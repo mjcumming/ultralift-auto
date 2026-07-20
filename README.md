@@ -23,10 +23,9 @@ Full bill of materials, wiring, and I/O map: **[docs/boat_lift_cobalt_design.md]
 ## Repo map
 
 | File | What it is |
-|---|---|
-| `boat-lift-cobalt-v2.yaml` | **The live config** — two-valve / two-IMU V2, everything described above |
-| `boat-lift-cobalt.yaml` | Single-valve V1, kept as a mirrored archive (not hardware-safe on split plumbing — see file header) |
-| `boat-lift-panel.yaml` / `boat-lift-panel-sc01.yaml` | Touch panel UI (Waveshare 4B / WT32-SC01 Plus), runs standalone in simulation until wired |
+| --- | --- |
+| `boat-lift-cobalt.yaml` | **The live config** — two-valve / two-IMU V2, everything described above (the retired single-valve V1 lives in git history only; it is not hardware-safe on the split plumbing) |
+| `boat-lift-panel.yaml` | Touch panel UI (Waveshare ESP32-S3-Touch-LCD-4B), runs standalone in simulation until wired |
 | `rs485-test-lift.yaml` / `rs485-test-panel.yaml` | Minimal ping harnesses to prove the RS485 link independent of app logic |
 | `docs/boat_lift_cobalt_design.md` | **The design document** — architecture, safety contract, failure modes, field history. Start here. |
 | `docs/boat_lift_link_protocol.md` | Lift ↔ panel RS485 protocol |
@@ -40,9 +39,9 @@ Full bill of materials, wiring, and I/O map: **[docs/boat_lift_cobalt_design.md]
 3. Validate and build:
 
    ```sh
-   esphome config boat-lift-cobalt-v2.yaml
-   esphome compile boat-lift-cobalt-v2.yaml
-   esphome upload boat-lift-cobalt-v2.yaml   # OTA; first flash over USB
+   esphome config boat-lift-cobalt.yaml
+   esphome compile boat-lift-cobalt.yaml
+   esphome upload boat-lift-cobalt.yaml   # OTA; first flash over USB
    ```
 
    (Developed on ESPHome 2026.6.x / ESP-IDF. V2 runs with serial logging off — UART0 feeds the second IMU — so use `esphome logs` over WiFi.)

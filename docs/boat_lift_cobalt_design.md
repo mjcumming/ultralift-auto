@@ -3,7 +3,7 @@
 
 **Project:** Automated control of a HydroHoist UltraLift UL2 8800 hydropneumatic boat lift — *Cobalt* boat
 **Location:** Minaki, Ontario (floating boathouse, summer-only)
-**Controller:** KinCony KC868-A16 (ESP32) running ESPHome — **live config `boat-lift-cobalt-v2.yaml`** (two-valve / two-IMU V2; `boat-lift-cobalt.yaml` is the single-valve V1 kept as a mirrored archive)
+**Controller:** KinCony KC868-A16 (ESP32) running ESPHome — **live config `boat-lift-cobalt.yaml`** (two-valve / two-IMU V2, renamed from `boat-lift-cobalt-v2.yaml` 2026-07-20; the retired single-valve V1 lives in git history only and is not hardware-safe on the split plumbing)
 **Status:** **V2 installed and operating on the lift** since the 2026-07-18 cutover: split per-tank plumbing, valve B, and the second IMU are wired and field-verified; auto-leveling, the boat-presence classifier, and auto-maintain are all live and field-proven (2026-07-19 stress session). This revision brings the document back in sync with the deployed firmware (V2 rev G).
 
 > **Changes from Rev E** *(documentation catch-up — the system moved fast in the field)*
@@ -27,7 +27,7 @@
 > - **Blower watchdog retired (§9.1, §11):** the absolute runtime cap always tripped first, so it is now the sole blower backstop.
 > - **Phase 2 auto-maintain is implemented and live-capable (§17–§19):** real top-ups behind the default-off `Auto-Maintain` switch, with a max-top-ups-per-window lockout.
 > - **RS485 panel link implemented (§22):** STA heartbeat + CMD parser at **9600 baud** to the dock touch panel; protocol in `boat_lift_link_protocol.md`.
-> - **Design-for-V2 note (§21):** the one-valve system is being perfected first; changes should stay easy to port to the two-valve/two-IMU V2 (`boat-lift-cobalt-v2.yaml`).
+> - **Design-for-V2 note (§21):** the one-valve system is being perfected first; changes should stay easy to port to the two-valve/two-IMU V2 (`boat-lift-cobalt-v2.yaml` — since the cutover, renamed to the sole `boat-lift-cobalt.yaml`).
 > - **Docs consolidated (2026-07-11):** the separate auto-hold and V2-leveling design files were workspace, not records — their content now lives here (§17 auto-maintain as built, §21 V2 auto-level design) and the files are deleted. The lift design space is exactly two documents: **this one** and **`boat_lift_link_protocol.md`**.
 
 > **Changes from Rev C**
@@ -612,13 +612,15 @@ Switches: `Auto-Level` (default OFF; shadow-logs when off), bench `Valve Port (Y
 
 ### 21.13 V1 design constraint until cutover (decided 2026-07-11)
 
+*(Historical — the cutover is complete: the V1 yaml was retired 2026-07-20, and the V2 yaml renamed to the sole `boat-lift-cobalt.yaml`.)*
+
 Perfect the one-valve system first; every V1 change must stay V2-portable:
 
 - **FSM state numbering frozen** (V2 reuses states 0–6; retired slot 1 stays reserved).
 - **`apply_outputs` stays the single output writer** — V2 extends it with the per-side throttle.
 - **Y3 and GPIO14 stay unassigned** in V1.
 - Prefer changes expressed as **policy over the existing FSM** (like auto-maintain) — those port unchanged.
-- **Port V1 fixes to `boat-lift-cobalt-v2.yaml`** as they land, so cutover is a hardware event, not a firmware rewrite.
+- **Port V1 fixes to the V2 yaml** as they land, so cutover is a hardware event, not a firmware rewrite.
 
 ## 22. Panel link (RS485) — as built
 
@@ -631,4 +633,4 @@ Protocol details: **`boat_lift_link_protocol.md`**. Panel UI: **`boat_lift_panel
 
 ---
 
-*End of Revision F. The document matches the deployed firmware (`boat-lift-cobalt-v2.yaml` rev G, flashed 2026-07-20): V2 live on the dock with auto-leveling, the tuned boat-presence classifier, field-proven auto-maintain, a fail-safe blower chain, and the automation-facing status trio. Next: the descent-rate/seal-failure alarm (§13, data in hand), the §21.6 rest keeper out of shadow, and stall-threshold tightening from the recorded baselines.*
+*End of Revision F. The document matches the deployed firmware (`boat-lift-cobalt.yaml` rev G, flashed 2026-07-20): V2 live on the dock with auto-leveling, the tuned boat-presence classifier, field-proven auto-maintain, a fail-safe blower chain, and the automation-facing status trio. Next: the descent-rate/seal-failure alarm (§13, data in hand), the §21.6 rest keeper out of shadow, and stall-threshold tightening from the recorded baselines.*
