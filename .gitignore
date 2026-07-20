@@ -1,0 +1,14 @@
+# Real credentials — never commit (use secrets.yaml.example as the template)
+secrets.yaml
+
+# ESPHome build artifacts
+.esphome/
+*.bin
+
+# Local Python environment
+venv/
+__pycache__/
+
+# Editor / OS noise
+.vscode/
+.DS_Store

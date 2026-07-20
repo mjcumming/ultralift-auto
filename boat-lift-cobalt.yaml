@@ -1,0 +1,2268 @@
+# =============================================================================
+#  Cumming Floating Boathouse — Boat Lift Automation  (Cobalt)
+#  HydroHoist UltraLift UL2 8800  ·  KinCony KC868-A16 (ESP32)
+#  Design: boat_lift_cobalt_design.md (Rev E)  ·  V2 (two-valve): see §21 there
+#
+#  STATUS: installed and operating on the lift. Calibration captured in the
+#          field (lowered = positive angle, raised = negative). Keep changes
+#          portable to boat-lift-cobalt-v2.yaml (same FSM, adds leveling).
+#
+#  STATE LEGEND (global lift_state — named ${S_*} in substitutions):
+#     0 = HOLD           blower OFF, valve CLOSED   (make_safe)
+#     1 = (retired)      was RAISING_VALVE_OPENING; slot kept reserved so V1/V2
+#                         numbering stays aligned. Blower + valve now start
+#                         together — no sequencing interlock (rev H).
+#     2 = RAISING        blower ON,  valve OPEN
+#     3 = LOWERING       blower OFF, valve OPEN     (passive vent)
+#     4 = FAULT          blower OFF, valve CLOSED   (latched + reason)
+#     5 = BYPASS         blower OFF, valve OPEN     (manual override: vent & hold hands-off; all LEDs off)
+#     6 = LOWERED_VENT   blower OFF, valve OPEN     (resting at Lowered: vent stays
+#                         open so the lift keeps settling; commands accepted,
+#                         Stop seals the valve)
+#
+#  KC868-A16 I/O:
+#     I2C GPIO4/5 · inputs 0x22 (X01-08) 0x21 (X09-16)
+#                 · outputs 0x24 (Y01-08) 0x25 (Y09-16)
+#     RS485 UART  GPIO13(TX)/GPIO16(RX) @ 9600 (panel link)
+# =============================================================================
+
+substitutions:
+  device_name: "boat-lift-cobalt"
+  friendly_name: "Cobalt Boat Lift"
+
+  # ---- lift geometry ----
+  arm_length_in: "51.0"   # pivot arm 4 ft 3 in — drives the display-only Bunk Height
+                          # sensor (inches above the Lowered cal); no logic uses it
+
+  # ---- FSM state codes (global lift_state). Named so lambdas read as prose.
+  #      Values are FROZEN — V2 reuses them; slot 1 is retired but reserved. ----
+  S_HOLD: "0"
+  S_RAISING: "2"
+  S_LOWERING: "3"
+  S_FAULT: "4"
+  S_BYPASS: "5"
+  S_LOWERED_VENT: "6"
+  # ---- go-to mode codes (global goto_mode) ----
+  M_LIFT: "0"       # everyday stored position (Lift Target %)
+  M_READY: "1"      # almost down, not yet floating
+  M_LOWER: "2"      # all the way down (boat floats free)
+  M_MAX: "3"        # winter storage — max out of water
+
+  # ---- Output channel numbers on PCF8574 outputs_1_8 (0x24), pins 0-7 ----
+  blower_out_pin: "0"        # Y01 -> blower relay coil (RIB2401B / NT90)
+  valve_power_out_pin: "1"   # Y02 -> valve power/open line (auto-return valve: OFF = closed, ON = open)
+  spare_out_pin: "2"         # Y03 spare; previous close line is no longer used
+  led_top_pin: "3"           # Y04 -> Top button ring LED     (white)  CONFIRMED
+  led_ready_pin: "4"         # Y05 -> Ready button ring LED   (orange) CONFIRMED
+  led_stop_pin: "5"          # Y06 -> Stop button ring LED    (red)    CONFIRMED
+  led_lowered_pin: "6"       # Y07 -> Lowered button ring LED (green)  CONFIRMED
+
+  # ---- Input channel numbers on PCF8574 inputs_9_16 (0x21), pins 0-7 = DI9-16 ----
+  #   CONFIRMED at the panel by colour: red=Stop=DI12, white=Top=DI13, green=Lowered=DI16.
+  #   Ready (orange) MOVED off DI15 -> DI11: the X15 input channel was not registering
+  #   presses (wiring/board fault); X11 is the next free input. Move the wire to X11.
+  btn_stop_in_pin: "3"       # DI12 (X12) -> Stop button    (red)    CONFIRMED
+  btn_top_in_pin: "4"        # DI13 (X13) -> Top button     (white)  CONFIRMED
+  btn_ready_in_pin: "2"      # DI11 (X11) -> Ready button   (orange) MOVED from DI15 (bad channel)
+  btn_lowered_in_pin: "7"    # DI16 (X16) -> Lowered button (green)  CONFIRMED
+
+  # ---- Valve position feedback (CR502 5-wire) on PCF8574 inputs_1_8 (0x22), pins 0-7 = DI1-8 ----
+  #   Maintained aux contacts, common = WHITE -> DI GND/COM (NOT an input channel).
+  #   Green = FULLY OPEN, Yellow = FULLY CLOSED. Contact-closed at the limit -> inverted:true reads ON.
+  valve_open_fb_pin: "1"     # X02 (DI2) -> GREEN  (valve FULLY OPEN feedback)
+  valve_closed_fb_pin: "0"   # X01 (DI1) -> YELLOW (valve FULLY CLOSED feedback)
+
+  ds18b20_gpio: "GPIO33"     # CONFIRMED: GPIO terminal "2" on the A16 = GPIO33
+
+  # ---- Dock button wiring (DMWD 19mm illuminated, confirmed on the bench) ----
+  #   Switch NO contact = YELLOW + WHITE (open at rest, closes on press -> reads ON)
+  #   Spare NC contact  = GREEN (unused)
+  #   LED ring          = RED (+) / BLACK (-), ~12V (built-in resistor)
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  comment: "HydroHoist UL2 8800 boat lift controller (Cobalt)"
+  # ⚠ ARCHIVE ONLY — never flash onto the split plumbing (valve B would never
+  # open). Shares the device name with V2, so it needs its own build_path:
+  # compiling into a shared dir put THIS firmware on the live dock 2026-07-19.
+  build_path: .esphome/build/v1-archive
+  project:
+    name: mjc.boat_lift
+    version: "0.3.0-revL (2026-07-20)"   # human label; the "Firmware Build" sensor auto-stamps the real compile date/time
+    # rev L (mirrors v2 rev G) — declutter + automation-friendly status: removed
+    # Test LEDs, Bench Cal Load, Reset Fault (+request_reset), raw Pitch, Lift
+    # State (raw); bench inputs disabled_by_default in HA; hot 250 ms display
+    # sensors calmed to 1 s; NEW Lift Activity + Lift Position token sensors;
+    # Lift Status no longer embeds the live percentage.
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+# ---------------------------------------------------------------------------
+#  Connectivity — telemetry / UI ONLY. No safety logic depends on this.
+# ---------------------------------------------------------------------------
+wifi:
+  networks:
+    - ssid: !secret wifi_ssid_1
+      password: !secret wifi_password_1
+  ap:
+    ssid: ${device_name}
+    password: !secret ap_password
+
+captive_portal:
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+web_server:
+  port: 80
+  version: 3
+  # Page layout: entities are filed into these groups (top -> bottom) via
+  # web_server.sorting_group_id on each entity. 1 Control / 2 Status /
+  # 3 Config (calibration + everyday knobs) / 4 Advanced Tuning (set-and-forget,
+  # live-editable + persisted) / 5 Diagnostics (read-only) / 6 Bench (hands-on
+  # wiring + manual override).
+  sorting_groups:
+    - id: group_control
+      name: "1 · Control"
+      sorting_weight: 10
+    - id: group_status
+      name: "2 · Status"
+      sorting_weight: 20
+    - id: group_config
+      name: "3 · Configuration"
+      sorting_weight: 30
+    - id: group_advanced
+      name: "4 · Advanced Tuning"
+      sorting_weight: 35
+    - id: group_diag
+      name: "5 · Diagnostics"
+      sorting_weight: 40
+    - id: group_bench
+      name: "6 · Bench / Wiring Test"
+      sorting_weight: 50
+
+logger:
+  level: INFO
+
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: America/Winnipeg
+
+# ---------------------------------------------------------------------------
+#  Buses
+# ---------------------------------------------------------------------------
+i2c:
+  sda: 4
+  scl: 5
+  scan: true
+  id: bus_a
+
+pcf8574:
+  - id: inputs_1_8
+    address: 0x22
+    pcf8575: false
+  - id: inputs_9_16
+    address: 0x21
+    pcf8575: false
+  - id: outputs_1_8
+    address: 0x24
+    pcf8575: false
+  - id: outputs_9_16
+    address: 0x25
+    pcf8575: false
+
+# WT901BC-TTL angle sensor — native WIT protocol (0x55-framed), READ-ONLY on GPIO32.
+# (Replaces the earlier RS485/Modbus path: this unit is TTL, not RS485. Sensor TX -> GPIO32,
+#  VCC -> 12V, GND shared. GPIO32 is 3.3V-only; add a divider if the sensor TX is 5V.)
+uart:
+  - id: wit_uart
+    rx_pin: GPIO32
+    baud_rate: 9600
+    rx_buffer_size: 512
+
+  # Panel link — RS485 to the touch panel (auto-direction transceiver, no DE pin).
+  # See boat_lift_link_protocol.md. Telemetry/intents only; no safety logic here.
+  - id: link_uart
+    tx_pin: GPIO13
+    rx_pin: GPIO16
+    baud_rate: 9600
+
+one_wire:
+  - platform: gpio
+    pin: ${ds18b20_gpio}
+
+# ---------------------------------------------------------------------------
+#  State + persistent calibration + scratch globals
+# ---------------------------------------------------------------------------
+globals:
+  # ---- live state (not persisted: always boot to HOLD) ----
+  - id: lift_state
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: fault_reason
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: test_mode
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  # ---- angle tracking ----
+  - id: current_angle
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+  - id: angle_last_update
+    type: unsigned long
+    restore_value: no
+    initial_value: "0"
+  - id: angle_valid
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: angle_trusted          # valid AND positionally plausible (in calibrated range)
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: manual_move            # current move is a manual jog (not position-targeted)
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  # ---- raw decoded angle axes from the WT901 0x53 frame ----
+  - id: angle_roll
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+  - id: angle_pitch
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+  # ---- timers / progress trackers ----
+  - id: blower_on_since
+    type: unsigned long
+    restore_value: no
+    initial_value: "0"
+  # absolute blower-runtime cap tracking (works in ALL modes, incl. manual test)
+  - id: blower_run_since
+    type: unsigned long
+    restore_value: no
+    initial_value: "0"
+  - id: blower_was_on
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: last_progress_angle
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+  - id: last_progress_time
+    type: unsigned long
+    restore_value: no
+    initial_value: "0"
+  - id: lower_start_time
+    type: unsigned long
+    restore_value: no
+    initial_value: "0"
+  - id: last_stop_reason         # why the last move ended (diagnostic text sensor)
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  # go-to-position target: where a move is heading, and which mode (0=Lift,1=Ready,2=Lower,3=Lift Max)
+  - id: goto_target_pct
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+  - id: goto_mode
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  # ---- persisted calibration ----
+  - id: cal_angle_down
+    type: float
+    restore_value: yes
+    initial_value: "0.0"
+  - id: cal_angle_up
+    type: float
+    restore_value: yes
+    initial_value: "0.0"
+  - id: cal_angle_float
+    type: float
+    restore_value: yes
+    initial_value: "0.0"
+  - id: cal_angle_max
+    type: float
+    restore_value: yes
+    initial_value: "0.0"
+  - id: cal_down_done
+    type: bool
+    restore_value: yes
+    initial_value: "false"
+  - id: cal_up_done
+    type: bool
+    restore_value: yes
+    initial_value: "false"
+  - id: cal_float_done
+    type: bool
+    restore_value: yes
+    initial_value: "false"
+  - id: cal_max_done
+    type: bool
+    restore_value: yes
+    initial_value: "false"
+
+  # ---- derived height + position zones — computed ONCE by the 250 ms supervisor;
+  #      every other consumer (status text, LEDs, observer, panel link, do_goto)
+  #      reads these instead of re-deriving span/percent locally (rev H dedupe) ----
+  - id: have_cal                 # Lift + Lowered captured and span sane
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: lift_pct                 # height % of calibrated span (NAN until calibrated)
+    type: float
+    restore_value: no
+    initial_value: "NAN"
+  - id: zone_tol_pct             # Zone Tolerance (deg) converted to % of span
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+  - id: ready_target_pct         # Ready setpoint as % of span (NAN until Ready captured)
+    type: float
+    restore_value: no
+    initial_value: "NAN"
+  - id: pos_at_lowered
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: pos_at_ready
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: pos_at_max
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: pos_at_top               # at/above the Lift Target % band (angle_valid-gated like the other zones)
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  # ---- valve command-vs-feedback agreement (manual-operation detector; DISPLAY ONLY) ----
+  - id: valve_cmd_open_prev   # last-seen Y2 command, to timestamp command changes
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: valve_cmd_since       # millis the valve command last changed (grace window anchor)
+    type: unsigned long
+    restore_value: no
+    initial_value: "0"
+  - id: valve_disagree_since  # millis the disagreement first appeared (0 = agreeing)
+    type: unsigned long
+    restore_value: no
+    initial_value: "0"
+  - id: valve_disagree        # latched after persistence: actual valve pos != commanded
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  # ---- last move timing (for calibration runs + diagnostics) ----
+  - id: prev_lift_state
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: move_start_ms
+    type: unsigned long
+    restore_value: no
+    initial_value: "0"
+  - id: move_start_angle
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+  - id: last_move_duration_sec
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+
+  # ---- boat presence, classified from RAISE speed only (rev K, §13) ----
+  # Fail-safe polarity: true = boat aboard OR unknown, and true BLOCKS Lift Max
+  # (tower hits the boathouse roof ≈148%). Persisted across reboots; resets to
+  # presumed-ON whenever the boat could have changed (LOWERED_VENT, bypass).
+  - id: boat_present
+    type: bool
+    restore_value: yes
+    initial_value: "true"
+  - id: presence_start_pct       # height % when the raise began (NAN = not armed)
+    type: float
+    restore_value: no
+    initial_value: "NAN"
+  - id: presence_classified      # this raise already classified (init true = nothing armed)
+    type: bool
+    restore_value: no
+    initial_value: "true"
+
+  # ---- Phase-1 auto-maintain OBSERVE (instrumentation only; NEVER drives outputs) ----
+  - id: obs_height_filt          # wave-stripped EMA of height % (-999 = uninit)
+    type: float
+    restore_value: no
+    initial_value: "-999.0"
+  - id: obs_win_min              # running min over the current 60 s wave window
+    type: float
+    restore_value: no
+    initial_value: "1000000.0"
+  - id: obs_win_max              # running max over the current 60 s wave window
+    type: float
+    restore_value: no
+    initial_value: "-1000000.0"
+  - id: obs_win_start
+    type: unsigned long
+    restore_value: no
+    initial_value: "0"
+  - id: obs_wave_pp              # last completed 60 s peak-to-peak (wave amplitude)
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+  - id: obs_rate_last_h          # filtered height at last sag-rate sample
+    type: float
+    restore_value: no
+    initial_value: "-999.0"
+  - id: obs_rate_last_t
+    type: unsigned long
+    restore_value: no
+    initial_value: "0"
+  - id: obs_sag_rate             # %/hour drift of filtered height (negative = sagging)
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+  - id: obs_arm_mode             # latched: 0 = idle, 1 = at Top, 2 = at Ready
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: obs_settled_since        # when we armed at a maintained setpoint (0 = not armed)
+    type: unsigned long
+    restore_value: no
+    initial_value: "0"
+  - id: obs_below_since          # when filtered height first dropped below threshold (0 = not below)
+    type: unsigned long
+    restore_value: no
+    initial_value: "0"
+  - id: obs_below_now            # live: filtered height currently below threshold
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: obs_shadow_count         # would-be top-ups since boot (counted whether or not we actuate)
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: obs_act_count            # REAL auto-maintain top-ups performed (Phase-2 actuation)
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: obs_last_shadow          # millis of last shadow top-up (0 = none)
+    type: unsigned long
+    restore_value: no
+    initial_value: "0"
+  - id: auto_topup_window_start  # millis when the current auto-top-up count window began
+    type: unsigned long
+    restore_value: no
+    initial_value: "0"
+  - id: auto_topup_window_count  # real auto top-ups in the current window
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: auto_topup_lockout       # too many corrections: stop actuating until manually reset
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  # persisted LEVEL reference (pitch axis) for the tilt proxy
+  - id: cal_ref_pitch
+    type: float
+    restore_value: yes
+    initial_value: "0.0"
+  - id: cal_ref_pitch_done
+    type: bool
+    restore_value: yes
+    initial_value: "false"
+
+# ---------------------------------------------------------------------------
+#  Tunables — live-editable from Home Assistant (persisted)
+# ---------------------------------------------------------------------------
+number:
+  # ---- calibration setpoints (editable; globals persist in flash) ----
+  #      rev J: filed under 4 · Advanced Tuning — these are fine-nudge sliders;
+  #      everyday calibration is the "Calibrate: set …" capture buttons, and the
+  #      Calibration Summary line in Configuration shows the resulting zones.
+  - platform: template
+    name: "Cal Angle — Lowered"
+    id: cal_num_lowered
+    web_server: {sorting_group_id: group_advanced, sorting_weight: 60}
+    min_value: -90      # generous bound — real swing (~-45..+30) sits well inside;
+    max_value: 90       # sign/mounting unconfirmed until install, so don't clip real cals
+    step: 0.05
+    unit_of_measurement: "°"
+    entity_category: config
+    lambda: 'return id(cal_angle_down);'
+    set_action:
+      - lambda: |-
+          id(cal_angle_down) = x;
+          id(cal_down_done) = true;
+          ESP_LOGI("cal", "LOWERED adjusted to %.2f deg (zone: > %.2f)",
+                   x, x - id(zone_tol_deg).state);
+  - platform: template
+    name: "Cal Angle — Ready"
+    id: cal_num_ready
+    web_server: {sorting_group_id: group_advanced, sorting_weight: 61}
+    min_value: -90      # generous bound — real swing (~-45..+30) sits well inside;
+    max_value: 90       # sign/mounting unconfirmed until install, so don't clip real cals
+    step: 0.05
+    unit_of_measurement: "°"
+    entity_category: config
+    lambda: 'return id(cal_angle_float);'
+    set_action:
+      - lambda: |-
+          id(cal_angle_float) = x;
+          id(cal_float_done) = true;
+          float rt = id(zone_tol_deg).state;
+          ESP_LOGI("cal", "READY adjusted to %.2f deg (zone: %.2f .. %.2f)",
+                   x, x - rt, x + rt);
+  - platform: template
+    name: "Cal Angle — Lift"
+    id: cal_num_top
+    web_server: {sorting_group_id: group_advanced, sorting_weight: 62}
+    min_value: -90      # generous bound — real swing (~-45..+30) sits well inside;
+    max_value: 90       # sign/mounting unconfirmed until install, so don't clip real cals
+    step: 0.05
+    unit_of_measurement: "°"
+    entity_category: config
+    lambda: 'return id(cal_angle_up);'
+    set_action:
+      - lambda: |-
+          id(cal_angle_up) = x;
+          id(cal_up_done) = true;
+          ESP_LOGI("cal", "LIFT adjusted to %.2f deg", x);
+  - platform: template
+    name: "Cal Angle — Lift Max"
+    id: cal_num_max
+    web_server: {sorting_group_id: group_advanced, sorting_weight: 63}
+    min_value: -90      # generous bound — real swing (~-45..+30) sits well inside;
+    max_value: 90       # sign/mounting unconfirmed until install, so don't clip real cals
+    step: 0.05
+    unit_of_measurement: "°"
+    entity_category: config
+    lambda: 'return id(cal_angle_max);'
+    set_action:
+      - lambda: |-
+          id(cal_angle_max) = x;
+          id(cal_max_done) = true;
+          float mt = id(zone_tol_deg).state;
+          ESP_LOGI("cal", "LIFT MAX adjusted to %.2f deg (zone: %.2f .. %.2f)",
+                   x, x - mt, x + mt);
+
+  - platform: template
+    name: "Lift Target (%)"
+    id: top_target_pct
+    web_server: {sorting_group_id: group_config, sorting_weight: 40}
+    optimistic: true
+    restore_value: true
+    initial_value: 98
+    min_value: 50
+    max_value: 100
+    step: 1
+    unit_of_measurement: "%"
+    entity_category: config
+
+  # THE one tolerance for every "at position" band (rev H: also absorbed the old
+  # Position Tolerance % — the supervisor converts this to % of span as zone_tol_pct):
+  #   lowered band:  angle > (cal lowered − this)         (one-sided; lowered = high angle)
+  #   ready band:    cal ready ± this
+  #   lift-max band: cal max ± this
+  #   lift band:     height ≥ Lift Target % − (this as %)
+  - platform: template
+    name: "Zone Tolerance (°)"
+    id: zone_tol_deg
+    web_server: {sorting_group_id: group_config, sorting_weight: 41}
+    optimistic: true
+    restore_value: true
+    initial_value: 2
+    min_value: 0.5
+    max_value: 10
+    step: 0.5
+    unit_of_measurement: "°"
+    entity_category: config
+
+  # =========================================================================
+  #  4 · Advanced Tuning — set-and-forget knobs. Live-editable + persisted on
+  #  the ESP32 (no recompile needed); grouped below the everyday Configuration
+  #  entries so the main page stays lean.
+  # =========================================================================
+
+  # ---- mechanics / timing ----
+  # rev H: no longer a blower interlock (blower + valve start together). Now only
+  # the grace window for the valve command-vs-feedback disagreement detector.
+  # Measured travel: open ~7 s, close ~2.3 s.
+  - platform: template
+    name: "Valve Travel Time (s)"
+    id: valve_travel_seconds
+    web_server: {sorting_group_id: group_advanced, sorting_weight: 10}
+    optimistic: true
+    restore_value: true
+    initial_value: 12
+    min_value: 2
+    max_value: 60
+    step: 1
+    unit_of_measurement: "s"
+    entity_category: config
+
+  # Sole blower failsafe (rev E: replaces the separate Blower Watchdog — the
+  # absolute cap always tripped first, so the watchdog could never fire).
+  # ABSOLUTE cap, any mode (manual too). MUST exceed real full-raise time
+  # before real operation (OEM auto-off ~15 min).
+  - platform: template
+    name: "Blower Max Runtime (min)"
+    id: blower_max_minutes
+    web_server: {sorting_group_id: group_advanced, sorting_weight: 11}
+    optimistic: true
+    restore_value: true
+    initial_value: 5
+    min_value: 1
+    max_value: 15
+    step: 1
+    unit_of_measurement: "min"
+    entity_category: config
+
+  - platform: template
+    name: "Lower Timeout (min)"
+    id: lower_timeout_minutes
+    web_server: {sorting_group_id: group_advanced, sorting_weight: 12}
+    optimistic: true
+    restore_value: true
+    initial_value: 15          # FIELD-CONFIRM: measure real full-lower time
+    min_value: 1
+    max_value: 30
+    step: 1
+    unit_of_measurement: "min"
+    entity_category: config
+
+  # (rev G: the rev F "Lower Settle Time" was replaced by the LOWERED_VENT state —
+  #  reaching Lowered now leaves the vent open indefinitely, so no settle timer.)
+
+  # ---- angle sensor trust ----
+  - platform: template
+    name: "Angle Plausibility Margin (°)"
+    id: angle_margin_deg
+    web_server: {sorting_group_id: group_advanced, sorting_weight: 20}
+    optimistic: true
+    restore_value: true
+    initial_value: 10          # degrees the live angle may sit outside the
+    min_value: 1               # calibrated Top..Lowered span before it's "out of range"
+    max_value: 45
+    step: 1
+    unit_of_measurement: "°"
+    entity_category: config
+
+  - platform: template
+    name: "Angle Freshness (s)"
+    id: angle_fresh_seconds
+    web_server: {sorting_group_id: group_advanced, sorting_weight: 21}
+    optimistic: true
+    restore_value: true
+    initial_value: 3           # angle stale after this many s without a frame
+    min_value: 1
+    max_value: 30
+    step: 1
+    unit_of_measurement: "s"
+    entity_category: config
+
+  # ---- stall detection (raising) ----
+  # rev I: deliberately PERMISSIVE defaults — raise speed differs a lot loaded
+  # vs empty and no §17.4 baselines are recorded yet, so until real move data
+  # exists the stall detector should only catch a truly dead raise (the 5-min
+  # absolute blower cap remains the hard backstop). Tighten from data later.
+  # NOTE these persist in flash (restore_value): an OTA does NOT overwrite
+  # values already stored on the device — nudge the sliders once after update.
+  - platform: template
+    name: "Stall Grace (s)"
+    id: stall_grace_seconds
+    web_server: {sorting_group_id: group_advanced, sorting_weight: 30}
+    optimistic: true
+    restore_value: true
+    initial_value: 60          # don't arm stall until lift has broken free
+    min_value: 0
+    max_value: 300
+    step: 5
+    unit_of_measurement: "s"
+    entity_category: config
+
+  - platform: template
+    name: "Stall Timeout (s)"
+    id: stall_timeout_seconds
+    web_server: {sorting_group_id: group_advanced, sorting_weight: 31}
+    optimistic: true
+    restore_value: true
+    initial_value: 120         # no progress for this long (after grace) -> fault
+    min_value: 2
+    max_value: 300
+    step: 5
+    unit_of_measurement: "s"
+    entity_category: config
+
+  - platform: template
+    name: "Stall Min Progress (deg)"
+    id: stall_min_progress_deg
+    web_server: {sorting_group_id: group_advanced, sorting_weight: 32}
+    optimistic: true
+    restore_value: true
+    initial_value: 0.2         # any perceptible movement counts as progress
+    min_value: 0.05
+    max_value: 5.0
+    step: 0.05
+    unit_of_measurement: "°"
+    entity_category: config
+
+  # ---- boat-presence classifier (rev K) ----
+  # A raise whose early climb rate is at or above this is classified EMPTY;
+  # slower = BOAT ON. Ships at the unreachable ceiling so every raise reads
+  # "boat on" (and Lift Max stays blocked) until the first real empty- and
+  # loaded-raise baselines are recorded and this is set between them.
+  - platform: template
+    name: "Empty Raise Rate Min (% per s)"   # '/' is reserved in ESPHome URL paths
+    id: empty_raise_rate_min
+    web_server: {sorting_group_id: group_advanced, sorting_weight: 33}
+    optimistic: true
+    restore_value: true
+    initial_value: 99          # 99 = classifier can never say "empty" (untuned)
+    min_value: 0.05
+    max_value: 99
+    step: 0.05
+    unit_of_measurement: "%/s"
+    entity_category: config
+
+  # ---- auto-maintain thresholds (observer + Phase-2 actuation) ----
+  - platform: template
+    name: "Maintain Sag Deadband (%)"
+    id: maintain_sag_deadband
+    web_server: {sorting_group_id: group_advanced, sorting_weight: 40}
+    optimistic: true
+    restore_value: true
+    initial_value: 4           # DATA-CONFIRM: top-up when filtered height sags this far below setpoint
+    min_value: 1
+    max_value: 15
+    step: 0.5
+    unit_of_measurement: "%"
+    entity_category: config
+  - platform: template
+    name: "Maintain Persist (s)"
+    id: maintain_persist_seconds
+    web_server: {sorting_group_id: group_advanced, sorting_weight: 41}
+    optimistic: true
+    restore_value: true
+    initial_value: 60          # DATA-CONFIRM: sag must hold this long (rejects waves)
+    min_value: 5
+    max_value: 600
+    step: 5
+    unit_of_measurement: "s"
+    entity_category: config
+  - platform: template
+    name: "Maintain Min Interval (min)"
+    id: maintain_min_interval_min
+    web_server: {sorting_group_id: group_advanced, sorting_weight: 42}
+    optimistic: true
+    restore_value: true
+    initial_value: 12          # motor short-cycle guard: min spacing between top-ups
+    min_value: 1
+    max_value: 120
+    step: 1
+    unit_of_measurement: "min"
+    entity_category: config
+  - platform: template
+    name: "Maintain Settle Delay (s)"
+    id: maintain_settle_seconds
+    web_server: {sorting_group_id: group_advanced, sorting_weight: 43}
+    optimistic: true
+    restore_value: true
+    initial_value: 180         # ignore the initial settle right after reaching a setpoint
+    min_value: 0
+    max_value: 600
+    step: 10
+    unit_of_measurement: "s"
+    entity_category: config
+  - platform: template
+    name: "Maintain Smoothing (s)"
+    id: maintain_smoothing_seconds
+    web_server: {sorting_group_id: group_advanced, sorting_weight: 44}
+    optimistic: true
+    restore_value: true
+    initial_value: 20          # EMA time constant for the wave-stripped filtered height
+    min_value: 1
+    max_value: 120
+    step: 1
+    unit_of_measurement: "s"
+    entity_category: config
+  - platform: template
+    name: "Maintain Alert Window (h)"
+    id: maintain_alert_window_hours
+    web_server: {sorting_group_id: group_advanced, sorting_weight: 45}
+    optimistic: true
+    restore_value: true
+    initial_value: 24          # top-up frequency window before auto-maintain locks out
+    min_value: 1
+    max_value: 168
+    step: 1
+    unit_of_measurement: "h"
+    entity_category: config
+  - platform: template
+    name: "Maintain Max Top-ups"
+    id: maintain_max_topups
+    web_server: {sorting_group_id: group_advanced, sorting_weight: 46}
+    optimistic: true
+    restore_value: true
+    initial_value: 3           # real auto top-ups allowed per alert window
+    min_value: 1
+    max_value: 24
+    step: 1
+    entity_category: config
+
+  # ---- tilt proxy threshold (annunciator only; rev J: the Warn tier was
+  #      removed — watch the numeric "Lift Tilt" for anything below critical) ----
+  - platform: template
+    name: "Tilt Critical (deg)"
+    id: tilt_critical_deg
+    web_server: {sorting_group_id: group_advanced, sorting_weight: 51}
+    optimistic: true
+    restore_value: true
+    initial_value: 5           # DATA-CONFIRM: list proxy critical threshold
+    min_value: 1
+    max_value: 30
+    step: 0.5
+    unit_of_measurement: "°"
+    entity_category: config
+
+# ---------------------------------------------------------------------------
+#  Outputs — written ONLY by apply_outputs (never elsewhere)
+#  NOTE: 'inverted' below assumes A16 active-low transistor outputs (as in
+#        a16_basic.yaml). FIELD-CONFIRM against actual wiring / relay logic.
+# ---------------------------------------------------------------------------
+switch:
+  # Bench test: when ON, the FSM stops driving outputs (toggle Blower/Valve relays by
+  # hand to verify wiring) AND button presses are ignored — no mode changes. Presses
+  # still log + flip the diagnostic binary_sensors so you can check input wiring.
+  # Turn OFF for normal operation.
+  - platform: template
+    name: "Bench Test (FSM off)"
+    id: bench_test_mode
+    icon: "mdi:wrench"
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    entity_category: config
+    web_server: {sorting_group_id: group_bench, sorting_weight: 10}
+    turn_on_action:
+      - lambda: 'id(test_mode) = true;'
+    turn_off_action:
+      - lambda: 'id(test_mode) = false;'
+      - script.execute: apply_outputs    # re-assert safe FSM outputs on exit
+
+  # ---- Bypass Mode (manual override) ----
+  # ON  = open the valve, blower OFF, sit hands-off (lift vents/floats; FSM idle).
+  # OFF = return to normal HOLD operation.
+  # Mirrors the dock control: hold the red Stop button ~3 s to enter; short-press to exit.
+  # All button LEDs are OFF while in bypass (dark panel = bypass).
+  - platform: template
+    name: "Bypass Mode"
+    id: bypass_mode_switch
+    icon: "mdi:valve-open"
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    web_server: {sorting_group_id: group_control, sorting_weight: 20}
+    turn_on_action:
+      - script.execute: enter_bypass
+    turn_off_action:
+      - script.execute: exit_bypass
+
+  # (rev L: the four "Test LED" wiring-test switches were removed — ring wiring
+  #  was confirmed at commissioning and the FSM LED driver covers every cadence.)
+
+  # ---- Phase-2 Auto-Maintain ACTUATE ----
+  # When ON, a confirmed sag at Top or Ready triggers a REAL top-up: the lift raises
+  # back to that setpoint through the normal go-to path, so it inherits every existing
+  # guard (valve interlock, stall detector, runtime watchdog, absolute blower cap,
+  # angle-trust supervisor, min-interval short-cycle guard). Sag-only — it never
+  # auto-lowers. Defaults OFF. The observer math (Phase-1 instrumentation) always
+  # runs — rev J removed the separate "Auto-Maintain Observe" enable switch.
+  - platform: template
+    name: "Auto-Maintain"
+    id: auto_maintain_switch
+    icon: "mdi:arrow-up-bold-box"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    web_server: {sorting_group_id: group_config, sorting_weight: 10}
+
+  - platform: gpio
+    id: blower_relay
+    name: "Blower Relay (Y1) — bench only"
+    entity_category: config
+    web_server: {sorting_group_id: group_bench, sorting_weight: 30}
+    restore_mode: ALWAYS_OFF
+    pin:
+      pcf8574: outputs_1_8
+      number: ${blower_out_pin}
+      # 2026-07-19 evening (rev K.6): blower REWIRED to the relay's NO path
+      # (see v2 for the full history) — coil de-energized = motor OFF,
+      # fail-safe, no cold-boot blip. inverted:true restored in the same
+      # visit per the never-half-alone rule.
+      inverted: true
+
+  - platform: gpio
+    id: valve_power_open
+    name: "Valve Power to Open (Y2) - bench only"
+    entity_category: config
+    web_server: {sorting_group_id: group_bench, sorting_weight: 31}
+    restore_mode: ALWAYS_OFF     # auto-return valve: unpowered = closed
+    pin:
+      pcf8574: outputs_1_8
+      number: ${valve_power_out_pin}
+      inverted: true
+
+output:
+  - platform: gpio                 # Y4 — Top button ring (white)
+    id: led_top
+    pin:
+      pcf8574: outputs_1_8
+      number: ${led_top_pin}
+      inverted: true
+  - platform: gpio                 # Y5 — Stop button ring (red)
+    id: led_stop
+    pin:
+      pcf8574: outputs_1_8
+      number: ${led_stop_pin}
+      inverted: true
+  - platform: gpio                 # Y6 — Ready button ring (orange)
+    id: led_ready
+    pin:
+      pcf8574: outputs_1_8
+      number: ${led_ready_pin}
+      inverted: true
+  - platform: gpio                 # Y7 — Lowered button ring (green)
+    id: led_lowered
+    pin:
+      pcf8574: outputs_1_8
+      number: ${led_lowered_pin}
+      inverted: true
+
+# ---------------------------------------------------------------------------
+#  Inputs — buttons emit INTENTS. (No hardware top-limit fitted; raising stops
+#  on the calibrated Top angle + blower watchdog/runtime cap.)
+#  Buttons rejected mid-motion by the request guards (only Stop stops a move).
+#  'inverted: true' => contact-closed reads as true.
+# ---------------------------------------------------------------------------
+binary_sensor:
+  # ---- MAIN: single problem flag for alerting (fault / angle offline / uncalibrated) ----
+  - platform: template
+    name: "Lift Problem"
+    id: lift_problem
+    device_class: problem
+    web_server: {sorting_group_id: group_status, sorting_weight: 10}
+    lambda: |-
+      return id(lift_state) == ${S_FAULT} || id(lift_state) == ${S_BYPASS} || !id(angle_trusted)
+             || id(auto_topup_lockout)
+             || !(id(cal_down_done) && id(cal_up_done));
+
+  # ---- boat presence — ON = boat aboard OR unknown (fail-safe; blocks Lift Max).
+  #      Classified from raise speed only (§13); resets to ON at LOWERED_VENT/bypass. ----
+  - platform: template
+    name: "Boat Present"
+    id: boat_present_sensor
+    device_class: occupancy
+    web_server: {sorting_group_id: group_status, sorting_weight: 25}   # 30 collides with Water Temperature
+    lambda: 'return id(boat_present);'
+
+  # ---- Angle-sensor (MPU/WT901) health: ON = receiving fresh, valid frames ----
+  # (rev J: filed under Diagnostics — Lift Problem + Lift Status already surface
+  #  an offline sensor on the main page; the entity stays for HA alerting.)
+  - platform: template
+    name: "Angle Sensor OK"
+    device_class: connectivity
+    web_server: {sorting_group_id: group_diag, sorting_weight: 12}
+    lambda: 'return id(angle_valid);'
+
+  # (rev J: "Maintain: Sagging Now" and "Lift Tilt Warn" were removed — the
+  #  Maintain Observe line carries the sag story, and the numeric Lift Tilt
+  #  covers anything below the critical threshold.)
+  - platform: template
+    name: "Auto-Maintain Lockout"
+    id: auto_maintain_lockout_sensor
+    device_class: problem
+    entity_category: diagnostic
+    web_server: {sorting_group_id: group_diag, sorting_weight: 43}
+    lambda: 'return id(auto_topup_lockout);'
+  # "Something is really wrong" tilt alarm — no correction is possible (single blower/valve),
+  # this is a pure annunciator. Left OUT of Lift Problem for now: the pitch proxy is unproven
+  # until the rig is installed, so don't let a bad reading mask real faults. Fold in later.
+  - platform: template
+    name: "Lift Tilt Critical"
+    id: lift_tilt_critical
+    device_class: problem
+    entity_category: diagnostic
+    web_server: {sorting_group_id: group_status, sorting_weight: 35}
+    lambda: |-
+      if (!id(cal_ref_pitch_done)) return false;
+      return fabs(id(angle_pitch) - id(cal_ref_pitch)) >= id(tilt_critical_deg).state;
+
+  - platform: gpio
+    id: btn_top
+    name: "Button — White · Lift (DI13)"
+    entity_category: diagnostic
+    disabled_by_default: true    # rev L: hidden from HA (enable there if needed); live in web UI + lambdas
+    web_server: {sorting_group_id: group_bench, sorting_weight: 74}
+    pin:
+      pcf8574: inputs_9_16
+      number: ${btn_top_in_pin}
+      mode: INPUT
+      inverted: true
+    filters: [delayed_on: 30ms]
+    on_press:
+      - logger.log: {format: "INPUT: Button LIFT (DI13) PRESSED", tag: "input_test", level: INFO}
+      - script.execute: request_goto_top
+    on_release:
+      - logger.log: {format: "INPUT: Button LIFT (DI13) released", tag: "input_test", level: INFO}
+
+  - platform: gpio
+    id: btn_stop
+    name: "Button — Red · Stop (DI12)"
+    entity_category: diagnostic
+    disabled_by_default: true
+    web_server: {sorting_group_id: group_bench, sorting_weight: 71}
+    pin:
+      pcf8574: inputs_9_16
+      number: ${btn_stop_in_pin}
+      mode: INPUT
+      inverted: true
+    filters: [delayed_on: 30ms]
+    # Short press = Stop / clear FAULT / exit bypass. Hold ~3 s = enter bypass mode.
+    # (A long hold fires request_stop on press first — harmless: it just stops motion —
+    #  then enters bypass once the hold threshold is met.)
+    on_press:
+      - logger.log: {format: "INPUT: Button STOP (DI12) PRESSED", tag: "input_test", level: INFO}
+      - script.execute: request_stop
+    on_release:
+      - logger.log: {format: "INPUT: Button STOP (DI12) released", tag: "input_test", level: INFO}
+    on_click:
+      min_length: 3000ms
+      max_length: 15000ms
+      then:
+        - script.execute: enter_bypass
+
+  - platform: gpio
+    id: btn_lowered
+    name: "Button — Green · Lower (DI16)"
+    entity_category: diagnostic
+    disabled_by_default: true
+    web_server: {sorting_group_id: group_bench, sorting_weight: 73}
+    pin:
+      pcf8574: inputs_9_16
+      number: ${btn_lowered_in_pin}
+      mode: INPUT
+      inverted: true
+    filters: [delayed_on: 30ms]
+    on_press:
+      - logger.log: {format: "INPUT: Button LOWER (DI16) PRESSED", tag: "input_test", level: INFO}
+      - script.execute: request_goto_lowered
+    on_release:
+      - logger.log: {format: "INPUT: Button LOWER (DI16) released", tag: "input_test", level: INFO}
+
+  - platform: gpio
+    id: btn_ready
+    name: "Button — Orange · Ready (DI11)"
+    entity_category: diagnostic
+    disabled_by_default: true
+    web_server: {sorting_group_id: group_bench, sorting_weight: 72}
+    pin:
+      pcf8574: inputs_9_16
+      number: ${btn_ready_in_pin}
+      mode: INPUT
+      inverted: true
+    filters: [delayed_on: 30ms]
+    on_press:
+      - logger.log: {format: "INPUT: Button READY (DI11) PRESSED", tag: "input_test", level: INFO}
+      - script.execute: request_goto_ready
+    on_release:
+      - logger.log: {format: "INPUT: Button READY (DI11) released", tag: "input_test", level: INFO}
+
+  # ---- Valve position feedback (CR502 aux contacts) ----
+  #   Instrumentation for now: reports the valve's REAL end-stop position independent of
+  #   the open-loop Valve Travel Time. Maintained contacts (stay closed while at the limit),
+  #   so level-sensed. Debounced 100ms to reject seating chatter. Not yet wired into the FSM.
+  - platform: gpio
+    id: valve_fb_open
+    name: "Valve Feedback — Fully Open (X02)"
+    entity_category: diagnostic
+    disabled_by_default: true
+    web_server: {sorting_group_id: group_bench, sorting_weight: 40}
+    pin:
+      pcf8574: inputs_1_8
+      number: ${valve_open_fb_pin}
+      mode: INPUT
+      inverted: true
+    filters: [delayed_on: 100ms, delayed_off: 100ms]
+    on_press:
+      - logger.log: {format: "VALVE STBD: fully OPEN contact closed (X02)", tag: "valve_fb", level: INFO}
+    on_release:
+      - logger.log: {format: "VALVE STBD: left fully-open (X02 opened)", tag: "valve_fb", level: INFO}
+
+  - platform: gpio
+    id: valve_fb_closed
+    name: "Valve Feedback — Fully Closed (X01)"
+    entity_category: diagnostic
+    disabled_by_default: true
+    web_server: {sorting_group_id: group_bench, sorting_weight: 41}
+    pin:
+      pcf8574: inputs_1_8
+      number: ${valve_closed_fb_pin}
+      mode: INPUT
+      inverted: true
+    filters: [delayed_on: 100ms, delayed_off: 100ms]
+    on_press:
+      - logger.log: {format: "VALVE STBD: fully CLOSED contact closed (X01)", tag: "valve_fb", level: INFO}
+    on_release:
+      - logger.log: {format: "VALVE STBD: left fully-closed (X01 opened)", tag: "valve_fb", level: INFO}
+
+# ---------------------------------------------------------------------------
+#  Sensors
+# ---------------------------------------------------------------------------
+sensor:
+  # ---- WT901 tilt angle (decoded from the 0x55 0x53 frame by the UART parser below) ----
+  # Roll/Pitch are the two tilt axes. current_angle (used by the FSM) tracks the
+  # arm-swing axis — CONFIRM at commissioning which axis moves with the lift arm and
+  # set it in the parser interval lambda (defaults to Roll for now).
+  # (rev E: the separate Roll diagnostic was removed — "Arm Angle (live)" IS the
+  #  roll axis. rev L: the raw Pitch sensor went too — "Lift Tilt" below is
+  #  pitch minus the captured reference, and axis confirmation is long done.)
+  - platform: template
+    name: "Arm Angle (live)"
+    id: arm_angle_live
+    web_server: {sorting_group_id: group_diag, sorting_weight: 10}
+    unit_of_measurement: "°"
+    accuracy_decimals: 2
+    update_interval: 1s
+    filters: [delta: 0.1]
+    lambda: 'return id(current_angle);'
+
+  - platform: template
+    name: "Lift Height"
+    id: lift_height_pct
+    web_server: {sorting_group_id: group_status, sorting_weight: 20}
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    update_interval: 1s          # rev L: was 250 ms — nothing consumes this sensor
+    lambda: 'return id(lift_pct);'   # single-source height % (250 ms supervisor)
+
+  # ---- pseudo bunk height in INCHES above the Lowered cal (display only) ----
+  # Vertical travel of a 51 in pivot arm: Δh = L·(sin θ_lowered − sin θ). Height %
+  # is linear in ANGLE, so inches-per-% grows toward the top of the stroke
+  # (~0.9 in/° near horizontal vs ~0.55 in/° at the settled bottom) — this sensor
+  # shows the true rise. Negative = settled below the Lowered cal (loaded bottom).
+  - platform: template
+    name: "Bunk Height"
+    id: bunk_height_in
+    web_server: {sorting_group_id: group_status, sorting_weight: 21}
+    unit_of_measurement: "in"
+    accuracy_decimals: 1
+    update_interval: 1s
+    lambda: |-
+      if (!id(have_cal) || !id(angle_valid)) return NAN;
+      const float d2r = M_PI / 180.0f;
+      return ${arm_length_in} * (sinf(id(cal_angle_down) * d2r)
+                               - sinf(id(current_angle)  * d2r));
+
+  # (rev E: the five read-only "Cal Zone" edge sensors were removed — the
+  #  "Calibration Summary" text sensor already shows every zone edge.)
+  - platform: template
+    name: "Last Move Duration"
+    id: last_move_duration
+    entity_category: diagnostic
+    web_server: {sorting_group_id: group_diag, sorting_weight: 15}
+    unit_of_measurement: "s"
+    accuracy_decimals: 1
+    update_interval: 1s
+    lambda: 'return id(last_move_duration_sec);'
+  # (rev E: Last Move Start/End Angle sensors removed — the "move" log lines
+  #  carry both angles, and Last Move Duration stays for calibration runs.)
+
+  # ---- Phase-1 auto-maintain OBSERVE outputs (data product; NO actuation) ----
+  - platform: template
+    name: "Lift Height (filtered)"
+    id: lift_height_filt
+    entity_category: diagnostic
+    web_server: {sorting_group_id: group_diag, sorting_weight: 20}
+    unit_of_measurement: "%"
+    accuracy_decimals: 1
+    update_interval: 1s
+    lambda: 'return (id(obs_height_filt) < -900.0f) ? NAN : id(obs_height_filt);'
+  - platform: template
+    name: "Lift Wave P-P (60s)"
+    id: lift_wave_pp
+    entity_category: diagnostic
+    web_server: {sorting_group_id: group_diag, sorting_weight: 21}
+    unit_of_measurement: "%"
+    accuracy_decimals: 1
+    update_interval: 5s
+    lambda: 'return id(obs_wave_pp);'
+  - platform: template
+    name: "Lift Sag Rate"
+    id: lift_sag_rate
+    entity_category: diagnostic
+    web_server: {sorting_group_id: group_diag, sorting_weight: 22}
+    unit_of_measurement: "%/h"
+    accuracy_decimals: 2
+    update_interval: 10s
+    lambda: 'return id(obs_sag_rate);'   # negative = sagging
+  - platform: template
+    name: "Lift Tilt"
+    id: lift_tilt_deg
+    entity_category: diagnostic
+    web_server: {sorting_group_id: group_diag, sorting_weight: 23}
+    unit_of_measurement: "°"
+    accuracy_decimals: 2
+    update_interval: 1s
+    lambda: 'return id(cal_ref_pitch_done) ? (id(angle_pitch) - id(cal_ref_pitch)) : NAN;'
+  # (rev E: the Shadow/Auto/Window top-up count sensors were removed — the
+  #  "Maintain Observe" text line reports all three counters.)
+
+  - platform: dallas_temp
+    name: "Lift Water Temperature"
+    id: water_temp
+    web_server: {sorting_group_id: group_status, sorting_weight: 30}
+    update_interval: 30s
+
+  # ---- diagnostics: spot reboots / WiFi degradation from Home Assistant ----
+  - platform: uptime
+    name: "Uptime"
+    entity_category: diagnostic
+    web_server: {sorting_group_id: group_diag, sorting_weight: 50}
+    update_interval: 30s
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    entity_category: diagnostic
+    web_server: {sorting_group_id: group_diag, sorting_weight: 51}
+    update_interval: 60s
+
+text_sensor:
+  # ---- Valve position (derived from the two CR502 aux contacts; read-only) ----
+  #   OPEN=vent open  CLOSED=sealed  MOVING=mid-travel or stuck  FAULT=both contacts on (impossible)
+  - platform: template
+    name: "Valve Position"
+    id: valve_position_text
+    entity_category: diagnostic
+    web_server: {sorting_group_id: group_diag, sorting_weight: 14}
+    update_interval: 1s          # rev L: was 250 ms
+    lambda: |-
+      bool o = id(valve_fb_open).state;
+      bool c = id(valve_fb_closed).state;
+      if (o && c) return std::string("FAULT");
+      if (o)      return std::string("OPEN");
+      if (c)      return std::string("CLOSED");
+      return std::string("MOVING");
+
+  # ---- MAIN: human-readable overall status (priority ladder) ----
+  - platform: template
+    name: "Calibration Summary"
+    id: cal_summary_text
+    entity_category: config
+    web_server: {sorting_group_id: group_config, sorting_weight: 20}
+    update_interval: 1s
+    lambda: |-
+      char b[160];
+      if (!id(cal_down_done) && !id(cal_float_done) && !id(cal_up_done) && !id(cal_max_done))
+        return std::string("Not calibrated");
+      int n = 0;
+      if (id(cal_down_done)) {
+        float lim = id(cal_angle_down) - id(zone_tol_deg).state;
+        n += snprintf(b, sizeof(b), "Lowered: >%.1f° (cal %.1f°)", lim, id(cal_angle_down));
+      } else {
+        n += snprintf(b, sizeof(b), "Lowered: —");
+      }
+      if (id(cal_float_done)) {
+        float rt = id(zone_tol_deg).state;
+        n += snprintf(b + n, sizeof(b) - n, "  Ready: %.1f..%.1f°",
+                      id(cal_angle_float) - rt, id(cal_angle_float) + rt);
+      } else {
+        n += snprintf(b + n, sizeof(b) - n, "  Ready: —");
+      }
+      if (id(cal_up_done)) {
+        n += snprintf(b + n, sizeof(b) - n, "  Lift: %.1f°", id(cal_angle_up));
+      } else {
+        n += snprintf(b + n, sizeof(b) - n, "  Lift: —");
+      }
+      if (id(cal_max_done)) {
+        float mt = id(zone_tol_deg).state;
+        n += snprintf(b + n, sizeof(b) - n, "  Max: %.1f..%.1f°",
+                      id(cal_angle_max) - mt, id(cal_angle_max) + mt);
+      } else {
+        n += snprintf(b + n, sizeof(b) - n, "  Max: —");
+      }
+      return std::string(b);
+
+  # ---- MAIN: machine-friendly status pair for HA automations (rev L).
+  #      Lift Activity = what the lift is DOING; Lift Position = WHERE it is.
+  #      Short stable Title-Case tokens for exact-match triggers — no percentages
+  #      or reasons embedded, so states only change on real transitions.
+  #      (Replaces the old "Lift State (raw)" diagnostic.) ----
+  - platform: template
+    name: "Lift Activity"
+    id: lift_activity_text
+    web_server: {sorting_group_id: group_status, sorting_weight: 5.3}
+    update_interval: 1s
+    lambda: |-
+      switch (id(lift_state)) {
+        case ${S_RAISING}:  return std::string("Raising");
+        case ${S_LOWERING}: return std::string("Lowering");
+        case ${S_FAULT}:    return std::string("Fault");
+        case ${S_BYPASS}:   return std::string("Bypass");
+        default:            return std::string("Idle");   // HOLD + LOWERED_VENT
+      }
+  - platform: template
+    name: "Lift Position"
+    id: lift_position_text
+    web_server: {sorting_group_id: group_status, sorting_weight: 5.6}
+    update_interval: 1s
+    lambda: |-
+      // zone ladder mirrors Lift Status; valid mid-move too (reports the zone
+      // being passed through). Unknown = sensor untrusted or not calibrated.
+      if (!id(angle_trusted) || !id(have_cal) || std::isnan(id(lift_pct)))
+        return std::string("Unknown");
+      if (id(pos_at_lowered)) return std::string("Lowered");
+      if (id(pos_at_ready))   return std::string("Ready");
+      if (id(pos_at_max))     return std::string("Lifted Max");
+      if (id(pos_at_top))     return std::string("Lifted");
+      return std::string("Between");
+
+  # ---- human-readable status line (web UI + panel msg=). rev L: percentages
+  #      dropped from the moving states — Lift Height sits right beside it, and
+  #      without the number the string only changes on real transitions. ----
+  - platform: template
+    name: "Lift Status"
+    id: lift_status_text
+    update_interval: 1s
+    web_server: {sorting_group_id: group_status, sorting_weight: 5}
+    lambda: |-
+      float pct = id(lift_pct);
+      bool have_pct = id(have_cal) && !std::isnan(pct);
+      int s = id(lift_state);
+      const char* mn = id(goto_mode) == ${M_LIFT} ? "Lift"
+                     : (id(goto_mode) == ${M_READY} ? "Ready"
+                     : (id(goto_mode) == ${M_LOWER} ? "Lower" : "Lift Max"));
+      // 1) fault
+      if (s == ${S_FAULT}) return std::string("FAULT — ") + id(fault_reason);
+      // 1b) bypass — manual override, valve open, hands-off
+      if (s == ${S_BYPASS}) return std::string("BYPASS — valve open, blower off (manual override)");
+      // 2) moving (manual jog if angle offline; else go-to with target name)
+      if (s == ${S_RAISING}) {
+        if (!id(angle_trusted)) return std::string("MANUAL raising…");
+        return std::string("Raising -> ") + mn;
+      }
+      if (s == ${S_LOWERING}) {
+        if (!id(angle_trusted)) return std::string("MANUAL lowering…");
+        return std::string("Lowering -> ") + mn;
+      }
+      // 2b) resting at Lowered with the vent left open (still settling forever)
+      if (s == ${S_LOWERED_VENT}) return std::string("Lowered — vent open");
+      // 2c) valve manually operated while we're commanding it closed (display only; HOLD here)
+      if (id(valve_disagree)) return std::string("Manual valve");
+      // 3) HOLD: health/readiness, then resting position (mode)
+      if (!id(angle_valid))   return std::string("Angle sensor OFFLINE - manual control");
+      if (!id(angle_trusted)) return std::string("Angle OUT OF RANGE - manual control");
+      if (!have_pct) return std::string("Not calibrated");
+      if (id(pos_at_lowered))  return std::string("Lowered");
+      if (id(pos_at_ready))    return std::string("Ready");
+      if (id(pos_at_max))      return std::string("Lifted (max)");
+      if (id(pos_at_top))      return std::string("Lifted");
+      if (!std::isnan(id(ready_target_pct))) {
+        if (pct < id(ready_target_pct)) return std::string("Between lowered/ready");
+        return std::string("Between ready/lifted");
+      }
+      return std::string("Holding");
+
+  # (rev J: the standalone "Fault Reason" sensor was removed — the reason already
+  #  rides on Lift Status ("FAULT — …") and Lift Activity ("Fault").)
+
+  # Why the last move ended (target / vent left open / timeout / Stop / trust loss / fault) —
+  # field-debugging aid: answers "why did the valve close?" after the fact.
+  - platform: template
+    name: "Last Stop Reason"
+    id: last_stop_reason_text
+    entity_category: diagnostic
+    web_server: {sorting_group_id: group_diag, sorting_weight: 16}
+    update_interval: 1s
+    lambda: 'return id(last_stop_reason);'
+
+  # ---- Firmware build stamp: compiler auto-fills the date/time at every compile (no manual edits) ----
+  - platform: template
+    name: "Firmware Build"
+    id: firmware_build
+    entity_category: diagnostic
+    web_server: {sorting_group_id: group_diag, sorting_weight: 52}
+    update_interval: 6h
+    lambda: 'return std::string(__DATE__ " " __TIME__);'
+
+  # ---- Auto-maintain summary line (observe math + actuation state) ----
+  - platform: template
+    name: "Maintain Observe"
+    id: maintain_observe_text
+    entity_category: diagnostic
+    web_server: {sorting_group_id: group_diag, sorting_weight: 42}
+    update_interval: 1s
+    lambda: |-
+      if (id(auto_topup_lockout)) {
+        char b[96];
+        snprintf(b, sizeof(b), "LOCKOUT | top-ups %d/%d in %.0fh",
+                 id(auto_topup_window_count), (int) lroundf(id(maintain_max_topups).state),
+                 id(maintain_alert_window_hours).state);
+        return std::string(b);
+      }
+      const char* where = id(obs_arm_mode) == 1 ? "Lift"
+                        : (id(obs_arm_mode) == 2 ? "Ready" : "idle");
+      char b[112];
+      snprintf(b, sizeof(b), "%s | auto %s | top-ups %d/%d (shadow %d) | sag %.2f%%/h",
+               where, id(auto_maintain_switch).state ? "ON" : "off",
+               id(auto_topup_window_count), (int) lroundf(id(maintain_max_topups).state),
+               id(obs_shadow_count), id(obs_sag_rate));
+      return std::string(b);
+
+# ---------------------------------------------------------------------------
+#  HA-facing controls (mirror the dock buttons through the SAME intents)
+# ---------------------------------------------------------------------------
+button:
+  - platform: template
+    name: "Lower"
+    web_server: {sorting_group_id: group_control, sorting_weight: 1}
+    on_press: {script.execute: request_goto_lowered}
+  - platform: template
+    name: "Ready"
+    web_server: {sorting_group_id: group_control, sorting_weight: 2}
+    on_press: {script.execute: request_goto_ready}
+  - platform: template
+    name: "Lift"
+    web_server: {sorting_group_id: group_control, sorting_weight: 3}
+    on_press: {script.execute: request_goto_top}
+  - platform: template
+    name: "Lift Max"
+    web_server: {sorting_group_id: group_control, sorting_weight: 4}
+    on_press: {script.execute: request_goto_max}
+  - platform: template
+    name: "Stop"
+    web_server: {sorting_group_id: group_control, sorting_weight: 5}
+    on_press: {script.execute: request_stop}
+  # (rev L: the "Reset Fault" button was removed — Stop is the universal
+  #  clear-it control: it already clears a latched FAULT and exits BYPASS.)
+  - platform: template
+    name: "Reset Auto-Maintain Lockout"
+    entity_category: config
+    web_server: {sorting_group_id: group_config, sorting_weight: 11}
+    on_press:
+      - lambda: |-
+          id(auto_topup_lockout) = false;
+          id(auto_topup_window_count) = 0;
+          id(auto_topup_window_start) = millis();
+          ESP_LOGW("maintain", "auto-maintain lockout reset");
+  - platform: restart
+    name: "Restart"
+    entity_category: config
+    web_server: {sorting_group_id: group_config, sorting_weight: 60}
+  # ---- calibration capture (3 setpoints; ids kept: up=Lift, down=Lowered, float=Ready) ----
+  - platform: template
+    name: "Calibrate: set LIFT"
+    entity_category: config
+    web_server: {sorting_group_id: group_config, sorting_weight: 51}
+    on_press:
+      - lambda: |-
+          id(cal_angle_up) = id(current_angle);
+          id(cal_up_done) = true;
+          id(cal_num_top).publish_state(id(cal_angle_up));
+          ESP_LOGI("cal", "LIFT set to %.2f deg", id(cal_angle_up));
+  - platform: template
+    name: "Calibrate: set LIFT MAX"
+    entity_category: config
+    web_server: {sorting_group_id: group_config, sorting_weight: 50}
+    on_press:
+      - lambda: |-
+          id(cal_angle_max) = id(current_angle);
+          id(cal_max_done) = true;
+          id(cal_num_max).publish_state(id(cal_angle_max));
+          float mt = id(zone_tol_deg).state;
+          ESP_LOGI("cal", "LIFT MAX set to %.2f deg (zone: %.2f .. %.2f)",
+                   id(cal_angle_max), id(cal_angle_max) - mt, id(cal_angle_max) + mt);
+  - platform: template
+    name: "Calibrate: set READY"
+    entity_category: config
+    web_server: {sorting_group_id: group_config, sorting_weight: 52}
+    on_press:
+      - lambda: |-
+          id(cal_angle_float) = id(current_angle);
+          id(cal_float_done) = true;
+          id(cal_num_ready).publish_state(id(cal_angle_float));
+          float rt = id(zone_tol_deg).state;
+          ESP_LOGI("cal", "READY set to %.2f deg (zone: %.2f .. %.2f)",
+                   id(cal_angle_float), id(cal_angle_float) - rt, id(cal_angle_float) + rt);
+  - platform: template
+    name: "Calibrate: set LOWERED"
+    entity_category: config
+    web_server: {sorting_group_id: group_config, sorting_weight: 53}
+    on_press:
+      - lambda: |-
+          id(cal_angle_down) = id(current_angle);
+          id(cal_down_done) = true;
+          id(cal_num_lowered).publish_state(id(cal_angle_down));
+          ESP_LOGI("cal", "LOWERED set to %.2f deg (zone: > %.2f)",
+                   id(cal_angle_down), id(cal_angle_down) - id(zone_tol_deg).state);
+  # (rev L: "Bench Test Cal Load" was removed — the live device is fully
+  #  calibrated and one accidental press clobbered the real captures once
+  #  already (2026-07-19, restored via the web API). Bench setpoints live in
+  #  git history if a bench rig ever needs them again.)
+  - platform: template
+    name: "Calibrate: capture LEVEL ref (pitch)"
+    entity_category: config
+    web_server: {sorting_group_id: group_config, sorting_weight: 54}
+    on_press:
+      - lambda: |-
+          id(cal_ref_pitch) = id(angle_pitch);
+          id(cal_ref_pitch_done) = true;
+          ESP_LOGI("cal", "LEVEL ref pitch set to %.2f deg", id(cal_ref_pitch));
+
+# ---------------------------------------------------------------------------
+#  Intents (request_*) — validate against state + interlocks, then transition.
+#  A move is accepted ONLY from a resting state (HOLD / LOWERED_VENT); only Stop
+#  interrupts a move in progress (latched moves, no hold-to-run).
+# ---------------------------------------------------------------------------
+script:
+  # ---- go-to-position core: pick raise vs lower from current height ----
+  # Raising starts blower + valve TOGETHER (rev H) — no valve-opening interlock;
+  # a few seconds of dead-heading against the opening valve is accepted by design.
+  - id: do_goto
+    parameters:
+      target: float
+      mode: int
+    then:
+      - lambda: |-
+          // accepted from HOLD or LOWERED_VENT (resting states)
+          if (id(lift_state) != ${S_HOLD} && id(lift_state) != ${S_LOWERED_VENT}) return;
+          if (!id(have_cal)) { ESP_LOGW("fsm","goto: not calibrated"); return; }
+          if (!id(angle_trusted)) { ESP_LOGW("fsm","goto: angle not trusted"); return; }
+          float cur = id(lift_pct);
+          if (std::isnan(cur)) return;
+          float tol = id(zone_tol_pct);
+          id(goto_target_pct) = target; id(goto_mode) = mode; id(manual_move) = false;
+          if ((mode == ${M_LOWER} && id(pos_at_lowered)) || (mode == ${M_READY} && id(pos_at_ready))
+              || (mode == ${M_MAX} && id(pos_at_max))   || (mode == ${M_LIFT} && id(pos_at_top))) {
+            ESP_LOGI("fsm","goto mode %d: already in zone", mode);
+          } else if (cur < target - tol) {            // need to raise (blower + valve together)
+            id(lift_state) = ${S_RAISING};
+            id(blower_on_since) = millis();
+            id(last_progress_angle) = id(current_angle);
+            id(last_progress_time) = millis();
+            ESP_LOGI("fsm","goto %.0f%% (mode %d): raising", target, mode);
+          } else if (cur > target + tol) {     // need to lower
+            id(lower_start_time) = millis(); id(lift_state) = ${S_LOWERING};
+            ESP_LOGI("fsm","goto %.0f%% (mode %d): lowering", target, mode);
+          } else {
+            ESP_LOGI("fsm","goto %.0f%%: already there", target);
+          }
+      - script.execute: apply_outputs
+
+  # ---- DEGRADED / manual jog (angle offline): move with backstops only ----
+  - id: manual_raise            # unreachable target -> stops on blower cap / Stop
+    then:
+      - lambda: |-
+          if (id(lift_state) != ${S_HOLD} && id(lift_state) != ${S_LOWERED_VENT}) return;
+          id(goto_target_pct) = 200.0f; id(goto_mode) = ${M_LIFT}; id(manual_move) = true;
+          id(lift_state) = ${S_RAISING};
+          id(blower_on_since) = millis();
+          id(last_progress_angle) = id(current_angle);
+          id(last_progress_time) = millis();
+          ESP_LOGW("fsm","MANUAL raise (angle not trusted)");
+      - script.execute: apply_outputs
+
+  - id: manual_lower            # unreachable target -> stops on lower-timeout / Stop
+    then:
+      - lambda: |-
+          if (id(lift_state) != ${S_HOLD} && id(lift_state) != ${S_LOWERED_VENT}) return;
+          id(goto_target_pct) = -100.0f; id(goto_mode) = ${M_LOWER}; id(manual_move) = true;
+          id(lower_start_time) = millis(); id(lift_state) = ${S_LOWERING};
+          ESP_LOGW("fsm","MANUAL lower (angle not trusted)");
+      - script.execute: apply_outputs
+
+  # ---- button intents: normal go-to when angle is good; manual jog when offline ----
+  - id: request_goto_top
+    then:
+      - lambda: |-
+          if (id(test_mode)) { ESP_LOGI("fsm","bench test: LIFT press ignored"); return; }
+          if (id(angle_trusted)) id(do_goto)->execute(id(top_target_pct).state, ${M_LIFT});
+          else                   id(manual_raise)->execute();
+  - id: request_goto_max        # winter storage — highest out of water; needs max cal + trusted angle
+    then:
+      - lambda: |-
+          if (id(test_mode)) { ESP_LOGI("fsm","bench test: LIFT MAX press ignored"); return; }
+          if (!id(angle_trusted)) { ESP_LOGW("fsm","Lift Max needs a trusted angle"); return; }
+          if (!id(cal_max_done)) { ESP_LOGW("fsm","Lift Max not calibrated"); return; }
+          if (!id(have_cal)) return;
+          // ROOF GUARD (rev K.3, "decide en route" — see v2 rev F.3): from a
+          // LOW start the classifier resolves far below the roof and the
+          // in-flight clamp demotes Max -> Lift on any non-EMPTY outcome, so
+          // an unknown/boat-on press may launch. From a HIGH start it stays
+          // hard-blocked without a positive EMPTY verdict. (NAN-safe.)
+          if (id(boat_present) && !(id(lift_pct) < 50.0f)) {
+            ESP_LOGW("fsm","Lift Max BLOCKED: presence unknown/boat-on and start too high (%.0f%%) for en-route classification", id(lift_pct));
+            return;
+          }
+          if (id(boat_present))
+            ESP_LOGW("fsm","Lift Max from low start, presence unknown/ON -> classifier decides en route (demotes to Lift unless EMPTY)");
+          float span = id(cal_angle_up) - id(cal_angle_down);
+          float mp = (id(cal_angle_max) - id(cal_angle_down)) / span * 100.0f;
+          id(do_goto)->execute(mp, ${M_MAX});
+  - id: request_goto_lowered
+    then:
+      - lambda: |-
+          if (id(test_mode)) { ESP_LOGI("fsm","bench test: LOWER press ignored"); return; }
+          if (id(angle_trusted)) id(do_goto)->execute(0.0f, ${M_LOWER});
+          else                   id(manual_lower)->execute();
+  - id: request_goto_ready      # mid-position needs trusted position; no manual fallback
+    then:
+      - lambda: |-
+          if (id(test_mode)) { ESP_LOGI("fsm","bench test: READY press ignored"); return; }
+          if (!id(angle_trusted)) { ESP_LOGW("fsm","Ready needs a trusted angle"); return; }
+          if (!id(cal_float_done)) { ESP_LOGW("fsm","Ready not calibrated"); return; }
+          if (std::isnan(id(ready_target_pct))) return;
+          id(do_goto)->execute(id(ready_target_pct), ${M_READY});
+
+  - id: request_stop
+    then:
+      # Highest-priority intent and the universal "make it stop / clear it" control.
+      # Ends any moving state, CLEARS a latched FAULT (e.g. stall_no_progress,
+      # runtime_watchdog), and exits BYPASS. A short press while in BYPASS exits
+      # bypass back to HOLD ("press again for real mode").
+      - lambda: |-
+          if (id(test_mode)) {
+            // Red button = universal kill even on the bench: blower off + valve
+            // closed (bench switches follow), FSM stays suspended in test mode.
+            id(blower_relay).turn_off();
+            id(valve_power_open).turn_off();
+            ESP_LOGW("fsm", "bench test: STOP press -> all outputs COMMANDED off (verify the blower actually stopped — a welded Y1 keeps running; breaker if so)");
+            return;
+          }
+          if (id(lift_state) == ${S_FAULT}) {
+            id(fault_reason) = "";
+            id(lift_state) = ${S_HOLD};   // clear FAULT -> HOLD
+            ESP_LOGI("fsm", "request_stop -> clear FAULT -> HOLD");
+          } else if (id(lift_state) == ${S_BYPASS}) {
+            id(bypass_mode_switch).publish_state(false);
+            id(lift_state) = ${S_HOLD};
+            ESP_LOGI("fsm", "request_stop -> exit BYPASS -> HOLD");
+          } else if (id(lift_state) == ${S_RAISING} || id(lift_state) == ${S_LOWERING}) {
+            // (rev K.4: LOWERED_VENT removed from this clause — at the bottom
+            //  the vent stays open ALWAYS; the 250 ms rest-vent rule would
+            //  reopen it within a tick anyway, so Stop there is a no-op.)
+            id(lift_state) = ${S_HOLD};
+            id(last_stop_reason) = "Stop pressed";
+            ESP_LOGI("fsm", "request_stop -> HOLD");
+          }
+      - script.execute: apply_outputs
+
+  # ---- BYPASS: manual override — open valve, blower off, sit hands-off ----
+  - id: enter_bypass
+    then:
+      - lambda: |-
+          if (id(test_mode)) { ESP_LOGI("fsm","bench test: bypass ignored"); return; }
+          if (id(lift_state) == ${S_BYPASS}) return;       // already in bypass
+          id(manual_move) = false;
+          id(boat_present) = true;   // hands-off manual: anything can happen -> presence unknown = presumed ON
+          id(lift_state) = ${S_BYPASS};          // BYPASS: apply_outputs opens valve, blower off
+          ESP_LOGW("fsm", "BYPASS engaged -> valve OPEN, blower OFF (hands-off)");
+      - lambda: 'id(bypass_mode_switch).publish_state(true);'
+      - script.execute: apply_outputs
+
+  - id: exit_bypass
+    then:
+      - lambda: |-
+          if (id(lift_state) == ${S_BYPASS}) {
+            id(lift_state) = ${S_HOLD};
+            ESP_LOGI("fsm", "BYPASS cleared -> HOLD");
+          }
+      - lambda: 'id(bypass_mode_switch).publish_state(false);'
+      - script.execute: apply_outputs
+
+  # (rev L: request_reset was removed — it was a strict subset of request_stop,
+  #  which clears a latched FAULT and exits BYPASS; panel req=RESET maps there.)
+
+  - id: enter_fault
+    parameters:
+      reason: string
+    then:
+      - lambda: |-
+          if (id(lift_state) != ${S_FAULT}) {
+            id(fault_reason) = reason;
+            id(lift_state) = ${S_FAULT};
+            id(last_stop_reason) = std::string("FAULT: ") + reason;
+            ESP_LOGE("fsm", "FAULT: %s", reason.c_str());
+          }
+      - script.execute: apply_outputs
+
+  # ---- THE single place outputs are written. Outputs = f(state). ----
+  - id: apply_outputs
+    mode: single
+    then:
+      - lambda: |-
+          // Bench test mode: suspend FSM output writes so outputs can be toggled by hand.
+          if (id(test_mode)) return;
+          int s = id(lift_state);
+          bool blower = false, v_open = false;
+          if (s == ${S_RAISING}) { v_open = true;  blower = true;  }   // blower + valve together (rev H)
+          else if (s == ${S_LOWERING} || s == ${S_BYPASS} || s == ${S_LOWERED_VENT}) { v_open = true; }
+          // HOLD / FAULT: make_safe -> blower off, valve closed
+
+          // Auto-return valve: Y2 energized = open, Y2 off = spring/auto return closed.
+          // Blower and valve are commanded independently (no sequencing); when making
+          // safe, drop the blower before removing valve power.
+          if (blower) {
+            id(valve_power_open).turn_on();
+            id(blower_relay).turn_on();
+          } else {
+            id(blower_relay).turn_off();
+            if (v_open) id(valve_power_open).turn_on(); else id(valve_power_open).turn_off();
+          }
+          // (button LEDs handled by the dedicated 100 ms LED interval)
+
+# ---------------------------------------------------------------------------
+#  Control tick — supervisor + FSM advance, every 250 ms.
+#  Order: freshness -> height -> per-state logic -> apply_outputs.
+# ---------------------------------------------------------------------------
+interval:
+  # ---- WT901 stream parser: assemble 0x55-framed 11-byte packets, decode 0x53 (angle) ----
+  - interval: 50ms
+    then:
+      - lambda: |-
+          static uint8_t buf[11];
+          static uint8_t idx = 0;
+          while (id(wit_uart).available()) {
+            uint8_t b;
+            if (!id(wit_uart).read_byte(&b)) break;
+            if (idx == 0) {
+              if (b == 0x55) buf[idx++] = b;     // wait for frame header
+            } else {
+              buf[idx++] = b;
+              if (idx >= 11) {
+                idx = 0;
+                uint8_t sum = 0;
+                for (int i = 0; i < 10; i++) sum += buf[i];
+                if (sum == buf[10]) {
+                  if (buf[1] == 0x53) {            // Angle frame
+                    int16_t r = (int16_t)((buf[3] << 8) | buf[2]);
+                    int16_t p = (int16_t)((buf[5] << 8) | buf[4]);
+                    id(angle_roll)  = r / 32768.0f * 180.0f;
+                    id(angle_pitch) = p / 32768.0f * 180.0f;
+                    // FSM angle = arm-swing axis (default Roll; confirm at commissioning)
+                    id(current_angle) = id(angle_roll);
+                    id(angle_last_update) = millis();
+                  }
+                }
+              }
+            }
+          }
+
+  # ---- Button ring LEDs: solid in-mode, SLOW-flashing while a mode is operating
+  #      (calm "working" cadence — fast flash is reserved for problems). RED Stop =
+  #      latched-fault fast flash / sensor-offline gapped flash (burst then ~10 s
+  #      dark) / solid while operating ----
+  - interval: 100ms
+    then:
+      - lambda: |-
+          bool flash = ((millis() / 200) % 2) == 0;        // FAST — faults / critical only
+          bool flash_slow = ((millis() / 600) % 2) == 0;   // SLOW — normal motion in progress
+          int s = id(lift_state);
+          bool bypass = (s == ${S_BYPASS});       // BYPASS: dark panel — every LED off
+          bool moving = (s == ${S_RAISING} || s == ${S_LOWERING});
+          bool critical = (s == ${S_FAULT}) || !id(angle_trusted);   // fault, or position not trusted
+          bool at_top = (s == ${S_HOLD}) && id(angle_trusted) && id(pos_at_top);
+          bool at_low = id(pos_at_lowered);
+          bool at_rdy = id(pos_at_ready);
+          // position LEDs: solid when resting at that mode, slow-flashing while heading there
+          bool top_on = !bypass && (at_top || (moving && id(goto_mode) == ${M_LIFT} && flash_slow));
+          bool rdy_on = !bypass && (at_rdy || (moving && id(goto_mode) == ${M_READY} && flash_slow));
+          bool low_on = !bypass && (at_low || (moving && id(goto_mode) == ${M_LOWER} && flash_slow));
+          // RED Stop ring cadence:
+          //   bypass            -> off (dark panel)
+          //   latched FAULT     -> steady flash  (press the red Stop button to clear)
+          //   MPU/angle offline -> flash ~3 s, then dark ~10 s, repeat (distinct "no sensor" cadence)
+          //   out-of-range etc. -> steady flash
+          //   moving OR blower  -> solid ("something is operating; red button will
+          //                       stop it"). Blower term = COMMANDED relay state
+          //                       (incl. bench toggles), so a stuck Y1 chain still
+          //                       reads light-OFF + motor-on = hardware, not FSM.
+          bool mpu_offline = !id(angle_valid);
+          bool stop_on;
+          if (bypass)                stop_on = false;
+          else if (s == ${S_FAULT})  stop_on = flash;
+          else if (mpu_offline)      stop_on = ((millis() % 13000UL) < 3000UL) && flash;
+          else if (critical)         stop_on = flash;
+          else                       stop_on = moving || id(blower_relay).state;
+          // Wiring-test override: while a "Test LED" switch is ON it owns that ring
+          // (latched on); otherwise the FSM result drives it. No bench mode needed.
+          (top_on  ? id(led_top).turn_on()     : id(led_top).turn_off());
+          (rdy_on  ? id(led_ready).turn_on()   : id(led_ready).turn_off());
+          (low_on  ? id(led_lowered).turn_on() : id(led_lowered).turn_off());
+          (stop_on ? id(led_stop).turn_on()    : id(led_stop).turn_off());
+
+  - interval: 250ms
+    then:
+      - lambda: |-
+          unsigned long now = millis();
+
+          // ---- ABSOLUTE blower runtime cap (all modes, incl. manual bench test) ----
+          // Guarantees the blower can never get stuck on, however it was turned on.
+          bool blwr = id(blower_relay).state;
+          if (blwr && !id(blower_was_on)) id(blower_run_since) = now;   // rising edge
+          id(blower_was_on) = blwr;
+          if (blwr && (now - id(blower_run_since)) >
+                      (unsigned long)(id(blower_max_minutes).state * 60000.0f)) {
+            if (id(test_mode)) {              // manual: just force the relay off
+              id(blower_relay).turn_off();
+              ESP_LOGW("safety", "blower max runtime reached -> forced OFF (manual)");
+            } else {                          // FSM-driven: fault so apply_outputs makes safe
+              id(enter_fault)->execute("blower_max_runtime");
+            }
+          }
+
+          // ---- angle freshness + sanity ----
+          unsigned long fresh_ms = (unsigned long)(id(angle_fresh_seconds).state * 1000.0f);
+          bool fresh = (now - id(angle_last_update)) < fresh_ms && id(angle_last_update) != 0;
+          // arm swing stays well inside ±90 whatever the sensor mounting/sign;
+          // beyond ±95 the reading is nonsense -> invalid
+          bool in_range = (id(current_angle) > -95.0f && id(current_angle) < 95.0f);
+          id(angle_valid) = fresh && in_range;
+
+          // ---- height percent + derived targets — THE single source (rev H).
+          //      Everything else (status, LEDs, observer, panel link, do_goto)
+          //      reads have_cal / lift_pct / zone_tol_pct / ready_target_pct. ----
+          float span = id(cal_angle_up) - id(cal_angle_down);
+          id(have_cal) = id(cal_up_done) && id(cal_down_done) && fabs(span) > 0.5f;
+          id(lift_pct) = id(have_cal)
+                      ? (id(current_angle) - id(cal_angle_down)) / span * 100.0f : NAN;
+          id(zone_tol_pct) = id(have_cal)
+                      ? id(zone_tol_deg).state / fabs(span) * 100.0f : 0.0f;
+          id(ready_target_pct) = (id(have_cal) && id(cal_float_done))
+                      ? (id(cal_angle_float) - id(cal_angle_down)) / span * 100.0f : NAN;
+
+          // ---- angle TRUST: valid AND within the calibrated arm range (+ margin) ----
+          bool x_plausible = true;
+          if (id(have_cal)) {
+            float lo = id(cal_angle_down);
+            float hi = id(cal_angle_down);
+            if (id(cal_angle_up) < lo) lo = id(cal_angle_up);
+            if (id(cal_angle_up) > hi) hi = id(cal_angle_up);
+            if (id(cal_max_done)) {
+              if (id(cal_angle_max) < lo) lo = id(cal_angle_max);
+              if (id(cal_angle_max) > hi) hi = id(cal_angle_max);
+            }
+            float m = id(angle_margin_deg).state;
+            x_plausible = (id(current_angle) >= lo - m && id(current_angle) <= hi + m);
+          }
+          id(angle_trusted) = id(angle_valid) && x_plausible;
+
+          // ---- position zones (single Zone Tolerance knob, rev H) ----
+          // Lowered is one-sided: at the lowered cal OR settled beyond it. Valid for the
+          // confirmed sensor sign (lowered = positive/high angle, raising goes negative).
+          id(pos_at_lowered) = id(cal_down_done) && id(angle_valid)
+              && id(current_angle) > (id(cal_angle_down) - id(zone_tol_deg).state);
+          id(pos_at_ready) = id(cal_float_done) && id(angle_valid)
+              && fabs(id(current_angle) - id(cal_angle_float)) <= id(zone_tol_deg).state;
+          id(pos_at_max) = id(cal_max_done) && id(angle_valid)
+              && fabs(id(current_angle) - id(cal_angle_max)) <= id(zone_tol_deg).state;
+          id(pos_at_top) = id(angle_valid) && !std::isnan(id(lift_pct))
+              && id(lift_pct) >= id(top_target_pct).state - id(zone_tol_pct);
+
+          // ---- valve command-vs-feedback agreement (manual-operation detector; DISPLAY ONLY) ----
+          // "Commanded" = what we're driving Y2 to (valve_power_open); in bench mode that's the
+          // hand switch. The aux contacts lag through most of travel, so only judge after a grace
+          // window (measured open ~7 s / close ~2.3 s -> Valve Travel Time + 2 s) and require the
+          // mismatch to persist ~2 s. both-on is a sensor fault (shown by Valve Position), not manual.
+          {
+            bool vcmd_open = id(valve_power_open).state;
+            if (vcmd_open != id(valve_cmd_open_prev)) {
+              id(valve_cmd_open_prev) = vcmd_open;
+              id(valve_cmd_since) = now;
+            }
+            bool vfo = id(valve_fb_open).state, vfc = id(valve_fb_closed).state;
+            bool at_open = vfo && !vfc, at_closed = vfc && !vfo, both_on = vfo && vfc;
+            unsigned long vgrace = (unsigned long)(id(valve_travel_seconds).state * 1000.0f) + 2000UL;
+            bool vsettled = (now - id(valve_cmd_since)) > vgrace;
+            bool agree = vcmd_open ? at_open : at_closed;
+            bool vbad = vsettled && !both_on && !agree;
+            if (vbad) { if (id(valve_disagree_since) == 0) id(valve_disagree_since) = now; }
+            else      { id(valve_disagree_since) = 0; }
+            id(valve_disagree) = id(valve_disagree_since) != 0
+                                 && (now - id(valve_disagree_since)) > 2000UL;
+          }
+
+          // supervisor: a position-targeted (auto) move that loses trust -> STOP (manual stays live)
+          {
+            int sm = id(lift_state);
+            if ((sm == ${S_RAISING} || sm == ${S_LOWERING}) && !id(manual_move) && !id(angle_trusted)) {
+              id(lift_state) = ${S_HOLD};   // stop to HOLD; red keeps flashing (critical), manual allowed
+              id(last_stop_reason) = "angle trust lost mid-move";
+              ESP_LOGW("safety", "auto move lost angle trust (offline/out-of-range) -> STOP");
+            }
+          }
+
+          int s = id(lift_state);
+          float pct = id(lift_pct);
+
+          // ---- RAISING (blower + valve energized together since rev H) ----
+          if (s == ${S_RAISING}) {
+            // (Runtime backstop = the ABSOLUTE blower cap above; the old per-raise
+            //  watchdog was redundant — the cap always tripped first.)
+            // stall detector (armed only after grace window). rev I: SIGN-AWARE —
+            // progress is movement toward the 'up' cal, i.e. in the direction of
+            // the calibrated span (negative on the real mounting: raising drives
+            // the angle down from +lowered toward -lift). The old unsigned check
+            // could only ever see progress as an INCREASING angle, so a real
+            // raise looked like a stall.
+            if (id(angle_valid)) {
+              float dir = (span >= 0.0f) ? 1.0f : -1.0f;
+              if ((id(current_angle) - id(last_progress_angle)) * dir >= id(stall_min_progress_deg).state) {
+                id(last_progress_angle) = id(current_angle);
+                id(last_progress_time) = now;
+              } else {
+                unsigned long grace_ms = (unsigned long)(id(stall_grace_seconds).state * 1000.0f);
+                unsigned long stall_ms = (unsigned long)(id(stall_timeout_seconds).state * 1000.0f);
+                if ((now - id(blower_on_since)) > grace_ms &&
+                    (now - id(last_progress_time)) > stall_ms) {
+                  id(enter_fault)->execute("stall_no_progress");
+                }
+              }
+            }
+            // ---- boat-presence classification (rev K): raise cycles ONLY ----
+            // Time the first PRESENCE_WINDOW %-points of climb; rate at/above the
+            // Empty Raise Rate Min slider = EMPTY, slower = BOAT ON. Classifies
+            // once per raise; the latch holds between raises.
+            {
+              const float PRESENCE_WINDOW = 15.0f;   // %-points timed before deciding
+              if (!id(presence_classified) && !id(manual_move) && id(angle_valid)
+                  && !std::isnan(pct) && !std::isnan(id(presence_start_pct))) {
+                float climb = pct - id(presence_start_pct);
+                if (climb >= PRESENCE_WINDOW) {
+                  float dt = (now - id(move_start_ms)) / 1000.0f;
+                  float rate = (dt > 0.5f) ? (climb / dt) : 0.0f;
+                  bool empty = rate >= id(empty_raise_rate_min).state;
+                  id(presence_classified) = true;
+                  id(boat_present) = !empty;
+                  ESP_LOGI("presence", "raise %.1f%% in %.1fs = %.2f %%/s -> %s (empty >= %.2f)",
+                           climb, dt, rate, empty ? "EMPTY" : "BOAT ON",
+                           id(empty_raise_rate_min).state);
+                  // rev K.3 in-flight roof guard ("decide en route"): any
+                  // non-EMPTY verdict demotes an in-flight Max to Lift.
+                  if (!empty && id(goto_mode) == ${M_MAX}) {
+                    id(goto_target_pct) = id(top_target_pct).state;
+                    id(goto_mode) = ${M_LIFT};
+                    ESP_LOGW("presence", "Max demoted to Lift %.0f%% (no EMPTY verdict — roof guard)",
+                             id(goto_target_pct));
+                  }
+                }
+              }
+            }
+            // target stop: calibrated angle (no hardware top-limit fitted)
+            if (id(lift_state) == ${S_RAISING}) {  // re-check: may have faulted above
+              bool reached = false;
+              if (id(goto_mode) == ${M_LOWER} && id(pos_at_lowered)) reached = true;
+              else if (id(goto_mode) == ${M_READY} && id(pos_at_ready)) reached = true;
+              else if (id(goto_mode) == ${M_MAX} && id(pos_at_max)) reached = true;
+              else if (id(angle_valid) && !std::isnan(pct) && pct >= id(goto_target_pct)) reached = true;
+              if (reached) {
+                id(lift_state) = ${S_HOLD};
+                id(last_stop_reason) = "raise target reached";
+                ESP_LOGI("fsm", "raise target reached -> HOLD");
+              }
+            }
+          }
+
+          // ---- LOWERING (passive; angle stops early, timer backstops) ----
+          else if (s == ${S_LOWERING}) {
+            bool at_target = false;
+            if (id(goto_mode) == ${M_LOWER} && id(pos_at_lowered)) at_target = true;
+            else if (id(goto_mode) == ${M_READY} && id(pos_at_ready)) at_target = true;
+            else if (id(goto_mode) == ${M_MAX} && id(pos_at_max)) at_target = true;
+            else if (id(angle_valid) && !std::isnan(pct) && pct <= id(goto_target_pct)) at_target = true;
+            unsigned long lt_ms = (unsigned long)(id(lower_timeout_minutes).state * 60000.0f);
+            if (at_target) {
+              if (id(goto_mode) == ${M_LOWER}) {
+                // Lowered target: do NOT seal the valve — rest in LOWERED_VENT so the
+                // tanks keep venting and the lift settles as far down as it physically
+                // goes, indefinitely. Stop seals it; Lift/Ready move straight out of it.
+                id(lift_state) = ${S_LOWERED_VENT};
+                id(last_stop_reason) = "lowered - vent left open";
+                // floating: the boat can drive on/off here -> presence unknown = presumed ON
+                if (!id(boat_present)) ESP_LOGI("presence", "LOWERED_VENT -> presence reset to presumed BOAT ON");
+                id(boat_present) = true;
+                ESP_LOGI("fsm", "lowered threshold reached -> LOWERED_VENT (valve stays open)");
+              } else {
+                id(lift_state) = ${S_HOLD};
+                id(last_stop_reason) = "lower target reached";
+                ESP_LOGI("fsm", "lower target reached -> HOLD");
+              }
+            } else if ((now - id(lower_start_time)) > lt_ms) {
+              // backstop: descent never confirmed the target -> give up and seal
+              id(lift_state) = ${S_HOLD};
+              id(last_stop_reason) = (id(goto_mode) == ${M_LOWER})
+                  ? "lower timeout (lowered zone never confirmed - valve closed)"
+                  : "lower timeout";
+              // rev K.2: a Lowered-bound descent may have reached floating depth
+              // without ever confirming the zone — the boat could have changed,
+              // so presence resets to presumed ON just like the LOWERED_VENT path.
+              if (id(goto_mode) == ${M_LOWER}) id(boat_present) = true;
+              ESP_LOGI("fsm", "lower timeout -> HOLD");
+            }
+          }
+
+          // ---- resting at the bottom: vent stays open, ALWAYS (rev K.4,
+          //      Mike 2026-07-19). Any HOLD settled in the Lowered zone —
+          //      post-reboot, post-Stop, or a timed-out lower that settles in
+          //      later — re-enters LOWERED_VENT so the tank keeps venting.
+          //      Boat can come/go at the bottom -> presence presumed ON. ----
+          else if (s == ${S_HOLD} && id(angle_trusted) && id(pos_at_lowered)) {
+            id(lift_state) = ${S_LOWERED_VENT};
+            id(boat_present) = true;
+            id(last_stop_reason) = "at lowered - vent reopened";
+            ESP_LOGI("fsm", "HOLD in Lowered zone -> LOWERED_VENT (vent stays open)");
+          }
+
+          // ---- move timing (calibration runs + diagnostics) ----
+          {
+            int ps = id(prev_lift_state);
+            int cs = id(lift_state);
+            bool ps_rest = (ps == ${S_HOLD} || ps == ${S_LOWERED_VENT});
+            bool cs_rest = (cs == ${S_HOLD} || cs == ${S_LOWERED_VENT});
+            bool ps_move = (ps == ${S_RAISING} || ps == ${S_LOWERING});
+            bool cs_move = (cs == ${S_RAISING} || cs == ${S_LOWERING});
+            if (ps_rest && cs_move) {
+              id(move_start_ms) = now;
+              id(move_start_angle) = id(current_angle);
+              // arm the presence classifier on RAISE starts only (rev K)
+              if (cs == ${S_RAISING} && !id(manual_move) && !std::isnan(id(lift_pct))) {
+                id(presence_start_pct) = id(lift_pct);
+                id(presence_classified) = false;
+              } else {
+                id(presence_start_pct) = NAN;
+                id(presence_classified) = true;
+                // rev K.3: a Max launch whose classifier can't arm (angle blip
+                // at start) must not sail up unclassified — demote to Lift.
+                if (cs == ${S_RAISING} && id(goto_mode) == ${M_MAX} && id(boat_present)) {
+                  id(goto_target_pct) = id(top_target_pct).state;
+                  id(goto_mode) = ${M_LIFT};
+                  ESP_LOGW("presence", "Max launch without classifier arm -> demoted to Lift (roof guard)");
+                }
+              }
+              ESP_LOGI("move", "START %s angle=%.2f° mode=%d manual=%d",
+                       (cs == ${S_LOWERING}) ? "LOWER" : "RAISE",
+                       id(current_angle), id(goto_mode), id(manual_move));
+            }
+            if (ps_move && cs_rest) {
+              float dur = (now - id(move_start_ms)) / 1000.0f;
+              id(last_move_duration_sec) = dur;
+              ESP_LOGI("move", "END %.1fs  %.2f° -> %.2f°  mode=%d",
+                       dur, id(move_start_angle), id(current_angle), id(goto_mode));
+            }
+            id(prev_lift_state) = cs;
+          }
+      # re-assert outputs from (possibly updated) state every tick
+      - script.execute: apply_outputs
+
+  # ---- AUTO-MAINTAIN observer + actuator ----
+  # Measures wave amplitude, sag rate, tilt, and detects a sustained sag below the armed
+  # setpoint. Always runs (rev J: the separate Observe enable switch was removed).
+  # With "Auto-Maintain" OFF it only counts shadow top-ups (pure instrumentation);
+  # with it ON the same confirmed sag fires a REAL top-up via do_goto (normal raise path).
+  - interval: 250ms
+    then:
+      - lambda: |-
+          unsigned long now = millis();
+          unsigned long alert_window_ms =
+              (unsigned long)(id(maintain_alert_window_hours).state * 3600000.0f);
+          if (id(auto_topup_window_start) == 0 ||
+              (!id(auto_topup_lockout) && now - id(auto_topup_window_start) >= alert_window_ms)) {
+            id(auto_topup_window_start) = now;
+            id(auto_topup_window_count) = 0;
+          }
+          float pct = id(lift_pct);   // single-source height % (250 ms supervisor)
+          bool good = id(have_cal) && id(angle_trusted) && !std::isnan(pct);
+
+          // ---- wave-stripping EMA + 60 s peak-to-peak window ----
+          if (good) {
+            float tau = id(maintain_smoothing_seconds).state;
+            float a = (tau > 0.0f) ? (0.25f / tau) : 1.0f;   // dt = 0.25 s
+            if (a > 1.0f) a = 1.0f;
+            if (id(obs_height_filt) < -900.0f) id(obs_height_filt) = pct;
+            id(obs_height_filt) = a * pct + (1.0f - a) * id(obs_height_filt);
+            if (pct < id(obs_win_min)) id(obs_win_min) = pct;
+            if (pct > id(obs_win_max)) id(obs_win_max) = pct;
+          }
+          if (id(obs_win_start) == 0) id(obs_win_start) = now;
+          if (now - id(obs_win_start) >= 60000UL) {
+            id(obs_wave_pp) = (id(obs_win_max) > -900000.0f)
+                              ? (id(obs_win_max) - id(obs_win_min)) : 0.0f;
+            id(obs_win_min) = 1000000.0f; id(obs_win_max) = -1000000.0f;
+            id(obs_win_start) = now;
+          }
+
+          // ---- sag rate (%/h) from the filtered height, sampled every 60 s ----
+          if (good && id(obs_height_filt) > -900.0f) {
+            if (id(obs_rate_last_t) == 0) {
+              id(obs_rate_last_t) = now; id(obs_rate_last_h) = id(obs_height_filt);
+            } else if (now - id(obs_rate_last_t) >= 60000UL) {
+              float dt_h = (now - id(obs_rate_last_t)) / 3600000.0f;
+              if (dt_h > 0.0f) id(obs_sag_rate) = (id(obs_height_filt) - id(obs_rate_last_h)) / dt_h;
+              id(obs_rate_last_t) = now; id(obs_rate_last_h) = id(obs_height_filt);
+            }
+          }
+
+          // ---- SHADOW top-up detector: latched arm at Top/Ready, mirrors Phase-2 ----
+          float ready_pct = id(ready_target_pct);
+          bool at_top   = good && id(pos_at_top);
+          bool at_ready = good && id(pos_at_ready);
+
+          if (id(lift_state) != ${S_HOLD} || !good) {
+            // not in HOLD, or angle untrusted -> fully disarm
+            id(obs_arm_mode) = 0; id(obs_settled_since) = 0;
+            id(obs_below_since) = 0; id(obs_below_now) = false;
+          } else if (id(obs_arm_mode) == 0) {
+            // arm (latch) when resting at a maintained setpoint
+            if (at_top)        { id(obs_arm_mode) = 1; id(obs_settled_since) = now; id(obs_below_since) = 0; }
+            else if (at_ready) { id(obs_arm_mode) = 2; id(obs_settled_since) = now; id(obs_below_since) = 0; }
+          } else {
+            // armed: keep watching through the sag (does NOT require staying inside the band)
+            float setpoint = (id(obs_arm_mode) == 1) ? id(top_target_pct).state : ready_pct;
+            unsigned long settle_ms = (unsigned long)(id(maintain_settle_seconds).state * 1000.0f);
+            bool settled = (now - id(obs_settled_since)) >= settle_ms;
+            bool below = settled && (id(obs_height_filt) > -900.0f)
+                         && (id(obs_height_filt) < setpoint - id(maintain_sag_deadband).state);
+            id(obs_below_now) = below;
+            if (below) {
+              if (id(obs_below_since) == 0) id(obs_below_since) = now;
+              unsigned long persist_ms = (unsigned long)(id(maintain_persist_seconds).state * 1000.0f);
+              unsigned long gap_ms = (unsigned long)(id(maintain_min_interval_min).state * 60000.0f);
+              bool gap_ok = (id(obs_last_shadow) == 0) || (now - id(obs_last_shadow)) >= gap_ms;
+              if ((now - id(obs_below_since)) >= persist_ms && gap_ok) {
+                id(obs_shadow_count)++;
+                id(obs_last_shadow) = now;
+                id(obs_below_since) = 0;   // model a top-up restoring the setpoint, then keep watching
+                ESP_LOGW("maintain", "top-up #%d at %s (filt %.1f%% < %.1f%% - %.1f)",
+                         id(obs_shadow_count), id(obs_arm_mode) == 1 ? "Lift" : "Ready",
+                         id(obs_height_filt), setpoint, id(maintain_sag_deadband).state);
+                // ---- Phase-2: actually restore the setpoint through the normal raise path ----
+                // do_goto runs only from HOLD and re-checks calibration + angle trust; the move
+                // then inherits the valve interlock, stall detector, watchdog and blower cap.
+                // Next tick lift_state != 0 disarms this observer until the raise completes.
+                if (id(auto_maintain_switch).state && !id(test_mode) && id(lift_state) == ${S_HOLD}) {
+                  int max_topups = (int) lroundf(id(maintain_max_topups).state);
+                  if (id(auto_topup_lockout) || id(auto_topup_window_count) >= max_topups) {
+                    id(auto_topup_lockout) = true;
+                    ESP_LOGE("maintain", "AUTO-MAINTAIN LOCKOUT: %d top-ups in %.0fh window",
+                             id(auto_topup_window_count), id(maintain_alert_window_hours).state);
+                    return;
+                  }
+                  int md = (id(obs_arm_mode) == 1) ? ${M_LIFT} : ${M_READY};
+                  float sp = (id(obs_arm_mode) == 1) ? id(top_target_pct).state : ready_pct;
+                  id(obs_act_count)++;
+                  id(auto_topup_window_count)++;
+                  if (id(auto_topup_window_count) >= max_topups) {
+                    id(auto_topup_lockout) = true;
+                    ESP_LOGE("maintain", "AUTO-MAINTAIN LOCKOUT armed after top-up #%d in %.0fh window",
+                             id(auto_topup_window_count), id(maintain_alert_window_hours).state);
+                  }
+                  ESP_LOGW("maintain", "AUTO-MAINTAIN actuate #%d -> raise to %s (%.1f%%)",
+                           id(obs_act_count), md == 0 ? "Lift" : "Ready", sp);
+                  id(do_goto)->execute(sp, md);
+                }
+              }
+            } else {
+              id(obs_below_since) = 0;
+            }
+          }
+
+  # ---------------------------------------------------------------------------
+  #  Panel link (RS485) — STA emitter + CMD parser. Telemetry + intents ONLY.
+  #  Protocol: boat_lift_link_protocol.md. The panel is a request/display
+  #  terminal; every CMD is validated through the SAME request_* scripts a dock
+  #  button uses, so nothing here can bypass the FSM or the safety supervisor.
+  # ---------------------------------------------------------------------------
+  # STA heartbeat -> panel (~2 Hz): state token + height + flags + water + human msg.
+  - interval: 500ms
+    then:
+      - lambda: |-
+          float pct = id(lift_pct);   // single-source height % (250 ms supervisor)
+          bool have = id(have_cal);
+          int s = id(lift_state);
+          const char* st = "HOLDING";
+          if (s == ${S_FAULT})              st = "FAULT";
+          else if (s == ${S_BYPASS})        st = "BYPASS";
+          else if (s == ${S_RAISING})       st = "RAISING";
+          else if (s == ${S_LOWERING})      st = "LOWERING";
+          else if (s == ${S_LOWERED_VENT})  st = "LOWERED";   // resting, vent open
+          else if (have && id(angle_trusted) && !std::isnan(pct)) {   // HOLD: resting position
+            if (id(pos_at_lowered))       st = "LOWERED";
+            else if (id(pos_at_ready))    st = "READY";
+            else if (id(pos_at_max))      st = "LIFTED_MAX";
+            else if (id(pos_at_top))      st = "LIFTED";
+            else if (!std::isnan(id(ready_target_pct)))
+              st = (pct < id(ready_target_pct)) ? "BETWEEN_LOWERED_READY" : "BETWEEN_READY_LIFTED";
+            else                          st = "HOLDING";
+          }
+          int hp = (have && !std::isnan(pct)) ? (int)lroundf(pct) : -1;
+          float w = id(water_temp).state;
+          char wbuf[16];
+          if (std::isnan(w)) strcpy(wbuf, "nan"); else snprintf(wbuf, sizeof(wbuf), "%.1f", w);
+          char buf[180];
+          snprintf(buf, sizeof(buf), "STA v=1 st=%s h=%d prob=%d trust=%d water=%s msg=%s\n",
+                   st, hp, id(lift_problem).state ? 1 : 0, id(angle_trusted) ? 1 : 0,
+                   wbuf, id(lift_status_text).state.c_str());
+          id(link_uart).write_str(buf);
+
+  # CMD parser <- panel: assemble newline-terminated lines, map req=* to the
+  # existing intent scripts (ignore-unknown). Same validation as a dock button.
+  - interval: 50ms
+    then:
+      - lambda: |-
+          static std::string line;
+          while (id(link_uart).available()) {
+            uint8_t c;
+            if (!id(link_uart).read_byte(&c)) break;
+            if (c == '\n' || c == '\r') {
+              if (line.rfind("CMD", 0) == 0) {
+                size_t p = line.find("req=");
+                if (p != std::string::npos) {
+                  std::string req = line.substr(p + 4);
+                  size_t e = req.find(' ');
+                  if (e != std::string::npos) req = req.substr(0, e);
+                  ESP_LOGI("link", "RX CMD req=%s", req.c_str());
+                  if      (req == "LIFT" || req == "TOP")              id(request_goto_top)->execute();
+                  else if (req == "LIFT_MAX" || req == "MAX")          id(request_goto_max)->execute();
+                  else if (req == "READY")      id(request_goto_ready)->execute();
+                  else if (req == "LOWER" || req == "LOWERED")         id(request_goto_lowered)->execute();
+                  else if (req == "STOP")       id(request_stop)->execute();
+                  else if (req == "RESET")      id(request_stop)->execute();   // rev L: Stop = universal clear
+                  else if (req == "BYPASS_ON")  id(enter_bypass)->execute();
+                  else if (req == "BYPASS_OFF") id(exit_bypass)->execute();
+                  else ESP_LOGW("link", "unknown req=%s", req.c_str());
+                }
+              }
+              line.clear();
+            } else if (line.size() < 120) {
+              line.push_back((char) c);
+            }
+          }

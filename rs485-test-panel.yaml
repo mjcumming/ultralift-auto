@@ -1,0 +1,66 @@
+# =============================================================================
+#  RS485 LINK BENCH TEST — Panel end (Waveshare ESP32-S3-Touch-LCD-4)  DIAGNOSTIC
+# =============================================================================
+#  Kept as a quick way to sanity-check the panel<->lift RS485 wire independent of
+#  the display/touch/app. Sends "PING-PANEL <n>" once a second and logs everything
+#  it receives (UART debug). Flash both this and rs485-test-lift.yaml, watch logs:
+#  each board should print the OTHER's pings (proves both directions).
+#  Then re-flash the real boat-lift-panel.yaml.
+#
+#  Confirmed-good pins (verified 2026-06-22): RS485 SP3485 auto-direction (no DE),
+#  ESP TX=GPIO44 / RX=GPIO43, 9600 8N1. GPIO43/44 are UART0, so the console is on
+#  USB-CDC (hardware_uart below). No display/touch here on purpose — pure wire test.
+#  OTA:  esphome compile rs485-test-panel.yaml ; esphome upload rs485-test-panel.yaml --device <panel-ip>
+# =============================================================================
+substitutions:
+  name: rs485-test-panel
+
+esphome:
+  name: ${name}
+  min_version: 2026.6.0
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+
+logger:
+  level: DEBUG
+  hardware_uart: USB_SERIAL_JTAG    # free GPIO43/44 for RS485; USB & network logs still work
+
+wifi:
+  networks:
+    - ssid: !secret wifi_ssid_1
+      password: !secret wifi_password_1
+    - ssid: !secret wifi_ssid_2
+      password: !secret wifi_password_2
+
+api:
+
+ota:
+  - platform: esphome
+
+uart:
+  - id: link_uart
+    tx_pin: GPIO44
+    rx_pin: GPIO43
+    baud_rate: 9600
+    debug:
+      direction: BOTH
+      dummy_receiver: true          # this UART has no other consumer; debug reads it
+      after:
+        delimiter: "\n"
+      sequence:
+        - lambda: UARTDebug::log_string(direction, bytes);
+
+interval:
+  - interval: 1s
+    then:
+      - lambda: |-
+          static uint32_t n = 0; n++;
+          char b[32];
+          int len = snprintf(b, sizeof(b), "PING-PANEL %u\n", n);
+          id(link_uart).write_array((const uint8_t *) b, len);
+          ESP_LOGI("rs485", "sent PING-PANEL %u", n);
