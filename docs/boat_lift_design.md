@@ -2,7 +2,7 @@
 
 **Project:** ESPHome automation for a HydroHoist UltraLift UL2 8800 hydropneumatic boat lift (dual tank, two valves, two IMUs).
 **Controller:** KinCony KC868-A16 (ESP32) — live config [`boat-lift.yaml`](../boat-lift.yaml).
-**Companions:** [`adr.md`](adr.md) (design decisions) · [`boat_lift_link_protocol.md`](boat_lift_link_protocol.md) (RS485 panel link) · [`boat_lift_panel_design_revA.md`](boat_lift_panel_design_revA.md) (touch panel UI).
+**Companions:** [`adr.md`](adr.md) (design decisions) · [`boat_lift_ui_reference.md`](boat_lift_ui_reference.md) (web UI & calibration reference) · [`boat_lift_link_protocol.md`](boat_lift_link_protocol.md) (RS485 panel link) · [`boat_lift_panel_design_revA.md`](boat_lift_panel_design_revA.md) (touch panel UI).
 
 Firmware/control design for single-button go-to-position operation with local safety supervision, dual-tank auto-leveling, autonomous height maintenance, position sensing, dock buttons with status LEDs, and Home Assistant visibility. Safety-critical behaviour stays entirely on the A16; the network is observability only.
 
@@ -50,7 +50,7 @@ Each WT901 reports two tilt axes:
 
 - **X-axis (Roll) = the height/position axis.** `current_angle` tracks Roll; all height %, setpoints, calibration, and go-to logic derive from X on the **master** IMU.
   **Sign convention (field-confirmed):** fully **lowered = positive** angle; raising swings the angle **negative**. Height % handles the negative span transparently. The one-sided Lowered zone ("at the lowered angle *or settled beyond it*") depends on this sign — revisit if a sensor is remounted.
-- **Y-axis (Pitch) = observe-only “sensor moved” axis.** Pitch should not change as the lift swings; drift implies the sensor was knocked or loosened. The derived **`Lift Tilt`** sensor (pitch minus a captured reference) is the legacy consumer; the two-IMU **Level Error** is the primary list signal and is expected to supersede Guard B.
+- **Y-axis (Pitch) = decoded but unused.** Pitch should not change as the lift swings; drift would imply the sensor was knocked or loosened. The pitch-based tilt proxy (`Lift Tilt`, `Lift Tilt Critical`, LEVEL ref capture) was **retired 2026-07-24** — the two-IMU **Level Error** is the list signal, and the level-divergence hard stop (§16.2) is the mechanical backstop.
 
 ---
 
@@ -130,7 +130,7 @@ The **current resting mode** is derived from the live angle vs each setpoint (wi
 
 **Why:** Lift Max (~148 % of the everyday span) can drive a boat’s tower into a boathouse roof — it must only run with the boat **off** the lift. There is no presence switch; presence is inferred from physics.
 
-**How:** presence is classified on **raise cycles only**, from the early climb rate — a loaded raise is far slower than an empty one (example field rates: loaded **~0.53 %/s**, empty **~1.5–1.7 %/s**). The classifier times the first 15 %-points of climb and compares against the `Empty Raise Rate Min` slider (default **1.20 %/s**, biased high so a loaded raise cannot fake EMPTY). Fail-safe polarity: unknown/unclassified = **boat ON**, and boat ON blocks `request_goto_max`. Presence resets to presumed-ON wherever the boat could change (LOWERED_VENT, bypass entry); the latch persists across reboots.
+**How:** presence is classified on **raise cycles only**, from the early climb rate — a loaded raise is far slower than an empty one (example field rates: loaded **~0.53 %/s**, empty **~1.5–1.7 %/s**). The classifier times the first 15 %-points of climb and compares against the `Empty Raise Rate Min` slider (ships at the unreachable ceiling **99** so every raise reads BOAT ON until real empty and loaded baselines are recorded; tuned on this install to **1.20 %/s**, biased high so a loaded raise cannot fake EMPTY). Fail-safe polarity: unknown/unclassified = **boat ON**, and boat ON blocks `request_goto_max`. Presence resets to presumed-ON wherever the boat could change (LOWERED_VENT, bypass entry); the latch persists across reboots.
 
 **Decide en route:** a Max press from a LOW start (<50 %) with presence unknown is allowed to launch — the classifier resolves on the way up, and ANY non-EMPTY outcome demotes the in-flight Max to the boat-safe Lift target. High starts stay hard-blocked without a positive EMPTY verdict from the previous raise. Leveling interaction: a slave-side throttle during the timing window inflates the master's apparent rate, so that direction **aborts** classification for the raise (the previous latch holds).
 
@@ -149,7 +149,7 @@ Pressing a mode button sends the lift to that setpoint; the controller **chooses
 | **HOLD** | OFF | CLOSED | Resting (at a mode, or between). |
 | **RAISING** | ON | OPEN / throttled | Pumping air in; rising toward target. Blower + valves energize **together**. |
 | **LOWERING** | OFF | OPEN / throttled | Venting; descending toward target. |
-| **LOWERED_VENT** | OFF | **OPEN** | Resting at Lowered with vents left open — the lift keeps settling indefinitely. New commands accepted; **Stop seals the valves** (→ HOLD). |
+| **LOWERED_VENT** | OFF | **OPEN** | Resting at Lowered with vents left open — the lift keeps settling indefinitely. New commands accepted. **The vent stays open at the bottom, always** — Stop here is a no-op (a standing supervisor rule re-enters LOWERED_VENT from any HOLD settled in the Lowered zone; a latched FAULT still seals). |
 | **FAULT** | OFF | CLOSED | Latched safe state + reason. |
 | **BYPASS** | OFF | **OPEN** | Manual override (§6.6): valves open, blower off, FSM idle. |
 
@@ -179,7 +179,7 @@ Position checks use **one captured setpoint per mode + one configurable band**: 
 
 - **RAISING:** stop when the target zone is reached → HOLD. (Backstops: stall detector and absolute blower cap.)
 - **LOWERING:** stop when the target zone is reached → HOLD — **except a Lowered target**, which rests in **LOWERED_VENT**. The `Lower Timeout` timer backstops a descent that never confirms its zone.
-- **Stop button:** any moving state → HOLD; from LOWERED_VENT it seals the vents → HOLD. Mode buttons do **not** cancel — they retarget (§6.2).
+- **Stop button:** any moving state → HOLD. At the bottom Stop is a **no-op** — the vent stays open always; the 250 ms supervisor re-enters LOWERED_VENT from any HOLD settled in the Lowered zone (post-boot, post-timeout included). A latched FAULT still seals. Mode buttons do **not** cancel — they retarget (§6.2).
 - **Supervisor:** → FAULT (hard) or **auto-stop on loss of angle trust** (§6.5).
 
 ### 6.4 Preconditions
@@ -226,7 +226,7 @@ Maintained dry contacts report each valve’s **real** end-stop position, indepe
 
 Uses today (**display/diagnostic — not an FSM input yet**):
 - Live valve state on Diagnostics, independent of Y2/Y3 commands.
-- **Manual-operation detector:** if command and feedback still disagree after a grace window (`Valve Travel Time` + 2 s) and the mismatch persists ~2 s, status shows **"Manual valve"**.
+- **Manual-operation detector:** a valve at the **wrong end-stop** once it should have left its old seat (~5 s after a command change), or **mid-travel far past worst-case travel** (15 s; measured ~7 s open / ~2.3 s close), persisting ~2 s → status shows **"Manual valve"**. Fixed constants — the former `Valve Travel Time` slider was retired 2026-07-24 (the end-stops are direct evidence; nothing else consumed it).
 
 Future option (not done): use end-stops as stuck-valve fault triggers.
 
@@ -262,7 +262,7 @@ Future option (not done): use end-stops as stuck-valve fault triggers.
 
 - **`Lift Activity`** *(machine-friendly — what the lift is DOING)*: exactly one of `Idle / Raising / Lowering / Leveling / Fault / Bypass`. `LOWERED_VENT` reads as `Idle`.
 - **`Lift Position`** *(machine-friendly — WHERE it is)*: exactly one of `Lowered / Ready / Lifted / Lifted Max / Between / Unknown`.
-- **`Lift Status`** *(human-readable line, feeds the panel `msg=`)* via a priority ladder:
+- **`Lift Status`** *(human-readable line, feeds the panel `msg=`; shown as the **headline at the top of the web Control group**)* via a priority ladder:
   1. `FAULT — <reason>`
   2. `BYPASS — valve open, blower off (manual override)`
   3. Moving → `MANUAL raising…` (untrusted) or `Raising -> Ready` (go-to; **no live % embedded**)
@@ -288,7 +288,7 @@ Only **trusted** master angle allows automatic go-to moves:
 |---|---|---|
 | **OFFLINE** | no fresh frames within `Angle Freshness` (~3 s) | manual recovery; sensor OK = off |
 | **OUT OF RANGE** | data fresh, but live angle outside calibrated span ± `Angle Plausibility Margin` (default 10°) | manual recovery; auto-move stopped |
-| **SENSOR MOVED** *(Guard B, Y-axis — placeholder)* | Pitch drifts > `Pitch Drift Limit` from commissioning reference | decoded, not yet acted on |
+| **SENSOR MOVED** *(Guard B — retired 2026-07-24 with the pitch proxy)* | — | a moved/loosened sensor surfaces as persistent two-IMU Level Error / divergence |
 | **TRUSTED** | fresh + plausible | normal go-to |
 
 Implemented as `angle_valid` (fresh + inside ±95°) → `angle_trusted` (valid + plausible). Loss of trust mid-move **auto-stops** to HOLD. The slave IMU runs the same ladder independently (`angle2_valid` / `angle2_trusted`); leveling degrades to ganged valves when the slave loses trust.
@@ -303,7 +303,6 @@ Size the `angle_valid` gate to the *mounted* sensor. With the confirmed mounting
 - **Three slave captures** at the same physical positions (Lowered / Ready / Lift) so frame racking is calibrated out in % space (§16.2).
 - Each capture is also an **editable number** (Advanced Tuning) so a setpoint can be nudged or restored without re-running the lift. A **Calibration Summary** line shows every zone edge.
 - Height % is linear between Lift and Lowered (negative span — lowered is the *high* angle, §2.2).
-- A **capture LEVEL ref** button records the reference pitch for the tilt proxy (§17).
 - Stored in flash (`restore_value: yes`).
 - Target moves refused until calibrated; the plausibility window (§9.4) derives from these captures.
 
@@ -344,14 +343,12 @@ Size the `angle_valid` gate to the *mounted* sensor. With the confirmed mounting
 
 Still open:
 
-- **Descent-rate / seal-failure alarm.** Triggers: height falling while both valves are commanded closed; rate far above the known lower profile during a commanded lower.
-- **Can't-hold / immediate re-sag FAULT** (topped up and sagged again within a short window) — alert without disabling keepers.
-- **Tighten stall thresholds** from recorded baselines (still permissive: grace 60 s / timeout 120 s / 0.2°; 5-min blower cap remains the hard backstop).
-- **Diagnose command-to-valve-motion delay** (~1–2 s press-to-sound; firmware path ≈100 ms — use §7.1 feedback timestamps).
+- **Emergency descent pattern (proposed, undecided):** on an unfixable level failure with the boat high (level-divergence hard stop / catch-up fail), vent both sides down to Ready and seal there, instead of sealing in place — at Ready a list is harmless; aloft it is not. Needs an agreed spec (triggers, Stop override, blind-descent behaviour) before implementation.
 - Decide manual jog: **latched-with-Stop** (current) vs **hold-to-run / deadman**.
 - **Maintain-at-Ready policy** (float-away guard): whether sustained Ready sag should escalate to notify/FAULT.
 - Decide whether valve feedback should ever gate the FSM (stuck-valve fault) or stay display-only.
-- Retire the Lift Tilt pitch proxy once two-IMU level error covers the "sensor moved" case.
+
+Closed 2026-07-24: the descent-rate/seal-failure and re-sag alarms shipped as the **Air Loss Alert** (§15.5); **stall thresholds tightened** from the field-data replay (grace 20 s / timeout 30 s — worst healthy progress gap was 4 s in both loaded and empty raises); **blower cap default 4 min** (loaded full raise 134 s); the ~1–2 s command-to-valve delay is attributed to actuator mechanics (firmware path ≈100 ms — measure with §7.1 feedback timestamps if it recurs).
 
 Field move profiles used for tuning live in `field-data/`.
 
@@ -386,7 +383,7 @@ Consequences:
 
 Hold the lift at its parked setpoint against slow air loss (**height**) and, at everyday Lift only, against developing list (**level**). Both are thin policies on the existing FSM. They inherit every backstop: blower runtime cap, stall detector, angle-trust auto-stop, level-divergence hard stop.
 
-**Maintain Height** and **Maintain Level** switches **default ON**. There is **no sticky lockout** that disables keepers after N events — an unattended lift must not tip or sag because a counter tripped. Visibility is via **per-visit counters** on `Maintain Observe`.
+**Auto-Maintain Height** and **Auto-Maintain Level** switches **default ON**. There is **no sticky lockout** that disables keepers after N events — an unattended lift must not tip or sag because a counter tripped. Visibility is via **per-visit counters** on `Maintain Observe`.
 
 ### 15.1 Where each keeper runs
 
@@ -402,7 +399,7 @@ In-move throttle follows **Maintain Level** during any go-to, not only at Lift.
 ### 15.2 Height keeper
 
 - **Observer always runs:** filters height, estimates sag rate and wave movement.
-- **`Maintain Height`** (default ON): confirmed sag fires a **real top-up through `do_goto()`**. Arms while idle at Ready / Lift / Lift Max. Detector: settle delay → filtered height below `setpoint − deadband` for persist time → min interval between top-ups. Tuned defaults: sag deadband **3 %**, persist 60 s, min interval 12 min.
+- **`Auto-Maintain Height`** (default ON): confirmed sag fires a **real top-up through `do_goto()`**. Arms while idle at Ready / Lift / Lift Max. Detector: settle delay → filtered height below `setpoint − deadband` for persist time → min interval between top-ups. Tuned defaults: sag deadband **4 %**, persist 60 s, min interval 12 min.
 - **Up-only** — never auto-lowers.
 - **Priority over rest-level:** if master height is below the sag deadband, any rest-level pulse aborts and height owns the recovery.
 
@@ -423,7 +420,19 @@ In-move throttle follows **Maintain Level** during any go-to, not only at Lift.
 - **Notify as warning:** high visit top-up or level counts; unusually negative sag rate.
 - **Never auto-correct:** unknown position; untrusted angle; lowered/floating state; list at Ready or Lift Max (height only there).
 
-### 15.5 Baselines to record at commissioning
+### 15.5 Air Loss Alert
+
+Every keeper intervention is a symptom: a sealed lift should not descend, and a parked lift should not need frequent correction. The **`Air Loss Alert`** problem binary (Status) makes that pattern visible. It **never actuates** — the keepers keep correcting regardless (ADR-004); this is the "and you should know about it" layer. HA alerts on the binary; `Air Loss Detail` (Diagnostics) and the `airloss` log tag carry the reason. Triggers (Advanced Tuning):
+
+| Trigger | Meaning | Default |
+|---|---|---|
+| **Sealed drop** | filtered height fell this far in 30 s with both valves commanded closed (60 s settle grace after sealing; an event latches the alert ~30 min) | 2 % |
+| **Sag rate** | parked sag rate beyond this, downward | 20 %/h |
+| **Visit events** | height top-ups + level fixes in one visit reach this count | 4 |
+
+Catches seal failure, a manually opened valve, the §14.2 compression spiral, and slow-leak nights — the failures the firmware can only report, not fix. (Normal sealed seep measured ~5–13 %/h; the spiral runs ~1 %/s.)
+
+### 15.6 Baselines to record at commissioning
 
 - Lift / lower time with and without boat
 - Normal top-up duration and overnight visit counts at Lift / Ready / Max
@@ -482,7 +491,7 @@ While parked at **Lift**, a list is corrected by the at-rest keeper. Ready and L
 4. Vent floor: abort if master would drop below the Lift band.
 5. Progress check on feed (~15 s) or abort + log.
 6. No sticky lockout — visit **level** counter increments; §16.2 hard stop remains the mechanical backstop.
-7. Eligibility: HOLD + at Lift + both IMUs trusted + Maintain Level ON + not bench/bypass.
+7. Eligibility: HOLD + at Lift + both IMUs trusted + Auto-Maintain Level ON + not bench/bypass.
 8. FSM stays in HOLD; `rest_pulse` biases `apply_outputs`. `Lift Activity` reads **Leveling** while a pulse is active.
 
 ### 16.6 FSM interactions
@@ -496,7 +505,7 @@ While parked at **Lift**, a list is corrected by the at-rest keeper. Ready and L
 
 | Condition | Behaviour |
 |---|---|
-| Maintain Level OFF | valves ganged; decisions still logged as `LEVEL(shadow)` |
+| Auto-Maintain Level OFF | valves ganged; decisions still logged as `LEVEL(shadow)` |
 | Slave stale / implausible | leveling + completion gate disabled, valves ganged |
 | Master trust lost mid-move | auto move stops |
 | Sides diverge past hard stop | FAULT + make-safe |
@@ -511,7 +520,7 @@ While parked at **Lift**, a list is corrected by the at-rest keeper. Ready and L
 
 ### 16.9 Key entities (leveling)
 
-Switches: `Maintain Level` / `Maintain Height` (default ON), bench `Valve Port (Y3)`. Numbers: slave cal angles; Level Deadband / Hysteresis / Min Hold / Catch-up Timeout; Rest Level Trigger / Persist. Sensors: `Arm Angle Port`, `Height Port`, `Level Error (%)`, `Maintain Observe`. Binary: `IMU Port OK`. Text: `Level Status`, `Valve Positions`.
+Switches: `Auto-Maintain Level` / `Auto-Maintain Height` (default ON), bench `Valve Port (Y3)`. Numbers: slave cal angles; Level Deadband / Hysteresis / Min Hold / Catch-up Timeout; Rest Level Trigger / Persist. Sensors: `Arm Angle Port`, `Height Port`, `Level Error (%)`, `Maintain Observe`. Binary: `IMU Port OK`. Text: `Level Status` (simple, state-aware: what leveling is doing, or which side is high/low), `Valve Positions`.
 
 ---
 
@@ -522,10 +531,9 @@ Diagnostic entities, computed every 250 ms, **never write blower/valve**:
 - **Lift Height (filtered)** — wave-stripped EMA (*Maintain Smoothing*).
 - **Lift Wave P-P (60 s)** — peak-to-peak of raw height over 60 s.
 - **Lift Sag Rate (%/h)** — slope of filtered height.
-- **Lift Tilt (°)** — Pitch minus captured level reference (legacy; prefer Level Error).
-- **Maintain Observe** — visit position, switches, counters, sag rate, arm state.
+- **Maintain Observe** — parked position, per-visit top-up / level-fix counts, sag rate.
 
-Tunable defaults (Advanced Tuning): height **3 % / 60 s / 12 min / 180 s / 20 s**; rest-level **3 % / 30 s**; Tilt Critical **5°**.
+Tunable defaults (Advanced Tuning): height **4 % / 60 s / 12 min / 180 s / 20 s**; rest-level **3 % / 30 s**; Tilt Critical **5°** (level-divergence hard stop).
 
 ---
 

@@ -9,7 +9,7 @@ Built for a HydroHoist **UltraLift UL2 8800** with **per-tank valves and inclino
 ## What it does
 
 - **Go-to-position FSM** — four calibrated setpoints (Lift / Ready / Lowered / Lift Max). Press a button; the controller picks raise vs lower, drives blower + vent valves, and stops on the calibrated zone. Mode buttons retarget mid-move (last press wins); Stop cancels.
-- **Maintain Height / Maintain Level** (default ON) — height top-ups at Ready, Lift, and Lift Max; in-move throttle on every go-to plus at-rest leveling only while parked at Lift. Per-visit counters on `Maintain Observe`. No sticky lockout that disables keeping.
+- **Auto-Maintain Height / Auto-Maintain Level** (default ON) — height top-ups at Ready, Lift, and Lift Max; in-move throttle on every go-to plus at-rest leveling only while parked at Lift. Per-visit counters on `Maintain Observe`. No sticky lockout that disables keeping.
 - **Two-valve / two-IMU leveling** — each tank has its own vent/fill valve and inclinometer; divergence past a hard limit faults the lift safe.
 - **Boat-presence detection** — no sensor needed: a loaded raise climbs much slower than an empty one. The classifier times the first 15 % of climb and uses the verdict to block the roof-endangering Lift Max position whenever a boat is (or might be) aboard, including demoting an in-flight Max the moment the verdict lands.
 - **Safety supervisor** — angle trust ladder (freshness + plausibility, per sensor), stall detection, absolute blower runtime cap in every mode, valve position feedback with a manual-operation detector, degraded manual mode when sensing is lost, latched faults with reasons, power-loss-safe defaults.
@@ -28,6 +28,7 @@ Full bill of materials, wiring, and I/O map: **[docs/boat_lift_design.md](docs/b
 | `boat-lift-panel.yaml` | Touch panel UI (Waveshare ESP32-S3-Touch-LCD-4B), runs standalone in simulation until wired |
 | `rs485-test-lift.yaml` / `rs485-test-panel.yaml` | Minimal ping harnesses to prove the RS485 link independent of app logic |
 | `docs/boat_lift_design.md` | **The design document** — architecture, safety contract, failure modes. Start here. |
+| `docs/boat_lift_ui_reference.md` | **Web UI & calibration reference** — what every entity means, and how to calibrate |
 | `docs/adr.md` | Design decisions and rationale |
 | `docs/boat_lift_link_protocol.md` | Lift ↔ panel RS485 protocol |
 | `docs/boat_lift_panel_design_revA.md` | Panel UI design |
@@ -49,7 +50,7 @@ Full bill of materials, wiring, and I/O map: **[docs/boat_lift_design.md](docs/b
    ```
 
    (Serial logging is off — UART0 feeds the second IMU — so use `esphome logs` over WiFi.)
-4. Commission with the lift, not the desk: capture the four master setpoints (and three slave captures) from real positions, verify each output channel physically, confirm the sensor sign convention (§2.2). **Maintain Height** and **Maintain Level** (Control section switches, default ON) — confirm both on a supervised first night, and watch **Visit Height Top-ups** / **Visit Level Events**.
+4. Commission with the lift, not the desk: capture the four master setpoints (and three slave captures) from real positions, verify each output channel physically, confirm the sensor sign convention (§2.2). **Auto-Maintain Height** and **Auto-Maintain Level** (Control section switches, default ON) — confirm both on a supervised first night, and watch **Visit Height Top-ups** / **Visit Level Events** (Diagnostics).
 
 > **Note on device naming:** this repo uses `device_name: boat-lift`. If you previously flashed under a different ESPHome device name, Home Assistant will see a **new** device; entity history and flash-stored calibrations under the old name do not carry over automatically.
 

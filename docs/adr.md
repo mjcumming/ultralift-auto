@@ -97,7 +97,7 @@ In-move throttle follows Maintain Level on every go-to. Both switches **default 
 
 ## ADR-009 — LOWERED_VENT resting state
 
-**Decision:** Reaching Lowered leaves both valves **open** indefinitely so the lift keeps settling. Stop seals to HOLD.
+**Decision:** Reaching Lowered leaves both valves **open** indefinitely so the lift keeps settling — **the vent stays open at the bottom, always**: a standing supervisor rule re-enters LOWERED_VENT from any HOLD settled in the Lowered zone (post-boot, post-Stop, post-timeout), so Stop at the bottom is a no-op. A latched FAULT still seals.
 
 **Rationale:** “All the way down” is a physical end, not a precise angle band; leaving the vent open matches how the OEM system is used when floating the boat.
 
@@ -122,3 +122,13 @@ In-move throttle follows Maintain Level on every go-to. Both switches **default 
 **Rationale:** This archive is a reference build, not a site- or boat-specific product name.
 
 **Consequence:** Changing `device_name` from a prior install name creates a **new** Home Assistant device; entity history and stored calibrations under the old name do not carry over automatically — re-capture or copy number entities after first flash under the new name.
+
+---
+
+## ADR-012 — Retire the pitch tilt proxy
+
+**Decision:** Remove the pitch-based tilt proxy: the `Lift Tilt` sensor, `Lift Tilt Critical` annunciator, the LEVEL ref capture button, and the persisted pitch reference. Pitch is still decoded but unused. `Tilt Critical (deg)` remains — it is the level-divergence hard-stop threshold (§16.3), and its entity name is kept so the flash-persisted value survives.
+
+**Rationale:** The proxy predates the second IMU. The two-IMU Level Error measures list directly in calibrated %-space, and a moved or loosened sensor surfaces as persistent level error or divergence. The pitch proxy was unproven and deliberately excluded from Lift Problem — a status entity nobody may act on is clutter, not safety.
+
+**Consequence:** "Sensor moved" Guard B is retired with it; the trust ladder relies on freshness + plausibility + the level hard stop.

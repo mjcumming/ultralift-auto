@@ -107,7 +107,7 @@ esphome:
   build_path: .esphome/build/boat-lift
   project:
     name: ultralift.boat_lift
-    version: "0.5.1 (2026-07-24)"   # Control: Maintain Height/Level + visit counters; build with venv ESPHome 2026.6.x
+    version: "0.6.0 (2026-07-24)"   # UI pass (headline, simple status lines, Auto-Maintain names, pitch proxy retired) + Air Loss Alert + data-tuned stall/blower defaults; build with venv ESPHome 2026.6.x
 
 esp32:
   board: esp32dev
@@ -621,15 +621,34 @@ globals:
     type: int
     restore_value: no
     initial_value: "0"
-  # persisted LEVEL reference (pitch axis) for the tilt proxy
-  - id: cal_ref_pitch
+  # (rev I: cal_ref_pitch / cal_ref_pitch_done removed with the pitch tilt proxy —
+  #  the two-IMU Level Error + level_divergence FAULT cover list end to end.)
+
+  # ---- Air Loss Alert scratch (§15.5 — alert-only, never actuates) ----
+  - id: seal_ref_filt            # filtered-height reference for the sealed-drop check
     type: float
-    restore_value: yes
-    initial_value: "0.0"
-  - id: cal_ref_pitch_done
+    restore_value: no
+    initial_value: "-999.0"
+  - id: seal_ref_ms
+    type: unsigned long
+    restore_value: no
+    initial_value: "0"
+  - id: seal_since               # when both valves last became commanded-closed (0 = not sealed)
+    type: unsigned long
+    restore_value: no
+    initial_value: "0"
+  - id: air_alert_latch_ms       # sealed-drop events latch the alert ~30 min
+    type: unsigned long
+    restore_value: no
+    initial_value: "0"
+  - id: air_alert
     type: bool
-    restore_value: yes
+    restore_value: no
     initial_value: "false"
+  - id: air_alert_reason
+    type: std::string
+    restore_value: no
+    initial_value: '""'
 
 # ---------------------------------------------------------------------------
 #  Tunables — live-editable from Home Assistant (persisted)
@@ -792,33 +811,25 @@ number:
   # =========================================================================
 
   # ---- mechanics / timing ----
-  # rev H: no longer a blower interlock (blower + valve start together). Now only
-  # the grace window for the valve command-vs-feedback disagreement detector.
-  # Measured travel: open ~7 s, close ~2.3 s.
-  - platform: template
-    name: "Valve Travel Time (s)"
-    id: valve_travel_seconds
-    web_server: {sorting_group_id: group_advanced, sorting_weight: 10}
-    optimistic: true
-    restore_value: true
-    initial_value: 12
-    min_value: 2
-    max_value: 60
-    step: 1
-    unit_of_measurement: "s"
-    entity_category: config
+  # (rev I: the "Valve Travel Time (s)" slider is RETIRED — since rev H its only
+  #  job was the manual-valve detector's grace window, and the CR5-02 end-stop
+  #  contacts are direct evidence: wrong end-stop = manual, still-moving far past
+  #  worst-case travel (~7 s open / ~2.3 s close) = stuck. Fixed constants in the
+  #  detector replace the knob.)
 
   # Sole blower failsafe (rev E: replaces the separate Blower Watchdog — the
   # absolute cap always tripped first, so the watchdog could never fire).
   # ABSOLUTE cap, any mode (manual too). MUST exceed real full-raise time
-  # before real operation (OEM auto-off ~15 min).
+  # (OEM auto-off ~15 min). Default 4 min (2026-07-24): loaded full raise
+  # measured 134 s; ~1.5x margin on the worst realistic case. Persisted on
+  # the device — nudge the slider after OTA to pick up the new default.
   - platform: template
     name: "Blower Max Runtime (min)"
     id: blower_max_minutes
     web_server: {sorting_group_id: group_advanced, sorting_weight: 11}
     optimistic: true
     restore_value: true
-    initial_value: 5
+    initial_value: 4
     min_value: 1
     max_value: 15
     step: 1
@@ -922,10 +933,11 @@ number:
     entity_category: config
 
   # ---- stall detection (raising) ----
-  # rev I port: deliberately PERMISSIVE defaults — raise speed differs a lot
-  # loaded vs empty and no §17.4 baselines are recorded yet, so until real move
-  # data exists the stall detector should only catch a truly dead raise (the
-  # 5-min absolute blower cap remains the hard backstop). Tighten from data.
+  # Tightened 2026-07-24 from the field-data replay: in BOTH recorded raises
+  # (loaded 132 s AND empty 16 s) the worst gap between 0.2-deg progress
+  # checkpoints was 4 s — a healthy raise never pauses. Grace covers valve
+  # open (~7 s) + blower spool; timeout is ~7x the worst observed gap. A dead
+  # raise now faults in ~50 s instead of 3 min (blower cap stays the backstop).
   # NOTE these persist in flash (restore_value): an OTA does NOT overwrite
   # values already stored on the device — nudge the sliders once after update.
   - platform: template
@@ -934,7 +946,7 @@ number:
     web_server: {sorting_group_id: group_advanced, sorting_weight: 30}
     optimistic: true
     restore_value: true
-    initial_value: 60          # don't arm stall until lift has broken free
+    initial_value: 20          # don't arm stall until valve open + blower spooled
     min_value: 0
     max_value: 300
     step: 5
@@ -947,7 +959,7 @@ number:
     web_server: {sorting_group_id: group_advanced, sorting_weight: 31}
     optimistic: true
     restore_value: true
-    initial_value: 120         # no progress for this long (after grace) -> fault
+    initial_value: 30          # no progress for this long (after grace) -> fault
     min_value: 2
     max_value: 300
     step: 5
@@ -1046,6 +1058,46 @@ number:
     step: 1
     unit_of_measurement: "s"
     entity_category: config
+  # ---- Air Loss Alert thresholds (§15.5 — alert-only, never actuates).
+  #      "Any sink is a symptom": a sealed lift should not descend, and a parked
+  #      lift should not need frequent keeper interventions. The keepers keep
+  #      correcting regardless (ADR-004); HA alerts on the Air Loss Alert binary. ----
+  - platform: template
+    name: "Air Alert Sealed Drop (%)"
+    id: air_drop_alert_pct
+    web_server: {sorting_group_id: group_advanced, sorting_weight: 45}
+    optimistic: true
+    restore_value: true
+    initial_value: 2           # filtered height falling this far in 30 s while both
+    min_value: 0.5             # valves are commanded closed -> sinking-while-sealed
+    max_value: 10              # (normal sealed seep measured ~5-13 %/h; spiral ~1 %/s)
+    step: 0.5
+    unit_of_measurement: "%"
+    entity_category: config
+  - platform: template
+    name: "Air Alert Sag Rate (% per h)"
+    id: air_sag_alert_rate
+    web_server: {sorting_group_id: group_advanced, sorting_weight: 46}
+    optimistic: true
+    restore_value: true
+    initial_value: 20          # parked sag rate beyond this (downward) -> alert
+    min_value: 2
+    max_value: 200
+    step: 1
+    unit_of_measurement: "%/h"
+    entity_category: config
+  - platform: template
+    name: "Air Alert Visit Events"
+    id: air_visit_alert_count
+    web_server: {sorting_group_id: group_advanced, sorting_weight: 49}
+    optimistic: true
+    restore_value: true
+    initial_value: 4           # top-ups + level fixes in one visit at/above this -> alert
+    min_value: 2
+    max_value: 20
+    step: 1
+    entity_category: config
+
   # ---- at-rest level keeper (Lift only) ----
   - platform: template
     name: "Rest Level Trigger (%)"
@@ -1072,8 +1124,10 @@ number:
     unit_of_measurement: "s"
     entity_category: config
 
-  # ---- tilt threshold (annunciator + leveling hard stop; the Warn
-  #      tier was removed — watch the numeric "Lift Tilt" below critical) ----
+  # ---- level-divergence HARD STOP threshold (§16.3): two-IMU error, expressed
+  #      in degrees of arm through the master span -> FAULT + make-safe.
+  #      rev I: the pitch-proxy annunciator is retired; this number now serves
+  #      the hard stop only. Name kept — the flash-persisted value is keyed to it. ----
   - platform: template
     name: "Tilt Critical (deg)"
     id: tilt_critical_deg
@@ -1131,18 +1185,19 @@ switch:
   # (rev G: the four "Test LED" wiring-test switches were removed — ring wiring
   #  was confirmed at commissioning and the FSM LED driver covers every cadence.)
 
-  # ---- Maintain Height / Maintain Level (Control — dock-facing keepers) ----
-  # Formerly "Auto-Maintain" / "Auto-Level". Height: Ready/Lift/Lift Max.
-  # Level at-rest: Lift only. In-move throttle follows Maintain Level. Defaults ON.
+  # ---- Auto-Maintain Height / Auto-Maintain Level (Control — dock-facing keepers) ----
+  # rev I: renamed back to Auto-* so the automation is explicit on the page.
+  # Height: Ready/Lift/Lift Max. Level: BOTH the in-move throttle on every go-to
+  # AND the at-rest correction pulses while parked at Lift. Defaults ON.
   - platform: template
-    name: "Maintain Height"
+    name: "Auto-Maintain Height"
     id: auto_maintain_switch
     icon: "mdi:arrow-up-bold-box"
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
     web_server: {sorting_group_id: group_control, sorting_weight: 10}
   - platform: template
-    name: "Maintain Level"
+    name: "Auto-Maintain Level"
     id: auto_level_switch
     icon: "mdi:scale-balance"
     optimistic: true
@@ -1244,6 +1299,17 @@ binary_sensor:
     web_server: {sorting_group_id: group_status, sorting_weight: 25}   # 30 collides with Water Temperature
     lambda: 'return id(boat_present);'
 
+  # ---- Air Loss Alert (§15.5): ON = air is leaving abnormally — sinking while
+  #      sealed, high parked sag rate, or frequent keeper interventions. Alert
+  #      only, never actuates; "Air Loss Detail" (Diagnostics) + log tag
+  #      "airloss" carry the reason. ----
+  - platform: template
+    name: "Air Loss Alert"
+    id: air_loss_alert
+    device_class: problem
+    web_server: {sorting_group_id: group_status, sorting_weight: 11}
+    lambda: 'return id(air_alert);'
+
   # ---- Angle-sensor (MPU/WT901) health: ON = receiving fresh, valid frames ----
   # (rev E: filed under Diagnostics — Lift Problem + Lift Status already surface
   #  an offline sensor on the main page; the entities stay for HA alerting.)
@@ -1265,18 +1331,9 @@ binary_sensor:
   #  covers anything below the critical threshold.)
   # (rev H: Auto-Maintain Lockout binary removed — sticky lockout that disabled
   #  height/level keeping was the wrong failure mode; visit counters replace it.)
-  # "Something is really wrong" tilt alarm — pure annunciator (§21.3 hard stop uses
-  # the same threshold on the live level error). Left OUT of Lift Problem for now:
-  # the pitch proxy is unproven, so don't let a bad reading mask real faults.
-  - platform: template
-    name: "Lift Tilt Critical"
-    id: lift_tilt_critical
-    device_class: problem
-    entity_category: diagnostic
-    web_server: {sorting_group_id: group_status, sorting_weight: 35}
-    lambda: |-
-      if (!id(cal_ref_pitch_done)) return false;
-      return fabs(id(angle_pitch) - id(cal_ref_pitch)) >= id(tilt_critical_deg).state;
+  # (rev I: the pitch tilt proxy is RETIRED — Lift Tilt Critical, Lift Tilt, the
+  #  LEVEL ref capture and its cal globals are gone. The two-IMU Level Error is
+  #  the list signal, and the §16.3 level_divergence FAULT is the hard stop.)
 
   # rev G: the four button diagnostics + four valve feedback contacts are
   # disabled_by_default — hidden from HA (enable per-entity there if ever
@@ -1440,11 +1497,10 @@ binary_sensor:
 sensor:
   # ---- WT901 tilt angle (decoded from the 0x55 0x53 frame by the UART parser below) ----
   # Roll/Pitch are the two tilt axes. current_angle (used by the FSM) tracks the
-  # arm-swing axis — CONFIRM at commissioning which axis moves with the lift arm and
-  # set it in the parser interval lambda (defaults to Roll for now).
-  # (rev E: the separate Roll diagnostic was removed — "Arm Angle (live)" IS the
-  #  roll axis. rev G: the raw Pitch sensor went too — "Lift Tilt" below is
-  #  pitch minus the captured reference, and axis confirmation is long done.)
+  # arm-swing axis (Roll — field-confirmed).
+  # (rev E: the separate Roll diagnostic was removed — "Arm Angle" IS the roll
+  #  axis. rev G: the raw Pitch sensor went too. rev I: the whole pitch proxy is
+  #  retired; pitch is still decoded into angle_pitch but nothing consumes it.)
   - platform: template
     name: "Arm Angle ${side_master}"
     id: arm_angle_live
@@ -1507,12 +1563,15 @@ sensor:
     update_interval: 1s          # rev G: was 250 ms — display only, supervisor has its own copy
     lambda: 'return id(level_ok_now) ? id(level_err_filt) : NAN;'   # + = slave side HIGH
 
-  # ---- per-visit maintain event counters (reset on arrive at a new maintained zone) ----
+  # ---- per-visit maintain event counters (reset on arrive at a new maintained zone).
+  #      rev I: moved out of Control (they're data, not controls) — kept as numeric
+  #      entities for HA graphing; the Maintain Observe line shows both counts. ----
   - platform: template
     name: "Visit Height Top-ups"
     id: visit_height_topups
     icon: "mdi:arrow-up-bold-hexagon-outline"
-    web_server: {sorting_group_id: group_control, sorting_weight: 12}
+    entity_category: diagnostic
+    web_server: {sorting_group_id: group_diag, sorting_weight: 24}
     accuracy_decimals: 0
     update_interval: 1s
     lambda: 'return (float) id(visit_height_count);'
@@ -1520,7 +1579,8 @@ sensor:
     name: "Visit Level Events"
     id: visit_level_events
     icon: "mdi:scale-balance"
-    web_server: {sorting_group_id: group_control, sorting_weight: 13}
+    entity_category: diagnostic
+    web_server: {sorting_group_id: group_diag, sorting_weight: 25}
     accuracy_decimals: 0
     update_interval: 1s
     lambda: 'return (float) id(visit_level_count);'
@@ -1577,17 +1637,9 @@ sensor:
     accuracy_decimals: 2
     update_interval: 10s
     lambda: 'return id(obs_sag_rate);'   # negative = sagging
-  - platform: template
-    name: "Lift Tilt"
-    id: lift_tilt_deg
-    entity_category: diagnostic
-    web_server: {sorting_group_id: group_diag, sorting_weight: 23}
-    unit_of_measurement: "°"
-    accuracy_decimals: 2
-    update_interval: 1s
-    lambda: 'return id(cal_ref_pitch_done) ? (id(angle_pitch) - id(cal_ref_pitch)) : NAN;'
   # (rev E: the Shadow/Auto/Window top-up count sensors were removed — the
   #  "Maintain Observe" text line reports all three counters.)
+  # (rev I: "Lift Tilt" removed with the pitch proxy — Level Error is the list signal.)
 
   - platform: dallas_temp
     name: "Lift Water Temperature"
@@ -1611,7 +1663,7 @@ text_sensor:
   # ---- Valve position (derived from the two CR502 aux contacts; read-only) ----
   #   OPEN=vent open  CLOSED=sealed  MOVING=mid-travel or stuck  FAULT=both contacts on (impossible)
   # ---- MAIN: both valves' REAL positions (from feedback contacts) on one line,
-  #      right under Lift Status. During leveling moves this shows the throttle
+  #      at the top of Status. During leveling moves this shows the throttle
   #      actually closing one side. ----
   - platform: template
     name: "Valve Positions"
@@ -1678,11 +1730,13 @@ text_sensor:
   #      Lift Activity = what the lift is DOING; Lift Position = WHERE it is.
   #      Short stable Title-Case tokens for exact-match triggers — no percentages
   #      or reasons embedded, so states only change on real transitions.
-  #      (Replaces the old "Lift State (raw)" diagnostic.) ----
+  #      (Replaces the old "Lift State (raw)" diagnostic.)
+  #      rev I: filed at the BOTTOM of Status — they exist for HA, and the human
+  #      story is told by Lift Status (Control headline) + the lines above. ----
   - platform: template
     name: "Lift Activity"
     id: lift_activity_text
-    web_server: {sorting_group_id: group_status, sorting_weight: 5.3}
+    web_server: {sorting_group_id: group_status, sorting_weight: 45}
     update_interval: 1s
     lambda: |-
       switch (id(lift_state)) {
@@ -1697,7 +1751,7 @@ text_sensor:
   - platform: template
     name: "Lift Position"
     id: lift_position_text
-    web_server: {sorting_group_id: group_status, sorting_weight: 5.6}
+    web_server: {sorting_group_id: group_status, sorting_weight: 46}
     update_interval: 1s
     lambda: |-
       // zone ladder mirrors Lift Status; valid mid-move too (reports the zone
@@ -1712,12 +1766,14 @@ text_sensor:
 
   # ---- human-readable status line (web UI + panel msg=). rev G: percentages
   #      dropped from the moving states — Lift Height sits right beside it, and
-  #      without the number the string only changes on real transitions. ----
+  #      without the number the string only changes on real transitions.
+  #      rev I: filed at the TOP of Control (weight 0) — the page's headline:
+  #      what the lift is doing, with the buttons directly beneath it. ----
   - platform: template
     name: "Lift Status"
     id: lift_status_text
     update_interval: 1s
-    web_server: {sorting_group_id: group_status, sorting_weight: 5}
+    web_server: {sorting_group_id: group_control, sorting_weight: 0}
     lambda: |-
       float pct = id(lift_pct);
       bool have_pct = id(have_cal) && !std::isnan(pct);
@@ -1769,28 +1825,41 @@ text_sensor:
     update_interval: 1s
     lambda: 'return id(last_stop_reason);'
 
-  # ---- leveling summary: trust, filtered error, current throttle / rest pulse ----
+  # ---- Air Loss Alert reason ("none" when clear) — pairs with the Status binary ----
+  - platform: template
+    name: "Air Loss Detail"
+    id: air_loss_detail
+    entity_category: diagnostic
+    web_server: {sorting_group_id: group_diag, sorting_weight: 26}
+    update_interval: 1s
+    lambda: 'return id(air_alert_reason).empty() ? std::string("none") : id(air_alert_reason);'
+
+  # ---- leveling summary — SIMPLE + state-aware (rev I). Plain answer to "is the
+  #      lift level / is leveling doing something right now". No valve words
+  #      (Valve Positions is the source of truth for those) and no internal
+  #      throttle vocabulary; side + high/low replaces the signed err%. ----
   - platform: template
     name: "Level Status"
     id: level_status_text
-    entity_category: diagnostic
-    web_server: {sorting_group_id: group_diag, sorting_weight: 18}
+    web_server: {sorting_group_id: group_status, sorting_weight: 7}
     update_interval: 1s
     lambda: |-
-      if (!id(have_cal2))     return std::string("${side_slave} IMU not calibrated");
-      if (!id(angle2_valid))  return std::string("${side_slave} IMU OFFLINE - ganged (v1)");
-      if (!id(level_ok_now))  return std::string("not trusted - ganged (v1)");
-      char b[112];
-      const char* thr;
-      if (id(rest_pulse) == 1)      thr = "rest FEED ${side_master}";
-      else if (id(rest_pulse) == 2) thr = "rest FEED ${side_slave}";
-      else if (id(rest_pulse) == 3) thr = "rest VENT ${side_slave}";
-      else if (id(rest_pulse) == 4) thr = "rest VENT ${side_master}";
-      else if (id(level_throttle) == 1) thr = "throttling ${side_master}";
-      else if (id(level_throttle) == 2) thr = "throttling ${side_slave}";
-      else thr = "both open";
-      snprintf(b, sizeof(b), "%s | err %+.1f%% | maintain %s", thr, id(level_err_filt),
-               id(auto_level_switch).state ? "ON" : "off (shadow)");
+      if (!id(have_cal2))     return std::string("${side_slave} not calibrated — ganged");
+      if (!id(angle2_valid))  return std::string("${side_slave} IMU offline — ganged");
+      if (!id(level_ok_now))  return std::string("Not trusted — ganged");
+      int rp = id(rest_pulse);
+      if (rp == 1) return std::string("Leveling — feeding ${side_master}");
+      if (rp == 2) return std::string("Leveling — feeding ${side_slave}");
+      if (rp == 3) return std::string("Leveling — venting ${side_slave}");
+      if (rp == 4) return std::string("Leveling — venting ${side_master}");
+      if (id(level_throttle) == 1) return std::string("Leveling — holding ${side_master} back");
+      if (id(level_throttle) == 2) return std::string("Leveling — holding ${side_slave} back");
+      float e = id(level_err_filt);
+      const char* pre = id(auto_level_switch).state ? "Level OK" : "Auto-level OFF";
+      char b[72];
+      if (fabs(e) < 0.05f) snprintf(b, sizeof(b), "%s — even", pre);
+      else snprintf(b, sizeof(b), "%s — ${side_slave} %.1f%% %s",
+                    pre, fabs(e), e > 0.0f ? "high" : "low");
       return std::string(b);
 
   # ---- Firmware build stamp: compiler auto-fills the date/time at every compile (no manual edits) ----
@@ -1802,7 +1871,10 @@ text_sensor:
     update_interval: 6h
     lambda: 'return std::string(__DATE__ " " __TIME__);'
 
-  # ---- Maintain summary (Status): switches + per-visit event counts + sag rate ----
+  # ---- Maintain summary (Status) — SIMPLE (rev I): where the lift is parked,
+  #      what the keepers have done this visit, and the sag trend. Switch states
+  #      show on the Auto-Maintain switches themselves; armed/disarmed internals
+  #      moved to the log. ----
   - platform: template
     name: "Maintain Observe"
     id: maintain_observe_text
@@ -1811,44 +1883,39 @@ text_sensor:
     lambda: |-
       const char* where = id(visit_pos) == 1 ? "Lift"
                         : (id(visit_pos) == 2 ? "Ready"
-                        : (id(visit_pos) == 3 ? "Lift Max" : "idle"));
-      const char* armed = id(obs_arm_mode) == 1 ? "arm Lift"
-                        : (id(obs_arm_mode) == 2 ? "arm Ready"
-                        : (id(obs_arm_mode) == 3 ? "arm Max" : "disarmed"));
-      char b[128];
-      snprintf(b, sizeof(b),
-               "%s | ht %s lvl %s | visit top-ups %d level %d | sag %.2f%%/h | %s",
-               where,
-               id(auto_maintain_switch).state ? "ON" : "off",
-               id(auto_level_switch).state ? "ON" : "off",
-               id(visit_height_count), id(visit_level_count),
-               id(obs_sag_rate), armed);
+                        : (id(visit_pos) == 3 ? "Lift Max" : nullptr));
+      if (where == nullptr) return std::string("Not parked at a maintained position");
+      char b[96];
+      snprintf(b, sizeof(b), "At %s — %d top-ups, %d level fixes — sag %+.2f%%/h",
+               where, id(visit_height_count), id(visit_level_count), id(obs_sag_rate));
       return std::string(b);
 
 # ---------------------------------------------------------------------------
 #  HA-facing controls (mirror the dock buttons through the SAME intents)
 # ---------------------------------------------------------------------------
 button:
+  # rev I: order matches the physical dock panel (Lift / Ready / Stop / Lower) so
+  # web and dock share one muscle memory; Lift Max sits last (guarded, rare).
   - platform: template
-    name: "Lower"
+    name: "Lift"
     web_server: {sorting_group_id: group_control, sorting_weight: 1}
-    on_press: {script.execute: request_goto_lowered}
+    on_press: {script.execute: request_goto_top}
   - platform: template
     name: "Ready"
     web_server: {sorting_group_id: group_control, sorting_weight: 2}
     on_press: {script.execute: request_goto_ready}
   - platform: template
-    name: "Lift"
+    name: "Stop"
     web_server: {sorting_group_id: group_control, sorting_weight: 3}
-    on_press: {script.execute: request_goto_top}
+    on_press: {script.execute: request_stop}
+  - platform: template
+    name: "Lower"
+    web_server: {sorting_group_id: group_control, sorting_weight: 4}
+    on_press: {script.execute: request_goto_lowered}
   - platform: template
     name: "Lift Max"
-    web_server: {sorting_group_id: group_control, sorting_weight: 4}
-    on_press: {script.execute: request_goto_max}
-  - platform: template
-    name: "Stop"
     web_server: {sorting_group_id: group_control, sorting_weight: 5}
-    on_press: {script.execute: request_stop}
+    on_press: {script.execute: request_goto_max}
   # (rev G: the "Reset Fault" button was removed — Stop is the universal
   #  clear-it control: it already clears a latched FAULT and exits BYPASS.)
   # (rev H: Reset Auto-Maintain Lockout removed with the sticky lockout.)
@@ -1938,15 +2005,7 @@ button:
   #  calibrated and one accidental press clobbered the real captures once
   #  already (2026-07-19, restored via the web API). Bench setpoints live in
   #  git history if a bench rig ever needs them again.)
-  - platform: template
-    name: "Calibrate: capture LEVEL ref (pitch)"
-    entity_category: config
-    web_server: {sorting_group_id: group_config, sorting_weight: 54}
-    on_press:
-      - lambda: |-
-          id(cal_ref_pitch) = id(angle_pitch);
-          id(cal_ref_pitch_done) = true;
-          ESP_LOGI("cal", "LEVEL ref pitch set to %.2f deg", id(cal_ref_pitch));
+  # (rev I: "Calibrate: capture LEVEL ref (pitch)" removed with the pitch proxy.)
 
 # ---------------------------------------------------------------------------
 #  Intents (request_*) — validate against state + interlocks, then transition.
@@ -2597,22 +2656,30 @@ interval:
           // ================ end leveling supervisor ================
 
           // ---- valve command-vs-feedback agreement (manual-operation detector; DISPLAY ONLY) ----
-          // "Commanded" = what we're driving Y2 to (valve_power_open); in bench mode that's the
-          // hand switch. The aux contacts lag through most of travel, so only judge after a grace
-          // window (measured open ~7 s / close ~2.3 s -> Valve Travel Time + 2 s) and require the
-          // mismatch to persist ~2 s. both-on is a sensor fault (shown by Valve Position), not manual.
+          // rev I: no travel-time knob — the CR5-02 end-stops are direct evidence.
+          // "Commanded" = what we're driving Y2 to (valve_power_open); in bench mode
+          // that's the hand switch. Two independent tells, fixed constants:
+          //   · WRONG end-stop once the valve should have left its old seat -> manual
+          //   · neither contact (still MOVING) far past worst-case travel (~7 s open /
+          //     ~2.3 s close) -> stuck/slow or hand-cranked off a seat; same flag
+          // 2 s persistence rejects seating chatter. both-on = contact fault (shown
+          // by Valve Positions), not manual operation.
           {
+            const unsigned long WRONG_STOP_GRACE_MS = 5000UL;   // time to leave the old seat
+            const unsigned long TRAVEL_LIMIT_MS     = 15000UL;  // worst-case travel + margin
             bool vcmd_open = id(valve_power_open).state;
             if (vcmd_open != id(valve_cmd_open_prev)) {
               id(valve_cmd_open_prev) = vcmd_open;
               id(valve_cmd_since) = now;
             }
             bool vfo = id(valve_fb_open).state, vfc = id(valve_fb_closed).state;
-            bool at_open = vfo && !vfc, at_closed = vfc && !vfo, both_on = vfo && vfc;
-            unsigned long vgrace = (unsigned long)(id(valve_travel_seconds).state * 1000.0f) + 2000UL;
-            bool vsettled = (now - id(valve_cmd_since)) > vgrace;
-            bool agree = vcmd_open ? at_open : at_closed;
-            bool vbad = vsettled && !both_on && !agree;
+            bool both_on = vfo && vfc;
+            bool wrong_stop = vcmd_open ? (vfc && !vfo) : (vfo && !vfc);
+            bool mid_travel = !vfo && !vfc;
+            unsigned long since_cmd = now - id(valve_cmd_since);
+            bool vbad = !both_on
+                        && ((wrong_stop && since_cmd > WRONG_STOP_GRACE_MS)
+                            || (mid_travel && since_cmd > TRAVEL_LIMIT_MS));
             if (vbad) { if (id(valve_disagree_since) == 0) id(valve_disagree_since) = now; }
             else      { id(valve_disagree_since) = 0; }
             id(valve_disagree) = id(valve_disagree_since) != 0
@@ -2890,6 +2957,55 @@ interval:
               if (dt_h > 0.0f) id(obs_sag_rate) = (id(obs_height_filt) - id(obs_rate_last_h)) / dt_h;
               id(obs_rate_last_t) = now; id(obs_rate_last_h) = id(obs_height_filt);
             }
+          }
+
+          // ---- AIR LOSS ALERT (§15.5 — visibility only; NEVER actuates) ----
+          // "Any sink is a symptom." Three tells, all tunable:
+          //   A) sinking while sealed: filtered height fell > Air Alert Sealed Drop
+          //      in 30 s with both valves commanded closed (60 s settle grace after
+          //      sealing; event latches the alert ~30 min). Seal failure, manually
+          //      opened valve, or the §14.2 compression spiral.
+          //   B) parked sag rate beyond Air Alert Sag Rate (downward).
+          //   C) top-ups + level fixes this visit reach Air Alert Visit Events.
+          // Keepers keep correcting regardless (ADR-004) — this is the "and you
+          // should know about it" layer. HA alerts on the Air Loss Alert binary.
+          {
+            bool sealed = !id(valve_power_open).state && !id(valve_power_open_b).state
+                          && !id(test_mode);
+            if (!sealed) { id(seal_ref_filt) = -999.0f; id(seal_since) = 0; }
+            else {
+              if (id(seal_since) == 0) { id(seal_since) = now; id(seal_ref_filt) = -999.0f; }
+              bool seal_settled = (now - id(seal_since)) > 60000UL;
+              if (seal_settled && good && id(obs_height_filt) > -900.0f) {
+                if (id(seal_ref_filt) < -900.0f) {
+                  id(seal_ref_filt) = id(obs_height_filt); id(seal_ref_ms) = now;
+                } else if (now - id(seal_ref_ms) >= 30000UL) {
+                  float drop = id(seal_ref_filt) - id(obs_height_filt);
+                  if (drop > id(air_drop_alert_pct).state) {
+                    id(air_alert_latch_ms) = now;
+                    ESP_LOGE("airloss", "SINKING WHILE SEALED: %.1f%% in 30 s (limit %.1f%%) at %.1f%%",
+                             drop, id(air_drop_alert_pct).state, id(obs_height_filt));
+                  }
+                  id(seal_ref_filt) = id(obs_height_filt); id(seal_ref_ms) = now;
+                }
+              }
+            }
+            bool parked = (id(lift_state) == ${S_HOLD}) && id(visit_pos) != 0;
+            bool a = id(air_alert_latch_ms) != 0
+                     && (now - id(air_alert_latch_ms)) < 1800000UL;
+            bool b = parked && (id(obs_sag_rate) < -id(air_sag_alert_rate).state);
+            bool c = parked && (id(visit_height_count) + id(visit_level_count))
+                               >= (int) id(air_visit_alert_count).state;
+            bool on = a || b || c;
+            if (on && !id(air_alert)) {
+              id(air_alert_reason) = a ? "sinking while sealed"
+                                   : (b ? "sag rate high" : "frequent interventions");
+              ESP_LOGW("airloss", "AIR LOSS ALERT: %s", id(air_alert_reason).c_str());
+            } else if (!on && id(air_alert)) {
+              id(air_alert_reason) = "";
+              ESP_LOGI("airloss", "air loss alert cleared");
+            }
+            id(air_alert) = on;
           }
 
           // ---- visit + height-arm at Ready / Lift / Lift Max (Max preferred over Lift) ----
