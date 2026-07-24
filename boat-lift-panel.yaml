@@ -4,7 +4,7 @@
 #  STATUS: UI build #3. The panel is a REQUEST + DISPLAY surface only — it never
 #  drives an output. It asks the lift to do things ("lower", "raise", "stop") and
 #  shows whatever the lift reports. All "can I? is it safe? any errors?" logic
-#  lives on the lift controller (KC868-A16, see boat_lift_cobalt_design.md).
+#  lives on the lift controller (KC868-A16, see boat_lift_design.md).
 #
 #  >>> PANEL NOT YET WIRED TO THE LIFT <<<
 #  The lift firmware HAS emitted STA frames + parsed CMD since 2026-07 (protocol
@@ -103,8 +103,8 @@ time:
 # TODO: set to your dock's real coordinates.
 sun:
   id: dock_sun
-  latitude: 49.9864°       # Minaki, ON
-  longitude: -94.6700°
+  latitude: 0.0°           # TODO: your latitude
+  longitude: 0.0°          # TODO: your longitude
 
 # ----------------------------------------------------------------------------
 #  Buses
@@ -246,12 +246,12 @@ globals:
 sensor:
   - platform: homeassistant
     id: ha_wind_speed
-    entity_id: sensor.kenora_wind_speed         # Environment Canada (Kenora) via HA
+    entity_id: sensor.outdoor_wind_speed        # TODO: your HA wind-speed entity
     on_value:
       - script.execute: refresh_wind
   - platform: homeassistant
     id: ha_air_temp
-    entity_id: sensor.kenora_temperature        # Environment Canada (Kenora) via HA
+    entity_id: sensor.outdoor_temperature       # TODO: your HA outdoor-temp entity
     on_value:
       - lvgl.label.update:
           id: lbl_air
@@ -269,7 +269,7 @@ sensor:
             char b[12]; snprintf(b, sizeof(b), "%.1f°F", x); return std::string(b);
   - platform: homeassistant
     id: ha_precip_prob
-    entity_id: sensor.kenora_chance_of_precipitation   # Environment Canada (Kenora)
+    entity_id: sensor.precip_probability               # TODO: your HA precip entity
     on_value:
       - lvgl.label.update:
           id: lbl_precip
@@ -299,7 +299,7 @@ sensor:
 text_sensor:
   - platform: homeassistant
     id: ha_wind_dir
-    entity_id: sensor.kenora_wind_direction     # Environment Canada (Kenora) via HA
+    entity_id: sensor.outdoor_wind_direction    # TODO: your HA wind-direction entity
     on_value:
       - script.execute: refresh_wind
   - platform: sun
@@ -908,11 +908,11 @@ lvgl:
               - logger.log: "requests disabled (lift in manual/degraded mode)"
 
     # ================= WEATHER PAGE =================
-    # Fields wire to Environment Canada (Kenora) entities; placeholders for now.
+    # Fields wire to your HA weather entities (see sensor: homeassistant above).
     - id: weather_page
       bg_color: 0x0E1116
       widgets:
-        - label: { text: "WEATHER  —  Minaki", x: 16, y: 10, text_font: montserrat_20, text_color: 0x6B7686 }
+        - label: { text: "WEATHER", x: 16, y: 10, text_font: montserrat_20, text_color: 0x6B7686 }
         - obj: { x: 8, y: 40, width: 464, height: 2, bg_color: 0x2A3340, bg_opa: COVER, border_width: 0, radius: 0 }
         - label: { id: lbl_condition, text: "—", x: 16, y: 52, text_font: montserrat_28, text_color: 0xFFFFFF }
         - label: { id: lbl_wind, text: "WIND  --", x: 16, y: 104, text_font: montserrat_22, text_color: 0xCBD3DF }
@@ -1010,4 +1010,4 @@ lvgl:
             pad_all: 0
             widgets:
               - label: { align: CENTER, y: -16, text: "RADAR", text_font: montserrat_38, text_color: 0x3A475C }
-              - label: { align: CENTER, y: 32, text: "camera.kenora_radar", text_font: montserrat_16, text_color: 0x2A3340 }
+              - label: { align: CENTER, y: 32, text: "camera.radar (TODO)", text_font: montserrat_16, text_color: 0x2A3340 }

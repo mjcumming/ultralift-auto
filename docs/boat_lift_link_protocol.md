@@ -1,9 +1,9 @@
 # Boat Lift ↔ Touch Panel — Wired Link Protocol
 
 **Version:** v1
-**Status:** **wired and implemented in firmware** (lift STA emitter + CMD parser live in `boat-lift-cobalt.yaml`, panel end working). As-built deviation from the draft: the link runs at **9600 8N1**, not 19200.
-**Applies to:** `boat-lift-cobalt.yaml` (lift, KinCony KC868-A16) ⇄ `boat-lift-panel.yaml` (Waveshare ESP32-S3-Touch-LCD-4B).
-**Companion:** `boat_lift_cobalt_design.md` (lift control design, Rev E — states, status ladder, modes; §22 covers this link).
+**Status:** **wired and implemented in firmware** (lift STA emitter + CMD parser live in `boat-lift.yaml`, panel end working). As-built deviation from the draft: the link runs at **9600 8N1**, not 19200.
+**Applies to:** `boat-lift.yaml` (lift, KinCony KC868-A16) ⇄ `boat-lift-panel.yaml` (Waveshare ESP32-S3-Touch-LCD-4B).
+**Companion:** [`boat_lift_design.md`](boat_lift_design.md) (lift control design — states, status ladder, modes; §18 covers this link).
 
 ---
 
@@ -19,7 +19,7 @@ The lift controller (A16) is the **sole authority**. It decides:
 - *Is it safe?* (angle trusted, interlocks, supervisor)
 - *What's actually happening?* (state, faults, position)
 
-Everything in the lift's safety contract (`revC` §11) stays on the A16. The link
+Everything in the lift's safety contract (design doc §11) stays on the A16. The link
 carries **intents** from the panel and **status** from the lift — nothing else.
 
 This split is the reason the panel must be **slaved to lift-reported status**,
@@ -41,7 +41,7 @@ lift's status says so.
 5. **The lift owns the truth.** The status stream is the single source of state;
    the panel never re-derives the status ladder locally.
 6. **Fail safe, fail quiet.** Link loss never changes the lift's safe behaviour
-   (`revC` §11). A dropped frame is tolerable — the dock STOP button is the
+   (design doc §11). A dropped frame is tolerable — the dock STOP button is the
    always-available backstop, and the panel is slaved to status so the user sees
    whether a request took.
 
@@ -53,7 +53,7 @@ lift's status says so.
 
 The link rides **RS485** (half-duplex, differential). Both boxes already have the
 hardware: the panel is the **Waveshare 4B = RS485+CAN variant**, and the
-KC868-A16 has an onboard RS485 port. RS485 tolerates the floating-boathouse
+KC868-A16 has an onboard RS485 port. RS485 tolerates a dock / boathouse
 environment (long-ish runs, blower inrush noise, separate supplies) far better
 than bare 3.3 V TTL.
 
@@ -63,10 +63,11 @@ than bare 3.3 V TTL.
 | Baud | **9600 8N1** as built (draft specified 19200; slow on purpose — the traffic is tiny and noise-margin matters) |
 | Framing | newline-terminated ASCII lines |
 
-> **Why not HTTP/REST?** Control must survive a WiFi/HA outage (`revC` §11: "network
-> loss → no change in safe behaviour"). HTTP makes the panel a network appliance
-> that dies with the network. The wired link makes it a peripheral of the lift.
-> HTTP/HA stays in its lane: **weather + radar only** (see the panel's data split).
+> **Why not HTTP/REST?** Control must survive a WiFi/HA outage (design doc §11:
+> "network loss → no change in safe behaviour"). HTTP makes the panel a network
+> appliance that dies with the network. The wired link makes it a peripheral of
+> the lift. HTTP/HA stays in its lane: **weather + radar only** (see the panel's
+> data split).
 
 > **Why not CAN (yet)?** CAN is the better choice if a boathouse-wide multi-node
 > bus appears. For two adjacent boxes it's overkill. The application protocol
@@ -113,10 +114,10 @@ STA v=1 st=RAISING h=63 prob=0 trust=1 water=18.4 msg=Raising -> Lift... 63%
 | `v` | int | protocol version (1) |
 | `st` | token | machine state token (§6) — drives colours / which control is active |
 | `h` | int | lift height %, 0–100 (`-1` = unknown / not calibrated) |
-| `prob` | 0/1 | Lift Problem flag (`revC` §9.2) — drives the panel's error banner |
-| `trust` | 0/1 | angle trusted (`revC` §9.4). `0` ⇒ panel shows degraded/manual UI |
-| `water` | float | lake/water temp in **°C** (panel converts for display). `nan` if absent |
-| `msg` | text | the lift's full human status string (`revC` §9.2 ladder) — displayed verbatim |
+| `prob` | 0/1 | Lift Problem flag (design doc §9.2) — drives the panel's error banner |
+| `trust` | 0/1 | angle trusted (design doc §9.4). `0` ⇒ panel shows degraded/manual UI |
+| `water` | float | water temp in **°C** (panel converts for display). `nan` if absent |
+| `msg` | text | the lift's full human status string (design doc §9.2 ladder) — displayed verbatim |
 
 Forward-compat: the panel reads the keys it knows and ignores the rest. New lift
 data (e.g. `wd=` blower runtime, `cal=` calibration flags) can be appended freely.
@@ -129,7 +130,7 @@ Sent **once on a button press** (no streaming, no repeat).
 CMD v=1 req=LIFT
 ```
 
-| `req` | Lift action (existing `revC` script) | Notes |
+| `req` | Lift action (existing design-doc script) | Notes |
 |---|---|---|
 | `LOWER` | `request_goto_lowered` | go-to Lower setpoint |
 | `READY` | `request_goto_ready` | go-to Ready setpoint |
@@ -137,7 +138,7 @@ CMD v=1 req=LIFT
 | `LIFT_MAX` | `request_goto_max` | go-to Lift Max setpoint |
 | `STOP` | `request_stop` | always honoured; no confirm |
 | `RESET` | `request_reset` | clear a latched FAULT (panel gates behind a confirm) |
-| `BYPASS_ON` | `enter_bypass` | deliberate hands-off override (`revC` §6.6) |
+| `BYPASS_ON` | `enter_bypass` | deliberate hands-off override (design doc §6.6) |
 | `BYPASS_OFF` | `exit_bypass` | leave bypass → HOLD |
 
 The lift validates **every** `CMD` exactly as if it were a dock-button press —
@@ -155,7 +156,7 @@ Unknown `req=` value → the lift ignores it (rule 3).
 The token is for the panel's *visual* logic (colour, which control is live). The
 full human text always comes in `msg=`.
 
-| `st=` token | Lift condition (`revC` §6.1 / §9.2) | Panel shows |
+| `st=` token | Lift condition (design doc §6.1 / §9.2) | Panel shows |
 |---|---|---|
 | `HOLDING` | resting, but no precise position bucket available | "HOLDING" |
 | `RAISING` | MOVING_VALVE_OPENING or MOVING_UP | "RAISING" |
@@ -192,7 +193,7 @@ simply never flips — the honest outcome, with no extra round-trip.
 A touchscreen can't be a trustworthy dead-man, so the panel does **not** offer
 manual jogging. On `trust=0` it **greys out** the request buttons and shows
 "MANUAL CONTROL — use dock buttons." Recovery happens at the physical dock
-buttons (`revC` §6.5). STOP stays available.
+buttons (design doc §6.5). STOP stays available.
 
 ### 7.4 Fault (`st=FAULT` / `prob=1`)
 Panel surfaces the error and offers **RESET** behind a confirm dialog → `CMD

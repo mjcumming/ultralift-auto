@@ -1,34 +1,25 @@
 # =============================================================================
-#  Cumming Floating Boathouse — Boat Lift Automation  (Cobalt)  ··· V2 ···
+#  UltraLift Auto — Boat Lift Automation
 #  HydroHoist UltraLift UL2 8800  ·  KinCony KC868-A16 (ESP32)
-#  Design: boat_lift_cobalt_design.md (Rev E — §21 is this V2 variant)
+#  Design: docs/boat_lift_design.md  ·  Decisions: docs/adr.md
 #
-#  V2 = v1 (rev H) + TWO-VALVE / TWO-IMU AUTO-LEVELING:
+#  TWO-VALVE / TWO-IMU AUTO-LEVELING:
 #    · one vent/fill valve per tank: valve A (master side, Y2) + valve B (slave
 #      side, Y3); per-tank plumbing with check-valved blower tee (NO shared
 #      open manifold)
-#    · IMU #1 (GPIO32) = MASTER: sole height authority, drives the whole v1 FSM
+#    · IMU #1 (GPIO32) = MASTER: sole height authority, drives the go-to FSM
 #    · IMU #2 (GPIO14/HT3, UART0 — serial logging off) = SLAVE: leveling only
 #    · level error = slave height % − master height % (each side has its OWN
-#      captures, so the ~5° frame racking is calibrated out); while moving, the
+#      captures, so frame racking is calibrated out); while moving, the
 #      side that is AHEAD gets its valve throttled shut until the other catches up
-#    · §21.3 hard stop: sides diverging past Tilt Critical (°) => FAULT+make-safe
-#    · Auto-Level switch OFF => valves ganged = exactly v1, decisions logged
-#      as LEVEL(shadow) (observe-first, like auto-maintain Phase 1)
-#
-#  STATUS: CUTOVER (2026-07-18) — flashed to the live controller to verify the
-#          V2 wiring (valve B on Y3, IMU #2 on GPIO14). Keeps the V1 device
-#          name for HA/cal continuity; the version string identifies V2.
-#          The single-valve V1 yaml was retired 2026-07-20 (git history only;
-#          this file was then renamed boat-lift-cobalt.yaml as the sole config).
-#          ⚠ Do NOT flash a plain-V1 build back onto the split plumbing:
-#          valve B would never open (slave tank fills but can't vent).
+#    · hard stop: sides diverging past Tilt Critical (°) => FAULT+make-safe
+#    · Maintain Level switch OFF => valves ganged, decisions logged as
+#      LEVEL(shadow) (observe-first, like height-maintain with actuation off)
 #
 #  STATE LEGEND (global lift_state — named ${S_*} in substitutions):
 #     0 = HOLD           blower OFF, valves CLOSED  (make_safe)
-#     1 = (retired)      was RAISING_VALVE_OPENING; slot kept reserved so V1/V2
-#                         numbering stays aligned. Blower + valves start
-#                         together — no sequencing interlock (rev H).
+#     1 = (retired)      was RAISING_VALVE_OPENING; slot kept reserved.
+#                         Blower + valves start together — no sequencing interlock.
 #     2 = RAISING        blower ON,  valves OPEN (minus the leveling throttle)
 #     3 = LOWERING       blower OFF, valves OPEN (minus the leveling throttle)
 #     4 = FAULT          blower OFF, valves CLOSED  (latched + reason)
@@ -45,20 +36,14 @@
 # =============================================================================
 
 substitutions:
-  # Cutover naming (decided 2026-07-18): keep the V1 device name so HA history,
-  # dashboards and stored calibrations carry over. The project version string
-  # + device comment still identify V2 firmware. NOTE: after cutover, flashing
-  # a plain-V1 build (retired yaml, git history only) back onto the split
-  # plumbing is NOT hardware-safe (valve B would never open -> the slave tank
-  # could fill but never vent).
-  device_name: "boat-lift-cobalt"
-  friendly_name: "Cobalt Boat Lift"
+  device_name: "boat-lift"
+  friendly_name: "Boat Lift"
 
-  # ---- physical side labels (dock terms; decided + FIELD-VERIFIED 2026-07-18) ----
+  # ---- physical side labels (dock terms) ----
   # IMU #1 (master, HT1/GPIO32) = STARBOARD. IMU #2 (slave, HT3/GPIO14) = PORT.
-  # Valve A (Y2) = starboard tank, valve B (Y3) = port tank — confirmed at the
-  # dock. (Leveling logic requires valve A = master IMU's side; if plumbing is
-  # ever redone, swap the valve output pins AND feedback pin pairs below.)
+  # Valve A (Y2) = starboard tank, valve B (Y3) = port tank.
+  # Leveling requires valve A = master IMU's side; if plumbing differs, swap the
+  # valve output pins AND feedback pin pairs below.
   side_master: "Starboard"
   side_slave: "Port"
 
@@ -67,7 +52,7 @@ substitutions:
                           # sensor (inches above the Lowered cal); no logic uses it
 
   # ---- FSM state codes (global lift_state). Named so lambdas read as prose.
-  #      Values are FROZEN — V2 reuses them; slot 1 is retired but reserved. ----
+  #      Values are FROZEN; slot 1 is retired but reserved. ----
   S_HOLD: "0"
   S_RAISING: "2"
   S_LOWERING: "3"
@@ -103,7 +88,7 @@ substitutions:
   #   Green = FULLY OPEN, Yellow = FULLY CLOSED. Contact-closed at the limit -> inverted:true reads ON.
   valve_open_fb_pin: "1"     # X02 (DI2) -> GREEN  (valve A FULLY OPEN feedback)
   valve_closed_fb_pin: "0"   # X01 (DI1) -> YELLOW (valve A FULLY CLOSED feedback)
-  # V2: valve B (slave tank) CR5-02 aux contacts on the next free inputs, same
+  # Valve B (slave tank) CR5-02 aux contacts on the next free inputs, same
   # block, same colour convention. Common (white) -> same DI GND/COM screw.
   valve_b_open_fb_pin: "3"   # X04 (DI4) -> GREEN  (valve B FULLY OPEN feedback)
   valve_b_closed_fb_pin: "2" # X03 (DI3) -> YELLOW (valve B FULLY CLOSED feedback)
@@ -118,21 +103,11 @@ substitutions:
 esphome:
   name: ${device_name}
   friendly_name: ${friendly_name}
-  comment: "HydroHoist UL2 8800 boat lift controller (Cobalt) V2: 2 valves + 2 IMUs auto-level"
-  # ⚠ V1 and V2 shared the device name (cutover decision), which used to mean they
-  # shared .esphome/build/boat-lift-cobalt — compiling one OVERWROTE the other's
-  # binary, and on 2026-07-19 that put V1 firmware on the split-plumbing dock for
-  # ~10 min. Distinct build_path made that impossible; the V1 yaml is now retired
-  # (2026-07-20, git history only) and this V2 file is the sole config.
-  build_path: .esphome/build/v2-live
+  comment: "HydroHoist UL2 8800 boat lift controller: 2 valves + 2 IMUs auto-level"
+  build_path: .esphome/build/boat-lift
   project:
-    name: mjc.boat_lift_v2
-    version: "0.4.0-v2-revG (2026-07-20)"   # human label; the "Firmware Build" sensor auto-stamps the real compile date/time
-    # rev G — declutter + automation-friendly status: removed Test LEDs, Bench Cal
-    # Load, Reset Fault (+request_reset), per-side valve position texts, raw Pitch,
-    # Lift State (raw); bench inputs disabled_by_default in HA; hot 250 ms display
-    # sensors calmed to 1 s; NEW Lift Activity + Lift Position token sensors;
-    # Lift Status no longer embeds the live percentage.
+    name: ultralift.boat_lift
+    version: "0.5.1 (2026-07-24)"   # Control: Maintain Height/Level + visit counters; build with venv ESPHome 2026.6.x
 
 esp32:
   board: esp32dev
@@ -324,7 +299,7 @@ globals:
     restore_value: no
     initial_value: "false"
 
-  # ---- leveling scratch (v2) ----
+  # ---- leveling scratch ----
   - id: level_ok_now           # both IMUs trusted + both sides calibrated
     type: bool
     restore_value: no
@@ -349,8 +324,26 @@ globals:
     type: unsigned long
     restore_value: no
     initial_value: "0"
-  - id: level_rest_shadow      # §21.6 at-rest keeper SHADOW: last logged rest decision
+  # ---- §21.6 at-rest level keeper (Lift only; gated by Maintain Level) ----
+  # rest_pulse: 0=off, 1=feed master, 2=feed slave, 3=vent slave, 4=vent master
+  - id: rest_pulse
     type: int
+    restore_value: no
+    initial_value: "0"
+  - id: rest_pulse_since
+    type: unsigned long
+    restore_value: no
+    initial_value: "0"
+  - id: rest_level_below_since   # level error past trigger (0 = not past)
+    type: unsigned long
+    restore_value: no
+    initial_value: "0"
+  - id: rest_pulse_start_angle   # progress check on the side being fed/vented
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+  - id: rest_last_pulse_ms       # min gap between rest-level pulses
+    type: unsigned long
     restore_value: no
     initial_value: "0"
 
@@ -587,7 +580,7 @@ globals:
     type: float
     restore_value: no
     initial_value: "0.0"
-  - id: obs_arm_mode             # latched: 0 = idle, 1 = at Top, 2 = at Ready
+  - id: obs_arm_mode             # latched: 0=idle, 1=Lift, 2=Ready, 3=Lift Max
     type: int
     restore_value: no
     initial_value: "0"
@@ -607,26 +600,27 @@ globals:
     type: int
     restore_value: no
     initial_value: "0"
-  - id: obs_act_count            # REAL auto-maintain top-ups performed (Phase-2 actuation)
+  - id: obs_act_count            # REAL height top-ups since boot
     type: int
     restore_value: no
     initial_value: "0"
-  - id: obs_last_shadow          # millis of last shadow top-up (0 = none)
+  - id: obs_last_shadow          # millis of last shadow/real top-up (0 = none)
     type: unsigned long
     restore_value: no
     initial_value: "0"
-  - id: auto_topup_window_start  # millis when the current auto-top-up count window began
-    type: unsigned long
-    restore_value: no
-    initial_value: "0"
-  - id: auto_topup_window_count  # real auto top-ups in the current window
+  # ---- per-visit maintain counters (reset when arriving at a new maintained position) ----
+  - id: visit_pos                # 0=none/ended, 1=Lift, 2=Ready, 3=Lift Max
     type: int
     restore_value: no
     initial_value: "0"
-  - id: auto_topup_lockout       # too many corrections: stop actuating until manually reset
-    type: bool
+  - id: visit_height_count       # height top-ups during the current (or last) visit
+    type: int
     restore_value: no
-    initial_value: "false"
+    initial_value: "0"
+  - id: visit_level_count        # at-rest level pulses during the current (or last) visit
+    type: int
+    restore_value: no
+    initial_value: "0"
   # persisted LEVEL reference (pitch axis) for the tilt proxy
   - id: cal_ref_pitch
     type: float
@@ -847,7 +841,7 @@ number:
   # (rev G: the rev F "Lower Settle Time" was replaced by the LOWERED_VENT state —
   #  reaching Lowered now leaves the vent open indefinitely, so no settle timer.)
 
-  # ---- auto-leveling (v2): slave follows master; throttle the side that's ahead.
+  # ---- auto-leveling: slave follows master; throttle the side that's ahead.
   #      §21.3: deadband should stay ≈ ≤1° of arm angle — with the current ~26°
   #      span the 3 % default ≈ 0.8°. The §21.3 HARD STOP reuses Tilt Critical (°)
   #      applied to the two-IMU difference (never silently disable it). ----
@@ -1052,31 +1046,33 @@ number:
     step: 1
     unit_of_measurement: "s"
     entity_category: config
+  # ---- at-rest level keeper (Lift only) ----
   - platform: template
-    name: "Maintain Alert Window (h)"
-    id: maintain_alert_window_hours
-    web_server: {sorting_group_id: group_advanced, sorting_weight: 45}
+    name: "Rest Level Trigger (%)"
+    id: rest_level_trigger_pct
+    web_server: {sorting_group_id: group_advanced, sorting_weight: 47}
     optimistic: true
     restore_value: true
-    initial_value: 24          # top-up frequency window before auto-maintain locks out
+    initial_value: 3           # |level error| to start an at-rest pulse (looser than in-move)
     min_value: 1
-    max_value: 168
-    step: 1
-    unit_of_measurement: "h"
+    max_value: 10
+    step: 0.5
+    unit_of_measurement: "%"
     entity_category: config
   - platform: template
-    name: "Maintain Max Top-ups"
-    id: maintain_max_topups
-    web_server: {sorting_group_id: group_advanced, sorting_weight: 46}
+    name: "Rest Level Persist (s)"
+    id: rest_level_persist_s
+    web_server: {sorting_group_id: group_advanced, sorting_weight: 48}
     optimistic: true
     restore_value: true
-    initial_value: 3           # real auto top-ups allowed per alert window
-    min_value: 1
-    max_value: 24
-    step: 1
+    initial_value: 30          # error must persist this long before a rest pulse
+    min_value: 5
+    max_value: 120
+    step: 5
+    unit_of_measurement: "s"
     entity_category: config
 
-  # ---- tilt threshold (annunciator + §21.3 leveling hard stop; rev E: the Warn
+  # ---- tilt threshold (annunciator + leveling hard stop; the Warn
   #      tier was removed — watch the numeric "Lift Tilt" below critical) ----
   - platform: template
     name: "Tilt Critical (deg)"
@@ -1135,35 +1131,23 @@ switch:
   # (rev G: the four "Test LED" wiring-test switches were removed — ring wiring
   #  was confirmed at commissioning and the FSM LED driver covers every cadence.)
 
-  # ---- Auto-Level (v2) ----
-  # ON: while moving, the side that is AHEAD of level gets its valve throttled
-  # shut until the other catches up, and moves don't complete until the slave
-  # is inside the level band. OFF: valves ganged (= v1) and the decisions are
-  # only logged as LEVEL(shadow) — run several cycles like this first.
-  # (The §21.3 hard stop — sides diverging past Tilt Critical — is ALWAYS armed
-  #  while both sensors are trusted, independent of this switch.)
+  # ---- Maintain Height / Maintain Level (Control — dock-facing keepers) ----
+  # Formerly "Auto-Maintain" / "Auto-Level". Height: Ready/Lift/Lift Max.
+  # Level at-rest: Lift only. In-move throttle follows Maintain Level. Defaults ON.
   - platform: template
-    name: "Auto-Level"
-    id: auto_level_switch
-    icon: "mdi:scale-balance"
-    optimistic: true
-    restore_mode: RESTORE_DEFAULT_OFF
-    web_server: {sorting_group_id: group_config, sorting_weight: 12}
-
-  # ---- Phase-2 Auto-Maintain ACTUATE ----
-  # When ON, a confirmed sag at Top or Ready triggers a REAL top-up: the lift raises
-  # back to that setpoint through the normal go-to path, so it inherits every existing
-  # guard (valve interlock, stall detector, runtime watchdog, absolute blower cap,
-  # angle-trust supervisor, min-interval short-cycle guard). Sag-only — it never
-  # auto-lowers. Defaults OFF. The observer math (Phase-1 instrumentation) always
-  # runs — rev E removed the separate "Auto-Maintain Observe" enable switch.
-  - platform: template
-    name: "Auto-Maintain"
+    name: "Maintain Height"
     id: auto_maintain_switch
     icon: "mdi:arrow-up-bold-box"
     optimistic: true
-    restore_mode: RESTORE_DEFAULT_OFF
-    web_server: {sorting_group_id: group_config, sorting_weight: 10}
+    restore_mode: RESTORE_DEFAULT_ON
+    web_server: {sorting_group_id: group_control, sorting_weight: 10}
+  - platform: template
+    name: "Maintain Level"
+    id: auto_level_switch
+    icon: "mdi:scale-balance"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    web_server: {sorting_group_id: group_control, sorting_weight: 11}
 
   - platform: gpio
     id: blower_relay
@@ -1178,7 +1162,7 @@ switch:
       # blower on the relay's NC path — opposite sense of the valves, fail-
       # DEADLY (blower-OFF needed an energized coil), found via the all-night
       # dead-head; rev E.2 flipped software to inverted:false to match.
-      # EVENING: Mike rewired the blower to the NO path — coil de-energized =
+      # Blower on the NO path — coil de-energized =
       # motor OFF. Chain is now fail-SAFE (dark ESP/PCF or failed coil = motor
       # off) and the cold-boot blip is gone (PCF8574 powers up HIGH = OFF).
       # inverted:true restored IN THE SAME VISIT (rev F.6) — hardware and this
@@ -1237,7 +1221,7 @@ output:
 # ---------------------------------------------------------------------------
 #  Inputs — buttons emit INTENTS. (No hardware top-limit fitted; raising stops
 #  on the calibrated Top angle + blower watchdog/runtime cap.)
-#  Buttons rejected mid-motion by the request guards (only Stop stops a move).
+#  Mode buttons retarget mid-motion (last press wins); Stop cancels to HOLD.
 #  'inverted: true' => contact-closed reads as true.
 # ---------------------------------------------------------------------------
 binary_sensor:
@@ -1249,7 +1233,6 @@ binary_sensor:
     web_server: {sorting_group_id: group_status, sorting_weight: 10}
     lambda: |-
       return id(lift_state) == ${S_FAULT} || id(lift_state) == ${S_BYPASS} || !id(angle_trusted)
-             || id(auto_topup_lockout)
              || !(id(cal_down_done) && id(cal_up_done));
 
   # ---- boat presence — ON = boat aboard OR unknown (fail-safe; blocks Lift Max).
@@ -1280,13 +1263,8 @@ binary_sensor:
   # (rev E: "Maintain: Sagging Now" and "Lift Tilt Warn" were removed — the
   #  Maintain Observe line carries the sag story, and the numeric Lift Tilt
   #  covers anything below the critical threshold.)
-  - platform: template
-    name: "Auto-Maintain Lockout"
-    id: auto_maintain_lockout_sensor
-    device_class: problem
-    entity_category: diagnostic
-    web_server: {sorting_group_id: group_diag, sorting_weight: 43}
-    lambda: 'return id(auto_topup_lockout);'
+  # (rev H: Auto-Maintain Lockout binary removed — sticky lockout that disabled
+  #  height/level keeping was the wrong failure mode; visit counters replace it.)
   # "Something is really wrong" tilt alarm — pure annunciator (§21.3 hard stop uses
   # the same threshold on the live level error). Left OUT of Lift Problem for now:
   # the pitch proxy is unproven, so don't let a bad reading mask real faults.
@@ -1528,6 +1506,25 @@ sensor:
     accuracy_decimals: 1
     update_interval: 1s          # rev G: was 250 ms — display only, supervisor has its own copy
     lambda: 'return id(level_ok_now) ? id(level_err_filt) : NAN;'   # + = slave side HIGH
+
+  # ---- per-visit maintain event counters (reset on arrive at a new maintained zone) ----
+  - platform: template
+    name: "Visit Height Top-ups"
+    id: visit_height_topups
+    icon: "mdi:arrow-up-bold-hexagon-outline"
+    web_server: {sorting_group_id: group_control, sorting_weight: 12}
+    accuracy_decimals: 0
+    update_interval: 1s
+    lambda: 'return (float) id(visit_height_count);'
+  - platform: template
+    name: "Visit Level Events"
+    id: visit_level_events
+    icon: "mdi:scale-balance"
+    web_server: {sorting_group_id: group_control, sorting_weight: 13}
+    accuracy_decimals: 0
+    update_interval: 1s
+    lambda: 'return (float) id(visit_level_count);'
+
   - platform: template
     name: "Height ${side_slave}"
     id: slave_height_pct
@@ -1693,7 +1690,9 @@ text_sensor:
         case ${S_LOWERING}: return std::string("Lowering");
         case ${S_FAULT}:    return std::string("Fault");
         case ${S_BYPASS}:   return std::string("Bypass");
-        default:            return std::string("Idle");   // HOLD + LOWERED_VENT
+        default:
+          if (id(rest_pulse) != 0) return std::string("Leveling");
+          return std::string("Idle");   // HOLD + LOWERED_VENT
       }
   - platform: template
     name: "Lift Position"
@@ -1770,7 +1769,7 @@ text_sensor:
     update_interval: 1s
     lambda: 'return id(last_stop_reason);'
 
-  # ---- leveling summary: trust, filtered error, current throttle ----
+  # ---- leveling summary: trust, filtered error, current throttle / rest pulse ----
   - platform: template
     name: "Level Status"
     id: level_status_text
@@ -1781,10 +1780,16 @@ text_sensor:
       if (!id(have_cal2))     return std::string("${side_slave} IMU not calibrated");
       if (!id(angle2_valid))  return std::string("${side_slave} IMU OFFLINE - ganged (v1)");
       if (!id(level_ok_now))  return std::string("not trusted - ganged (v1)");
-      char b[96];
-      const char* thr = id(level_throttle) == 1 ? "throttling ${side_master}"
-                      : id(level_throttle) == 2 ? "throttling ${side_slave}" : "both open";
-      snprintf(b, sizeof(b), "%s | err %+.1f%% | auto %s", thr, id(level_err_filt),
+      char b[112];
+      const char* thr;
+      if (id(rest_pulse) == 1)      thr = "rest FEED ${side_master}";
+      else if (id(rest_pulse) == 2) thr = "rest FEED ${side_slave}";
+      else if (id(rest_pulse) == 3) thr = "rest VENT ${side_slave}";
+      else if (id(rest_pulse) == 4) thr = "rest VENT ${side_master}";
+      else if (id(level_throttle) == 1) thr = "throttling ${side_master}";
+      else if (id(level_throttle) == 2) thr = "throttling ${side_slave}";
+      else thr = "both open";
+      snprintf(b, sizeof(b), "%s | err %+.1f%% | maintain %s", thr, id(level_err_filt),
                id(auto_level_switch).state ? "ON" : "off (shadow)");
       return std::string(b);
 
@@ -1797,28 +1802,27 @@ text_sensor:
     update_interval: 6h
     lambda: 'return std::string(__DATE__ " " __TIME__);'
 
-  # ---- Auto-maintain summary line (observe math + actuation state) ----
+  # ---- Maintain summary (Status): switches + per-visit event counts + sag rate ----
   - platform: template
     name: "Maintain Observe"
     id: maintain_observe_text
-    entity_category: diagnostic
-    web_server: {sorting_group_id: group_diag, sorting_weight: 42}
+    web_server: {sorting_group_id: group_status, sorting_weight: 40}
     update_interval: 1s
     lambda: |-
-      if (id(auto_topup_lockout)) {
-        char b[96];
-        snprintf(b, sizeof(b), "LOCKOUT | top-ups %d/%d in %.0fh",
-                 id(auto_topup_window_count), (int) lroundf(id(maintain_max_topups).state),
-                 id(maintain_alert_window_hours).state);
-        return std::string(b);
-      }
-      const char* where = id(obs_arm_mode) == 1 ? "Lift"
-                        : (id(obs_arm_mode) == 2 ? "Ready" : "idle");
-      char b[112];
-      snprintf(b, sizeof(b), "%s | auto %s | top-ups %d/%d (shadow %d) | sag %.2f%%/h",
-               where, id(auto_maintain_switch).state ? "ON" : "off",
-               id(auto_topup_window_count), (int) lroundf(id(maintain_max_topups).state),
-               id(obs_shadow_count), id(obs_sag_rate));
+      const char* where = id(visit_pos) == 1 ? "Lift"
+                        : (id(visit_pos) == 2 ? "Ready"
+                        : (id(visit_pos) == 3 ? "Lift Max" : "idle"));
+      const char* armed = id(obs_arm_mode) == 1 ? "arm Lift"
+                        : (id(obs_arm_mode) == 2 ? "arm Ready"
+                        : (id(obs_arm_mode) == 3 ? "arm Max" : "disarmed"));
+      char b[128];
+      snprintf(b, sizeof(b),
+               "%s | ht %s lvl %s | visit top-ups %d level %d | sag %.2f%%/h | %s",
+               where,
+               id(auto_maintain_switch).state ? "ON" : "off",
+               id(auto_level_switch).state ? "ON" : "off",
+               id(visit_height_count), id(visit_level_count),
+               id(obs_sag_rate), armed);
       return std::string(b);
 
 # ---------------------------------------------------------------------------
@@ -1847,16 +1851,7 @@ button:
     on_press: {script.execute: request_stop}
   # (rev G: the "Reset Fault" button was removed — Stop is the universal
   #  clear-it control: it already clears a latched FAULT and exits BYPASS.)
-  - platform: template
-    name: "Reset Auto-Maintain Lockout"
-    entity_category: config
-    web_server: {sorting_group_id: group_config, sorting_weight: 11}
-    on_press:
-      - lambda: |-
-          id(auto_topup_lockout) = false;
-          id(auto_topup_window_count) = 0;
-          id(auto_topup_window_start) = millis();
-          ESP_LOGW("maintain", "auto-maintain lockout reset");
+  # (rev H: Reset Auto-Maintain Lockout removed with the sticky lockout.)
   - platform: restart
     name: "Restart"
     entity_category: config
@@ -1955,43 +1950,77 @@ button:
 
 # ---------------------------------------------------------------------------
 #  Intents (request_*) — validate against state + interlocks, then transition.
-#  A move is accepted ONLY from a resting state (HOLD / LOWERED_VENT); only Stop
-#  interrupts a move in progress (latched moves, no hold-to-run).
+#  Mode buttons: last press wins — accepted from rest OR mid-move (retarget /
+#  reverse). Stop cancels a move to HOLD. Latched moves, no hold-to-run.
 # ---------------------------------------------------------------------------
 script:
   # ---- go-to-position core: pick raise vs lower from current height ----
   # Raising starts blower + valve TOGETHER (rev H) — no valve-opening interlock;
   # a few seconds of dead-heading against the opening valve is accepted by design.
+  # Mid-move presses update the destination; direction may reverse if the new
+  # target is on the other side of the live height.
   - id: do_goto
     parameters:
       target: float
       mode: int
     then:
       - lambda: |-
-          // accepted from HOLD or LOWERED_VENT (resting states)
-          if (id(lift_state) != ${S_HOLD} && id(lift_state) != ${S_LOWERED_VENT}) return;
+          // accepted from rest OR while moving (retarget). Not from FAULT/BYPASS.
+          int prev_s = id(lift_state);
+          if (prev_s != ${S_HOLD} && prev_s != ${S_LOWERED_VENT}
+              && prev_s != ${S_RAISING} && prev_s != ${S_LOWERING}) return;
           if (!id(have_cal)) { ESP_LOGW("fsm","goto: not calibrated"); return; }
           if (!id(angle_trusted)) { ESP_LOGW("fsm","goto: angle not trusted"); return; }
           float cur = id(lift_pct);
           if (std::isnan(cur)) return;
           float tol = id(zone_tol_pct);
+          bool was_moving = (prev_s == ${S_RAISING} || prev_s == ${S_LOWERING});
+          id(rest_pulse) = 0;   // any go-to preempts an at-rest level pulse
           id(goto_target_pct) = target; id(goto_mode) = mode; id(manual_move) = false;
-          // v2: fresh move -> clear leveling scratch (throttle/catch-up/shadow dedupe)
+          // clear leveling scratch on any (re)target (throttle/catch-up/shadow dedupe)
           id(level_catchup_start) = 0; id(level_since) = 0; id(level_shadow_want) = 0;
-          if ((mode == ${M_LOWER} && id(pos_at_lowered)) || (mode == ${M_READY} && id(pos_at_ready))
-              || (mode == ${M_MAX} && id(pos_at_max))   || (mode == ${M_LIFT} && id(pos_at_top))) {
-            ESP_LOGI("fsm","goto mode %d: already in zone", mode);
-          } else if (cur < target - tol) {            // need to raise (blower + valve together)
-            id(lift_state) = ${S_RAISING};
+
+          bool in_zone = (mode == ${M_LOWER} && id(pos_at_lowered))
+                      || (mode == ${M_READY} && id(pos_at_ready))
+                      || (mode == ${M_MAX}   && id(pos_at_max))
+                      || (mode == ${M_LIFT}  && id(pos_at_top));
+          int next_s;
+          if (in_zone || !(cur < target - tol || cur > target + tol)) {
+            // already there — rest (Lowered keeps the vent open)
+            next_s = (mode == ${M_LOWER}) ? ${S_LOWERED_VENT} : ${S_HOLD};
+          } else if (cur < target - tol) {
+            next_s = ${S_RAISING};
+          } else {
+            next_s = ${S_LOWERING};
+          }
+
+          // arm move-scoped timers only when *entering* that direction
+          if (next_s == ${S_RAISING} && prev_s != ${S_RAISING}) {
             id(blower_on_since) = millis();
             id(last_progress_angle) = id(current_angle);
             id(last_progress_time) = millis();
-            ESP_LOGI("fsm","goto %.0f%% (mode %d): raising", target, mode);
-          } else if (cur > target + tol) {     // need to lower
-            id(lower_start_time) = millis(); id(lift_state) = ${S_LOWERING};
-            ESP_LOGI("fsm","goto %.0f%% (mode %d): lowering", target, mode);
+          }
+          if (next_s == ${S_LOWERING} && prev_s != ${S_LOWERING}) {
+            id(lower_start_time) = millis();
+          }
+          // retarget that lands already-at-target: mirror normal arrival side effects
+          if (was_moving && (next_s == ${S_HOLD} || next_s == ${S_LOWERED_VENT})) {
+            id(last_stop_reason) = "retarget already in zone";
+            if (next_s == ${S_LOWERED_VENT}) {
+              if (!id(boat_present)) ESP_LOGI("presence", "retarget LOWERED_VENT -> presence reset to presumed BOAT ON");
+              id(boat_present) = true;
+            }
+          }
+          id(lift_state) = next_s;
+
+          const char* dir = (next_s == ${S_RAISING}) ? "raising"
+                          : (next_s == ${S_LOWERING}) ? "lowering" : "already there";
+          if (was_moving) {
+            ESP_LOGI("fsm","retarget %.0f%% (mode %d): %s", target, mode, dir);
+          } else if (next_s == ${S_HOLD} || next_s == ${S_LOWERED_VENT}) {
+            ESP_LOGI("fsm","goto mode %d: already in zone", mode);
           } else {
-            ESP_LOGI("fsm","goto %.0f%%: already there", target);
+            ESP_LOGI("fsm","goto %.0f%% (mode %d): %s", target, mode, dir);
           }
       - script.execute: apply_outputs
 
@@ -1999,22 +2028,33 @@ script:
   - id: manual_raise            # unreachable target -> stops on blower cap / Stop
     then:
       - lambda: |-
-          if (id(lift_state) != ${S_HOLD} && id(lift_state) != ${S_LOWERED_VENT}) return;
+          int prev_s = id(lift_state);
+          if (prev_s != ${S_HOLD} && prev_s != ${S_LOWERED_VENT}
+              && prev_s != ${S_RAISING} && prev_s != ${S_LOWERING}) return;
           id(goto_target_pct) = 200.0f; id(goto_mode) = ${M_LIFT}; id(manual_move) = true;
+          if (prev_s != ${S_RAISING}) {
+            id(blower_on_since) = millis();
+            id(last_progress_angle) = id(current_angle);
+            id(last_progress_time) = millis();
+          }
           id(lift_state) = ${S_RAISING};
-          id(blower_on_since) = millis();
-          id(last_progress_angle) = id(current_angle);
-          id(last_progress_time) = millis();
-          ESP_LOGW("fsm","MANUAL raise (angle not trusted)");
+          ESP_LOGW("fsm","MANUAL raise (angle not trusted)%s",
+                   (prev_s == ${S_LOWERING}) ? " [retarget reverse]" : "");
       - script.execute: apply_outputs
 
   - id: manual_lower            # unreachable target -> stops on lower-timeout / Stop
     then:
       - lambda: |-
-          if (id(lift_state) != ${S_HOLD} && id(lift_state) != ${S_LOWERED_VENT}) return;
+          int prev_s = id(lift_state);
+          if (prev_s != ${S_HOLD} && prev_s != ${S_LOWERED_VENT}
+              && prev_s != ${S_RAISING} && prev_s != ${S_LOWERING}) return;
           id(goto_target_pct) = -100.0f; id(goto_mode) = ${M_LOWER}; id(manual_move) = true;
-          id(lower_start_time) = millis(); id(lift_state) = ${S_LOWERING};
-          ESP_LOGW("fsm","MANUAL lower (angle not trusted)");
+          if (prev_s != ${S_LOWERING}) {
+            id(lower_start_time) = millis();
+          }
+          id(lift_state) = ${S_LOWERING};
+          ESP_LOGW("fsm","MANUAL lower (angle not trusted)%s",
+                   (prev_s == ${S_RAISING}) ? " [retarget reverse]" : "");
       - script.execute: apply_outputs
 
   # ---- button intents: normal go-to when angle is good; manual jog when offline ----
@@ -2031,7 +2071,7 @@ script:
           if (!id(angle_trusted)) { ESP_LOGW("fsm","Lift Max needs a trusted angle"); return; }
           if (!id(cal_max_done)) { ESP_LOGW("fsm","Lift Max not calibrated"); return; }
           if (!id(have_cal)) return;
-          // ROOF GUARD (rev F.3, "decide en route" — Mike's pattern 2026-07-19):
+          // ROOF GUARD ("decide en route"):
           // Max ≈148% puts the boat tower into the boathouse roof. From a LOW
           // start the classifier window (first 15%-pts of climb) resolves far
           // below the roof, and the in-flight clamp demotes Max -> Lift on any
@@ -2082,19 +2122,26 @@ script:
           }
           if (id(lift_state) == ${S_FAULT}) {
             id(fault_reason) = "";
+            id(rest_pulse) = 0;
             id(lift_state) = ${S_HOLD};   // clear FAULT -> HOLD
             ESP_LOGI("fsm", "request_stop -> clear FAULT -> HOLD");
           } else if (id(lift_state) == ${S_BYPASS}) {
             id(bypass_mode_switch).publish_state(false);
+            id(rest_pulse) = 0;
             id(lift_state) = ${S_HOLD};
             ESP_LOGI("fsm", "request_stop -> exit BYPASS -> HOLD");
           } else if (id(lift_state) == ${S_RAISING} || id(lift_state) == ${S_LOWERING}) {
             // (rev F.4: LOWERED_VENT removed from this clause — at the bottom
             //  the vent stays open ALWAYS; the 250 ms rest-vent rule would
             //  reopen it within a tick anyway, so Stop there is a no-op.)
+            id(rest_pulse) = 0;
             id(lift_state) = ${S_HOLD};
             id(last_stop_reason) = "Stop pressed";
             ESP_LOGI("fsm", "request_stop -> HOLD");
+          } else if (id(rest_pulse) != 0) {
+            id(rest_pulse) = 0;
+            id(last_stop_reason) = "Stop pressed (rest level)";
+            ESP_LOGI("fsm", "request_stop -> abort rest level pulse");
           }
       - script.execute: apply_outputs
 
@@ -2105,6 +2152,7 @@ script:
           if (id(test_mode)) { ESP_LOGI("fsm","bench test: bypass ignored"); return; }
           if (id(lift_state) == ${S_BYPASS}) return;       // already in bypass
           id(manual_move) = false;
+          id(rest_pulse) = 0;
           id(boat_present) = true;   // hands-off manual: anything can happen -> presence unknown = presumed ON
           id(lift_state) = ${S_BYPASS};          // BYPASS: apply_outputs opens valve, blower off
           ESP_LOGW("fsm", "BYPASS engaged -> valve OPEN, blower OFF (hands-off)");
@@ -2131,13 +2179,14 @@ script:
       - lambda: |-
           if (id(lift_state) != ${S_FAULT}) {
             id(fault_reason) = reason;
+            id(rest_pulse) = 0;
             id(lift_state) = ${S_FAULT};
             id(last_stop_reason) = std::string("FAULT: ") + reason;
             ESP_LOGE("fsm", "FAULT: %s", reason.c_str());
           }
       - script.execute: apply_outputs
 
-  # ---- THE single place outputs are written. Outputs = f(state). ----
+  # ---- THE single place outputs are written. Outputs = f(state, rest_pulse). ----
   - id: apply_outputs
     mode: single
     then:
@@ -2148,9 +2197,10 @@ script:
           bool blower = false, v_base = false;
           if (s == ${S_RAISING}) { v_base = true;  blower = true;  }   // blower + valves together (rev H)
           else if (s == ${S_LOWERING} || s == ${S_BYPASS} || s == ${S_LOWERED_VENT}) { v_base = true; }
-          // HOLD / FAULT: make_safe -> blower off, valves closed
+          // HOLD / FAULT: make_safe -> blower off, valves closed — unless an
+          // at-rest level pulse is active (HOLD + rest_pulse 1..4).
 
-          // v2 leveling bias: both valves follow the state, then the throttled
+          // Leveling bias: both valves follow the state, then the throttled
           // side (decided by the 250 ms supervisor) is closed while moving.
           // level_throttle is single-valued, so both valves can never be
           // throttled shut at once.
@@ -2158,6 +2208,16 @@ script:
           if (s == ${S_RAISING} || s == ${S_LOWERING}) {
             if (id(level_throttle) == 1) va = false;        // feed/vent slave side only
             else if (id(level_throttle) == 2) vb = false;   // feed/vent master side only
+          }
+
+          // §21.6 at-rest level pulse while parked at Lift (still HOLD in the FSM).
+          // 1=feed master, 2=feed slave, 3=vent slave, 4=vent master
+          int rp = id(rest_pulse);
+          if (s == ${S_HOLD} && rp != 0) {
+            if (rp == 1)      { blower = true;  va = true;  vb = false; }
+            else if (rp == 2) { blower = true;  va = false; vb = true;  }
+            else if (rp == 3) { blower = false; va = false; vb = true;  }
+            else if (rp == 4) { blower = false; va = true;  vb = false; }
           }
 
           // Auto-return valves: energized = open, off = spring/auto return closed.
@@ -2352,7 +2412,7 @@ interval:
           id(pos_at_top) = id(angle_valid) && !std::isnan(id(lift_pct))
               && id(lift_pct) >= id(top_target_pct).state - id(zone_tol_pct);
 
-          // ================= v2 LEVELING SUPERVISOR =================
+          // ================= LEVELING SUPERVISOR =================
           // ---- slave (IMU #2) freshness + sanity + trust — mirrors the master ----
           bool fresh2 = (now - id(angle2_last_update)) < fresh_ms && id(angle2_last_update) != 0;
           bool in_range2 = (id(current_angle2) > -95.0f && id(current_angle2) < 95.0f);
@@ -2386,7 +2446,7 @@ interval:
           // ---- §21.3 HARD STOP: sides diverging past Tilt Critical (°) is a
           //      something-is-mechanically-wrong condition — air cannot fix it.
           //      FAULT + make-safe (both valves closed). Armed whenever both
-          //      sensors are trusted, independent of the Auto-Level switch.
+          //      sensors are trusted, independent of the Maintain Level switch.
           //      (% error -> degrees through the master span.) ----
           if (lok && id(have_cal) && !id(test_mode)) {
             float err_deg = fabs(id(level_err_filt)) * fabs(span) / 100.0f;
@@ -2399,7 +2459,7 @@ interval:
 
           // ---- throttle decision: close the valve of whichever side is AHEAD ----
           // Applies only while RAISING/LOWERING on a position-targeted move.
-          // Auto-Level OFF => decisions are computed + logged as LEVEL(shadow)
+          // Maintain Level OFF => decisions are computed + logged as LEVEL(shadow)
           // but level_throttle stays 0 (valves ganged = v1).
           {
             int s0 = id(lift_state);
@@ -2441,35 +2501,100 @@ interval:
               }
             }
             if (!moving23) { id(level_throttle) = 0; id(level_shadow_want) = 0; }
+            else if (id(rest_pulse) != 0) {
+              id(rest_pulse) = 0;   // commanded move preempts any rest pulse
+            }
 
-            // ---- §21.6 at-rest keeper — SHADOW ONLY (design still open).
-            //      Proposed rule while parked at Lift with a list past the deadband:
-            //      reference at/below target -> feed the LOW side (top-up that also
-            //      levels); reference above target -> vent the HIGH side. Logged on
-            //      change so real data can confirm the rule before any actuation. ----
+            // ---- §21.6 at-rest level keeper (Lift only; Maintain Level ON).
+            //      Height maintain has priority: if master is below the sag
+            //      deadband, do not start (or abort) a rest pulse — the height
+            //      top-up raise will level as a side effect via in-move throttle.
+            //      No sticky lockout: count visit events, keep correcting. ----
             {
-              int rest_want = 0;   // 1=feed master, 2=feed slave, 3=vent slave, 4=vent master
-              if (s0 == ${S_HOLD} && lok && id(pos_at_top)
-                  && fabs(id(level_err_filt)) > id(level_deadband_pct).state) {
-                bool slave_high = id(level_err_filt) > 0.0f;
-                bool at_or_below = id(lift_pct) <= id(top_target_pct).state;
-                if (at_or_below) rest_want = slave_high ? 1 : 2;   // feed the LOW side
-                else             rest_want = slave_high ? 3 : 4;   // vent the HIGH side
-              }
-              if (rest_want != id(level_rest_shadow)) {
-                if (rest_want != 0) {
-                  const char* what = rest_want == 1 ? "FEED master (low side)"
-                                   : rest_want == 2 ? "FEED slave (low side)"
-                                   : rest_want == 3 ? "VENT slave (high side)"
-                                                    : "VENT master (high side)";
-                  ESP_LOGW("level", "REST-LEVEL(shadow): would %s (err %+.1f%%, height %.1f%%)",
-                           what, id(level_err_filt), id(lift_pct));
+              const unsigned long FEED_MS = 45000UL;
+              const unsigned long VENT_MS = 10000UL;
+              const unsigned long REST_GAP_MS = 60000UL;  // min off-time between pulses
+              bool at_lift_only = (s0 == ${S_HOLD}) && id(pos_at_top) && !id(pos_at_max);
+              bool height_ok = !std::isnan(id(lift_pct))
+                               && id(lift_pct) >= id(top_target_pct).state
+                                              - id(maintain_sag_deadband).state;
+              bool lvl_on = id(auto_level_switch).state && !id(test_mode);
+
+              // manage an active pulse
+              if (id(rest_pulse) != 0) {
+                bool abort = !at_lift_only || !lok || !lvl_on || !height_ok;
+                unsigned long lim = (id(rest_pulse) <= 2) ? FEED_MS : VENT_MS;
+                bool timed_out = (now - id(rest_pulse_since)) >= lim;
+                // vent floor: never trade Lift height away
+                if (id(rest_pulse) >= 3 && !std::isnan(id(lift_pct))
+                    && id(lift_pct) < id(top_target_pct).state - id(zone_tol_pct)) {
+                  abort = true;
+                  ESP_LOGW("level", "REST-LEVEL: vent aborted (height floor)");
                 }
-                id(level_rest_shadow) = rest_want;
+                // done when error back inside release band
+                float rel = id(rest_level_trigger_pct).state
+                            - id(level_hysteresis_pct).state;
+                if (rel < 0.0f) rel = 0.0f;
+                bool leveled = lok && fabs(id(level_err_filt)) <= rel;
+                // feed progress: fed side must move within ~15 s or abort
+                if (!abort && id(rest_pulse) <= 2 && (now - id(rest_pulse_since)) > 15000UL) {
+                  float fed = (id(rest_pulse) == 1) ? id(current_angle) : id(current_angle2);
+                  float dir = (id(rest_pulse) == 1)
+                            ? ((span >= 0.0f) ? 1.0f : -1.0f)
+                            : ((span2 >= 0.0f) ? 1.0f : -1.0f);
+                  if ((fed - id(rest_pulse_start_angle)) * dir < 0.15f) {
+                    abort = true;
+                    ESP_LOGW("level", "REST-LEVEL: feed no progress -> abort");
+                  }
+                }
+                if (abort || timed_out || leveled) {
+                  ESP_LOGI("level", "REST-LEVEL: pulse end (%s) err %+.1f%%",
+                           abort ? "abort" : (timed_out ? "timeout" : "leveled"),
+                           id(level_err_filt));
+                  id(rest_pulse) = 0;
+                  id(rest_last_pulse_ms) = now;
+                  id(rest_level_below_since) = 0;
+                }
+              } else if (at_lift_only && lok && lvl_on && height_ok) {
+                bool past = fabs(id(level_err_filt)) > id(rest_level_trigger_pct).state;
+                if (past) {
+                  if (id(rest_level_below_since) == 0) id(rest_level_below_since) = now;
+                  unsigned long persist_ms =
+                      (unsigned long)(id(rest_level_persist_s).state * 1000.0f);
+                  bool gap_ok = (id(rest_last_pulse_ms) == 0)
+                             || (now - id(rest_last_pulse_ms)) >= REST_GAP_MS;
+                  if ((now - id(rest_level_below_since)) >= persist_ms && gap_ok) {
+                    bool slave_high = id(level_err_filt) > 0.0f;
+                    bool at_or_below = id(lift_pct) <= id(top_target_pct).state;
+                    int want = at_or_below ? (slave_high ? 1 : 2)   // feed LOW
+                                           : (slave_high ? 3 : 4);  // vent HIGH
+                    id(rest_pulse) = want;
+                    id(rest_pulse_since) = now;
+                    id(rest_pulse_start_angle) =
+                        (want == 1 || want == 4) ? id(current_angle) : id(current_angle2);
+                    id(rest_level_below_since) = 0;
+                    // ensure visit is Lift before counting (supervisor may run before maintain tick)
+                    if (id(visit_pos) != 1) {
+                      id(visit_pos) = 1;
+                      id(visit_height_count) = 0;
+                      id(visit_level_count) = 0;
+                    }
+                    id(visit_level_count)++;
+                    const char* what = want == 1 ? "FEED master" : want == 2 ? "FEED slave"
+                                     : want == 3 ? "VENT slave" : "VENT master";
+                    ESP_LOGW("level", "REST-LEVEL: %s (err %+.1f%%, h %.1f%%) visit level #%d",
+                             what, id(level_err_filt), id(lift_pct), id(visit_level_count));
+                  }
+                } else {
+                  id(rest_level_below_since) = 0;
+                }
+              } else {
+                id(rest_level_below_since) = 0;
+                if (!at_lift_only && id(rest_pulse) != 0) id(rest_pulse) = 0;
               }
             }
           }
-          // ================ end v2 leveling supervisor ================
+          // ================ end leveling supervisor ================
 
           // ---- valve command-vs-feedback agreement (manual-operation detector; DISPLAY ONLY) ----
           // "Commanded" = what we're driving Y2 to (valve_power_open); in bench mode that's the
@@ -2511,7 +2636,7 @@ interval:
           if (s == ${S_RAISING}) {
             // (Runtime backstop = the ABSOLUTE blower cap above; the old per-raise
             //  watchdog was redundant — the cap always tripped first.)
-            // stall detector (armed only after grace window). v2: FEED-AWARE —
+            // stall detector (armed only after grace window). FEED-AWARE —
             // when the master valve is throttled for leveling, all air goes to
             // the slave side, so progress is measured on whichever side is fed,
             // IN THAT SENSOR'S OWN SIGN (raising drives the angle toward the
@@ -2586,7 +2711,7 @@ interval:
               else if (id(goto_mode) == ${M_READY} && id(pos_at_ready)) reached = true;
               else if (id(goto_mode) == ${M_MAX} && id(pos_at_max)) reached = true;
               else if (id(angle_valid) && !std::isnan(pct) && pct >= id(goto_target_pct)) reached = true;
-              // v2 two-sided completion: master at target, but the slave must be
+              // Two-sided completion: master at target, but the slave must be
               // inside the level band too — the throttle (master valve closed)
               // feeds the slave while the master holds. Times out to FAULT.
               if (reached && id(auto_level_switch).state && id(level_ok_now)
@@ -2633,7 +2758,7 @@ interval:
                 id(boat_present) = true;
                 ESP_LOGI("fsm", "lowered threshold reached -> LOWERED_VENT (valves stay open)");
               } else {
-                // v2 two-sided completion: master at target, slave must be level too
+                // Two-sided completion: master at target, slave must be level too
                 // (throttle closes the master valve so only the lagging side vents).
                 bool lvl_hold = false;
                 if (id(auto_level_switch).state && id(level_ok_now) && !id(manual_move)
@@ -2662,7 +2787,7 @@ interval:
               id(last_stop_reason) = (id(goto_mode) == ${M_LOWER})
                   ? "lower timeout (lowered zone never confirmed - valve closed)"
                   : "lower timeout";
-              // rev F.2: a Lowered-bound descent may have reached floating depth
+              // A Lowered-bound descent may have reached floating depth
               // without ever confirming the zone — the boat could have changed,
               // so presence resets to presumed ON just like the LOWERED_VENT path.
               if (id(goto_mode) == ${M_LOWER}) id(boat_present) = true;
@@ -2670,12 +2795,12 @@ interval:
             }
           }
 
-          // ---- resting at the bottom: vent stays open, ALWAYS (rev F.4,
-          //      Mike 2026-07-19). Any HOLD that finds itself settled in the
-          //      Lowered zone — post-reboot, post-Stop, or a timed-out lower
-          //      that settles in later — re-enters LOWERED_VENT so the tanks
-          //      keep venting indefinitely. Boat can come/go at the bottom,
-          //      so presence resets to presumed ON here too. ----
+          // ---- resting at the bottom: vent stays open, ALWAYS.
+          //      Any HOLD that finds itself settled in the Lowered zone —
+          //      post-reboot, post-Stop, or a timed-out lower that settles
+          //      in later — re-enters LOWERED_VENT so the tanks keep venting
+          //      indefinitely. Boat can come/go at the bottom, so presence
+          //      resets to presumed ON here too. ----
           else if (s == ${S_HOLD} && id(angle_trusted) && id(pos_at_lowered)) {
             id(lift_state) = ${S_LOWERED_VENT};
             id(boat_present) = true;
@@ -2691,10 +2816,12 @@ interval:
             bool cs_rest = (cs == ${S_HOLD} || cs == ${S_LOWERED_VENT});
             bool ps_move = (ps == ${S_RAISING} || ps == ${S_LOWERING});
             bool cs_move = (cs == ${S_RAISING} || cs == ${S_LOWERING});
-            if (ps_rest && cs_move) {
+            bool start_or_redirect = (ps_rest && cs_move) || (ps_move && cs_move && ps != cs);
+            if (start_or_redirect) {
               id(move_start_ms) = now;
               id(move_start_angle) = id(current_angle);
-              // arm the presence classifier on RAISE starts only (rev F)
+              // arm the presence classifier on RAISE starts only (rev F) —
+              // includes LOWERING→RAISING retarget reverse (fresh climb window)
               if (cs == ${S_RAISING} && !id(manual_move) && !std::isnan(id(lift_pct))) {
                 id(presence_start_pct) = id(lift_pct);
                 id(presence_classified) = false;
@@ -2709,7 +2836,8 @@ interval:
                   ESP_LOGW("presence", "Max launch without classifier arm -> demoted to Lift (roof guard)");
                 }
               }
-              ESP_LOGI("move", "START %s angle=%.2f° mode=%d manual=%d",
+              ESP_LOGI("move", "%s %s angle=%.2f° mode=%d manual=%d",
+                       (ps_move && ps != cs) ? "REDIRECT" : "START",
                        (cs == ${S_LOWERING}) ? "LOWER" : "RAISE",
                        id(current_angle), id(goto_mode), id(manual_move));
             }
@@ -2724,21 +2852,14 @@ interval:
       # re-assert outputs from (possibly updated) state every tick
       - script.execute: apply_outputs
 
-  # ---- AUTO-MAINTAIN observer + actuator ----
-  # Measures wave amplitude, sag rate, tilt, and detects a sustained sag below the armed
-  # setpoint. With "Auto-Maintain" OFF it only counts shadow top-ups (pure instrumentation);
-  # with it ON the same confirmed sag fires a REAL top-up via do_goto (normal raise path).
+  # ---- MAINTAIN HEIGHT observer + actuator ----
+  # Measures wave amplitude + sag rate. Confirmed sag at Ready / Lift / Lift Max
+  # fires a real top-up via do_goto when Maintain Height is ON. No sticky lockout.
+  # Per-visit counters reset when arriving at a new maintained position.
   - interval: 250ms
     then:
       - lambda: |-
           unsigned long now = millis();
-          unsigned long alert_window_ms =
-              (unsigned long)(id(maintain_alert_window_hours).state * 3600000.0f);
-          if (id(auto_topup_window_start) == 0 ||
-              (!id(auto_topup_lockout) && now - id(auto_topup_window_start) >= alert_window_ms)) {
-            id(auto_topup_window_start) = now;
-            id(auto_topup_window_count) = 0;
-          }
           float pct = id(lift_pct);   // single-source height % (250 ms supervisor)
           bool good = id(have_cal) && id(angle_trusted) && !std::isnan(pct);
 
@@ -2771,68 +2892,86 @@ interval:
             }
           }
 
-          // ---- SHADOW top-up detector: latched arm at Top/Ready, mirrors Phase-2 ----
+          // ---- visit + height-arm at Ready / Lift / Lift Max (Max preferred over Lift) ----
           float ready_pct = id(ready_target_pct);
-          bool at_top   = good && id(pos_at_top);
+          bool at_max   = good && id(pos_at_max);
+          bool at_top   = good && id(pos_at_top) && !id(pos_at_max);
           bool at_ready = good && id(pos_at_ready);
+          int zone = at_max ? 3 : (at_top ? 1 : (at_ready ? 2 : 0));
+          int s = id(lift_state);
+          bool resting = (s == ${S_HOLD});
+          // Start/reset visit when we arrive HOLD at a maintained zone different
+          // from the current visit. Top-up raises leave HOLD briefly but keep
+          // visit_pos so counters survive the automatic recovery.
+          if (resting && zone != 0 && id(visit_pos) != zone) {
+            id(visit_pos) = zone;
+            id(visit_height_count) = 0;
+            id(visit_level_count) = 0;
+            ESP_LOGI("maintain", "visit start at %s",
+                     zone == 1 ? "Lift" : zone == 2 ? "Ready" : "Lift Max");
+          } else if (resting && zone == 0 && id(visit_pos) != 0) {
+            ESP_LOGI("maintain", "visit end (left maintained zone)");
+            id(visit_pos) = 0;   // counts frozen on Maintain Observe until next visit
+          }
 
-          if (id(lift_state) != ${S_HOLD} || !good) {
-            // not in HOLD, or angle untrusted -> fully disarm
+          // Height arm only while HOLD + trusted (rest-level pulse aborts on height sag above)
+          if (id(rest_pulse) != 0 && good && id(obs_height_filt) > -900.0f && zone == 1) {
+            if (id(obs_height_filt) < id(top_target_pct).state - id(maintain_sag_deadband).state) {
+              ESP_LOGW("maintain", "height sag during rest pulse -> abort pulse, yield to height");
+              id(rest_pulse) = 0;
+            }
+          }
+          if (!resting || !good || id(rest_pulse) != 0) {
             id(obs_arm_mode) = 0; id(obs_settled_since) = 0;
             id(obs_below_since) = 0; id(obs_below_now) = false;
-          } else if (id(obs_arm_mode) == 0) {
-            // arm (latch) when resting at a maintained setpoint
-            if (at_top)        { id(obs_arm_mode) = 1; id(obs_settled_since) = now; id(obs_below_since) = 0; }
-            else if (at_ready) { id(obs_arm_mode) = 2; id(obs_settled_since) = now; id(obs_below_since) = 0; }
-          } else {
-            // armed: keep watching through the sag (does NOT require staying inside the band)
-            float setpoint = (id(obs_arm_mode) == 1) ? id(top_target_pct).state : ready_pct;
-            unsigned long settle_ms = (unsigned long)(id(maintain_settle_seconds).state * 1000.0f);
-            bool settled = (now - id(obs_settled_since)) >= settle_ms;
-            bool below = settled && (id(obs_height_filt) > -900.0f)
-                         && (id(obs_height_filt) < setpoint - id(maintain_sag_deadband).state);
-            id(obs_below_now) = below;
-            if (below) {
-              if (id(obs_below_since) == 0) id(obs_below_since) = now;
-              unsigned long persist_ms = (unsigned long)(id(maintain_persist_seconds).state * 1000.0f);
-              unsigned long gap_ms = (unsigned long)(id(maintain_min_interval_min).state * 60000.0f);
-              bool gap_ok = (id(obs_last_shadow) == 0) || (now - id(obs_last_shadow)) >= gap_ms;
-              if ((now - id(obs_below_since)) >= persist_ms && gap_ok) {
-                id(obs_shadow_count)++;
-                id(obs_last_shadow) = now;
-                id(obs_below_since) = 0;   // model a top-up restoring the setpoint, then keep watching
-                ESP_LOGW("maintain", "top-up #%d at %s (filt %.1f%% < %.1f%% - %.1f)",
-                         id(obs_shadow_count), id(obs_arm_mode) == 1 ? "Lift" : "Ready",
-                         id(obs_height_filt), setpoint, id(maintain_sag_deadband).state);
-                // ---- Phase-2: actually restore the setpoint through the normal raise path ----
-                // do_goto runs only from HOLD and re-checks calibration + angle trust; the move
-                // then inherits the valve interlock, stall detector, watchdog and blower cap.
-                // Next tick lift_state != 0 disarms this observer until the raise completes.
-                if (id(auto_maintain_switch).state && !id(test_mode) && id(lift_state) == ${S_HOLD}) {
-                  int max_topups = (int) lroundf(id(maintain_max_topups).state);
-                  if (id(auto_topup_lockout) || id(auto_topup_window_count) >= max_topups) {
-                    id(auto_topup_lockout) = true;
-                    ESP_LOGE("maintain", "AUTO-MAINTAIN LOCKOUT: %d top-ups in %.0fh window",
-                             id(auto_topup_window_count), id(maintain_alert_window_hours).state);
-                    return;
-                  }
-                  int md = (id(obs_arm_mode) == 1) ? ${M_LIFT} : ${M_READY};
-                  float sp = (id(obs_arm_mode) == 1) ? id(top_target_pct).state : ready_pct;
-                  id(obs_act_count)++;
-                  id(auto_topup_window_count)++;
-                  if (id(auto_topup_window_count) >= max_topups) {
-                    id(auto_topup_lockout) = true;
-                    ESP_LOGE("maintain", "AUTO-MAINTAIN LOCKOUT armed after top-up #%d in %.0fh window",
-                             id(auto_topup_window_count), id(maintain_alert_window_hours).state);
-                  }
-                  ESP_LOGW("maintain", "AUTO-MAINTAIN actuate #%d -> raise to %s (%.1f%%)",
-                           id(obs_act_count), md == 0 ? "Lift" : "Ready", sp);
-                  id(do_goto)->execute(sp, md);
-                }
-              }
-            } else {
-              id(obs_below_since) = 0;
-            }
+            return;
+          }
+
+          if (id(obs_arm_mode) == 0) {
+            if (zone == 3)      { id(obs_arm_mode) = 3; id(obs_settled_since) = now; id(obs_below_since) = 0; }
+            else if (zone == 1) { id(obs_arm_mode) = 1; id(obs_settled_since) = now; id(obs_below_since) = 0; }
+            else if (zone == 2) { id(obs_arm_mode) = 2; id(obs_settled_since) = now; id(obs_below_since) = 0; }
+            return;
+          }
+
+          float setpoint = ready_pct;
+          if (id(obs_arm_mode) == 1) {
+            setpoint = id(top_target_pct).state;
+          } else if (id(obs_arm_mode) == 3) {
+            float span = id(cal_angle_up) - id(cal_angle_down);
+            setpoint = (id(cal_angle_max) - id(cal_angle_down)) / span * 100.0f;
+          }
+          unsigned long settle_ms = (unsigned long)(id(maintain_settle_seconds).state * 1000.0f);
+          bool settled = (now - id(obs_settled_since)) >= settle_ms;
+          bool below = settled && (id(obs_height_filt) > -900.0f)
+                       && (id(obs_height_filt) < setpoint - id(maintain_sag_deadband).state);
+          id(obs_below_now) = below;
+          if (!below) { id(obs_below_since) = 0; return; }
+          if (id(obs_below_since) == 0) id(obs_below_since) = now;
+          unsigned long persist_ms = (unsigned long)(id(maintain_persist_seconds).state * 1000.0f);
+          unsigned long gap_ms = (unsigned long)(id(maintain_min_interval_min).state * 60000.0f);
+          bool gap_ok = (id(obs_last_shadow) == 0) || (now - id(obs_last_shadow)) >= gap_ms;
+          if ((now - id(obs_below_since)) < persist_ms || !gap_ok) return;
+
+          id(obs_shadow_count)++;
+          id(obs_last_shadow) = now;
+          id(obs_below_since) = 0;
+          const char* where = id(obs_arm_mode) == 1 ? "Lift"
+                            : (id(obs_arm_mode) == 3 ? "Lift Max" : "Ready");
+          ESP_LOGW("maintain", "top-up #%d at %s (filt %.1f%% < %.1f%% - %.1f)",
+                   id(obs_shadow_count), where,
+                   id(obs_height_filt), setpoint, id(maintain_sag_deadband).state);
+
+          // Real top-up when Maintain Height is ON — no lockout; visit counter only.
+          if (id(auto_maintain_switch).state && !id(test_mode) && id(lift_state) == ${S_HOLD}) {
+            int md = (id(obs_arm_mode) == 1) ? ${M_LIFT}
+                   : (id(obs_arm_mode) == 3) ? ${M_MAX} : ${M_READY};
+            id(obs_act_count)++;
+            id(visit_height_count)++;
+            id(rest_pulse) = 0;   // height owns the move
+            ESP_LOGW("maintain", "MAINTAIN HEIGHT actuate #%d -> raise to %s (%.1f%%) visit top-ups %d",
+                     id(obs_act_count), where, setpoint, id(visit_height_count));
+            id(do_goto)->execute(setpoint, md);
           }
 
   # ---------------------------------------------------------------------------
