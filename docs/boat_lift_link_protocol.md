@@ -169,6 +169,7 @@ full human text always comes in `msg=`.
 | `LIFTED_MAX` | resting at Lift Max | "LIFTED MAX" |
 | `BYPASS` | bypass override active | full-screen BYPASS lock |
 | `FAULT` | latched fault | "ERROR" + reset affordance |
+| `EMERG_DESCEND` | emergency descent to Ready (level divergence, ADR-013); `prob=1` rides along | "EMERGENCY" |
 
 `prob=1` independently drives the error banner; `trust=0` independently drives the
 degraded/manual treatment (below). They can coexist with any `st`.

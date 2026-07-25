@@ -152,6 +152,7 @@ Pressing a mode button sends the lift to that setpoint; the controller **chooses
 | **LOWERED_VENT** | OFF | **OPEN** | Resting at Lowered with vents left open — the lift keeps settling indefinitely. New commands accepted. **The vent stays open at the bottom, always** — Stop here is a no-op (a standing supervisor rule re-enters LOWERED_VENT from any HOLD settled in the Lowered zone; a latched FAULT still seals). |
 | **FAULT** | OFF | CLOSED | Latched safe state + reason. |
 | **BYPASS** | OFF | **OPEN** | Manual override (§6.6): valves open, blower off, FSM idle. |
+| **EMERG_DESCEND** | OFF | **OPEN** (ganged) | Emergency descent (§16.3, ADR-013): level divergence with the boat high — vent both sides down to Ready, then seal into FAULT. Stop = seal now; mode buttons refused. |
 
 *(Numeric FSM slot 1 is reserved/retired — formerly a valve-opening interlock state.)*
 
@@ -260,17 +261,18 @@ Future option (not done): use end-stops as stuck-valve fault triggers.
 
 ### 9.2 Roll-up entities (status trio)
 
-- **`Lift Activity`** *(machine-friendly — what the lift is DOING)*: exactly one of `Idle / Raising / Lowering / Leveling / Fault / Bypass`. `LOWERED_VENT` reads as `Idle`.
+- **`Lift Activity`** *(machine-friendly — what the lift is DOING)*: exactly one of `Idle / Raising / Lowering / Leveling / Fault / Bypass / Emergency Descent`. `LOWERED_VENT` reads as `Idle`.
 - **`Lift Position`** *(machine-friendly — WHERE it is)*: exactly one of `Lowered / Ready / Lifted / Lifted Max / Between / Unknown`.
 - **`Lift Status`** *(human-readable line, feeds the panel `msg=`; shown as the **headline at the top of the web Control group**)* via a priority ladder:
-  1. `FAULT — <reason>`
-  2. `BYPASS — valve open, blower off (manual override)`
-  3. Moving → `MANUAL raising…` (untrusted) or `Raising -> Ready` (go-to; **no live % embedded**)
-  4. `Lowered — vent open` (LOWERED_VENT)
-  5. `Manual valve` (feedback disagrees with closed command, §7.1)
-  6. `Angle sensor OFFLINE — manual control` / `Angle OUT OF RANGE — manual control`
-  7. `Not calibrated`
-  8. Resting → `Lowered`, `Ready`, `Lifted`, `Lifted (max)`, `Between …`, or `Holding`
+  1. `EMERGENCY — descending to Ready (level failure)` (ADR-013)
+  2. `FAULT — <reason>`
+  3. `BYPASS — valve open, blower off (manual override)`
+  4. Moving → `MANUAL raising…` (untrusted) or `Raising -> Ready` (go-to; **no live % embedded**)
+  5. `Lowered — vent open` (LOWERED_VENT)
+  6. `Manual valve` (feedback disagrees with closed command, §7.1)
+  7. `Angle sensor OFFLINE — manual control` / `Angle OUT OF RANGE — manual control`
+  8. `Not calibrated`
+  9. Resting → `Lowered`, `Ready`, `Lifted`, `Lifted (max)`, `Between …`, or `Holding`
 
 Short tokens exist for **exact-match Home Assistant automations**. Embedding a live percentage in status floods the HA recorder.
 
@@ -311,7 +313,7 @@ Size the `angle_valid` gate to the *mounted* sensor. With the confirmed mounting
 ## 11. Safety Contract (invariants)
 
 - Blower ON **only** in RAISING and not faulted. Blower and valves energize together; brief dead-heading is accepted by design.
-- HOLD/FAULT: valves commanded CLOSED, blower OFF. (LOWERED_VENT/BYPASS: valves OPEN, blower OFF.)
+- HOLD/FAULT: valves commanded CLOSED, blower OFF. (LOWERED_VENT/BYPASS/EMERG_DESCEND: valves OPEN, blower OFF.)
 - **Absolute blower runtime cap** (`Blower Max Runtime`, all modes incl. manual test): the blower can never run longer than this. *Must exceed real full-raise time before live use (OEM auto-off ~15 min).*
 - RAISING requires angle progress after a grace window, or FAULT (stall). Stall progress is **sign-aware** and **feed-aware** during leveling throttle.
 - **Automatic moves require a trusted master angle** (§9.4); loss of trust mid-move **auto-stops** to HOLD.
@@ -343,12 +345,11 @@ Size the `angle_valid` gate to the *mounted* sensor. With the confirmed mounting
 
 Still open:
 
-- **Emergency descent pattern (proposed, undecided):** on an unfixable level failure with the boat high (level-divergence hard stop / catch-up fail), vent both sides down to Ready and seal there, instead of sealing in place — at Ready a list is harmless; aloft it is not. Needs an agreed spec (triggers, Stop override, blind-descent behaviour) before implementation.
 - Decide manual jog: **latched-with-Stop** (current) vs **hold-to-run / deadman**.
 - **Maintain-at-Ready policy** (float-away guard): whether sustained Ready sag should escalate to notify/FAULT.
 - Decide whether valve feedback should ever gate the FSM (stuck-valve fault) or stay display-only.
 
-Closed 2026-07-24: the descent-rate/seal-failure and re-sag alarms shipped as the **Air Loss Alert** (§15.5); **stall thresholds tightened** from the field-data replay (grace 20 s / timeout 30 s — worst healthy progress gap was 4 s in both loaded and empty raises); **blower cap default 4 min** (loaded full raise 134 s); the ~1–2 s command-to-valve delay is attributed to actuator mechanics (firmware path ≈100 ms — measure with §7.1 feedback timestamps if it recurs).
+Closed 2026-07-24: the **emergency descent pattern** shipped as EMERG_DESCEND (§16.2, ADR-013 — trigger deliberately limited to the level-divergence hard stop; `level_fail_catchup` and stall keep sealing in place); the descent-rate/seal-failure and re-sag alarms shipped as the **Air Loss Alert** (§15.5); **stall thresholds tightened** from the field-data replay (grace 20 s / timeout 30 s — worst healthy progress gap was 4 s in both loaded and empty raises); **blower cap default 4 min** (loaded full raise 134 s); the ~1–2 s command-to-valve delay is attributed to actuator mechanics (firmware path ≈100 ms — measure with §7.1 feedback timestamps if it recurs).
 
 Field move profiles used for tuning live in `field-data/`.
 
@@ -454,7 +455,9 @@ Each tank has its own vent/fill valve and inclinometer. The controller keeps the
 ### 16.2 Intervention thresholds
 
 - **Intervene** when sides differ by more than the **Level Deadband** (configurable; intent ≈ ≤1° of arm).
-- **Hard stop** — divergence beyond ~5° (`Tilt Critical`) → **FAULT + make-safe (both valves closed) + alarm**. Air cannot fix a large mechanical split.
+- **Hard stop** — divergence beyond ~5° (`Tilt Critical`) means something mechanical has failed; air cannot fix it. The response depends on where the boat is (ADR-013):
+  - **Boat high** (above the Ready band): **emergency descent** — both valves open ganged, blower off, ride down to Ready, then **seal into FAULT**. Sealing in place would hold the good side up while the failed side falls (worst response to a burst hose); at Ready a list is harmless. Ends on the Ready band, on sinking below it, or on `Lower Timeout`; **trust loss does not stop it** (venting down is passively safe — the timeout still seals). **Stop seals immediately** (operator override). Red fast-flash + orange Ready slow-flash; `Lift Problem` ON throughout.
+  - **At/below Ready** (or Ready not calibrated / height unknown): **FAULT + make-safe** (both valves closed) as before.
 
 ### 16.3 Hardware (per-tank zone)
 

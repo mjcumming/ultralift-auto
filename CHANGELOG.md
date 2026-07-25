@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-07-24
+
+### Added
+
+- **Emergency descent on level divergence** ([ADR-013](docs/adr.md)): if the sides diverge past `Tilt Critical` (~5°) while the boat is above the Ready band, the controller no longer seals in place (which would hold the good side aloft while a failed side falls) — it opens both valves ganged, blower off, rides down to Ready, and seals there into a latched FAULT. Stop seals immediately; mode buttons are refused; trust loss doesn't stop the descent (Lower Timeout backstops and seals). New FSM state `EMERG_DESCEND` (7); new status readings `EMERGENCY — descending to Ready (level failure)` / Activity token `Emergency Descent` / panel token `EMERG_DESCEND` ("EMERGENCY"); `Lift Problem` ON throughout. At/below Ready the behaviour is unchanged (FAULT + make-safe). Trigger is deliberately only the divergence hard stop — catch-up failures and stalls still seal in place.
+
 ## [0.6.0] — 2026-07-24
 
 Web-UI presentation pass ("why are we showing it, and is this the best way?"), the new Air Loss Alert, data-tuned safety defaults, and doc sync.

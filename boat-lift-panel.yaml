@@ -448,6 +448,7 @@ interval:
             if (id(sim_degraded)) return std::string("MANUAL");
             if (id(link_up)) {
               std::string s = id(link_st);
+              if (s == "EMERG_DESCEND") return std::string("EMERGENCY");
               if (s == "RAISING")  return std::string("RAISING");
               if (s == "LOWERING") return std::string("LOWERING");
               if (s == "LIFTED" || s == "TOP")          return std::string("LIFTED");

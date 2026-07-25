@@ -25,8 +25,10 @@
 #     4 = FAULT          blower OFF, valves CLOSED  (latched + reason)
 #     5 = BYPASS         blower OFF, valves OPEN    (manual override: vent & hold hands-off; all LEDs off)
 #     6 = LOWERED_VENT   blower OFF, valves OPEN    (resting at Lowered: vent stays
-#                         open so the lift keeps settling; commands accepted,
-#                         Stop seals the valves)
+#                         open so the lift keeps settling; commands accepted)
+#     7 = EMERG_DESCEND  blower OFF, valves OPEN    (level divergence > Tilt Critical
+#                         with the boat high: give up altitude — vent BOTH sides down
+#                         to Ready, then seal into FAULT. Stop = seal now. ADR-013)
 #
 #  KC868-A16 I/O:
 #     I2C GPIO4/5 · inputs 0x22 (X01-08) 0x21 (X09-16)
@@ -59,6 +61,7 @@ substitutions:
   S_FAULT: "4"
   S_BYPASS: "5"
   S_LOWERED_VENT: "6"
+  S_EMERG: "7"      # emergency descent to Ready (level divergence, boat high)
   # ---- go-to mode codes (global goto_mode) ----
   M_LIFT: "0"       # everyday stored position (Lift Target %)
   M_READY: "1"      # almost down, not yet floating
@@ -107,7 +110,7 @@ esphome:
   build_path: .esphome/build/boat-lift
   project:
     name: ultralift.boat_lift
-    version: "0.6.0 (2026-07-24)"   # UI pass (headline, simple status lines, Auto-Maintain names, pitch proxy retired) + Air Loss Alert + data-tuned stall/blower defaults; build with venv ESPHome 2026.6.x
+    version: "0.7.0 (2026-07-24)"   # ADR-013 emergency descent (level divergence + boat high -> vent to Ready, seal); on 0.6.0 UI pass + Air Loss Alert; build with venv ESPHome 2026.6.x
 
 esp32:
   board: esp32dev
@@ -1287,7 +1290,8 @@ binary_sensor:
     device_class: problem
     web_server: {sorting_group_id: group_status, sorting_weight: 10}
     lambda: |-
-      return id(lift_state) == ${S_FAULT} || id(lift_state) == ${S_BYPASS} || !id(angle_trusted)
+      return id(lift_state) == ${S_FAULT} || id(lift_state) == ${S_BYPASS}
+             || id(lift_state) == ${S_EMERG} || !id(angle_trusted)
              || !(id(cal_down_done) && id(cal_up_done));
 
   # ---- boat presence — ON = boat aboard OR unknown (fail-safe; blocks Lift Max).
@@ -1744,6 +1748,7 @@ text_sensor:
         case ${S_LOWERING}: return std::string("Lowering");
         case ${S_FAULT}:    return std::string("Fault");
         case ${S_BYPASS}:   return std::string("Bypass");
+        case ${S_EMERG}:    return std::string("Emergency Descent");
         default:
           if (id(rest_pulse) != 0) return std::string("Leveling");
           return std::string("Idle");   // HOLD + LOWERED_VENT
@@ -1781,7 +1786,9 @@ text_sensor:
       const char* mn = id(goto_mode) == ${M_LIFT} ? "Lift"
                      : (id(goto_mode) == ${M_READY} ? "Ready"
                      : (id(goto_mode) == ${M_LOWER} ? "Lower" : "Lift Max"));
-      // 1) fault
+      // 1) emergency descent (ADR-013) — outranks everything but shares FAULT's tier
+      if (s == ${S_EMERG}) return std::string("EMERGENCY — descending to Ready (level failure)");
+      // 1a) fault
       if (s == ${S_FAULT}) return std::string("FAULT — ") + id(fault_reason);
       // 1b) bypass — manual override, valve open, hands-off
       if (s == ${S_BYPASS}) return std::string("BYPASS — valve open, blower off (manual override)");
@@ -2179,7 +2186,11 @@ script:
             ESP_LOGW("fsm", "bench test: STOP press -> all outputs COMMANDED off (verify the blower actually stopped — a welded Y1 keeps running; breaker if so)");
             return;
           }
-          if (id(lift_state) == ${S_FAULT}) {
+          if (id(lift_state) == ${S_EMERG}) {
+            // operator override: seal NOW, latch the fault (second press clears -> HOLD)
+            id(enter_fault)->execute("level_divergence - operator stop");
+            ESP_LOGW("fsm", "request_stop during EMERGENCY DESCENT -> sealed, FAULT latched");
+          } else if (id(lift_state) == ${S_FAULT}) {
             id(fault_reason) = "";
             id(rest_pulse) = 0;
             id(lift_state) = ${S_HOLD};   // clear FAULT -> HOLD
@@ -2255,7 +2266,8 @@ script:
           int s = id(lift_state);
           bool blower = false, v_base = false;
           if (s == ${S_RAISING}) { v_base = true;  blower = true;  }   // blower + valves together (rev H)
-          else if (s == ${S_LOWERING} || s == ${S_BYPASS} || s == ${S_LOWERED_VENT}) { v_base = true; }
+          else if (s == ${S_LOWERING} || s == ${S_BYPASS} || s == ${S_LOWERED_VENT}
+                   || s == ${S_EMERG}) { v_base = true; }   // EMERG: both valves ganged open, blower off
           // HOLD / FAULT: make_safe -> blower off, valves closed — unless an
           // at-rest level pulse is active (HOLD + rest_pulse 1..4).
 
@@ -2374,13 +2386,15 @@ interval:
           int s = id(lift_state);
           bool bypass = (s == ${S_BYPASS});       // BYPASS: dark panel — every LED off
           bool moving = (s == ${S_RAISING} || s == ${S_LOWERING});
-          bool critical = (s == ${S_FAULT}) || !id(angle_trusted);   // fault, or position not trusted
+          bool emerg  = (s == ${S_EMERG});        // ADR-013 emergency descent to Ready
+          bool critical = (s == ${S_FAULT}) || emerg || !id(angle_trusted);
           bool at_top = (s == ${S_HOLD}) && id(angle_trusted) && id(pos_at_top);
           bool at_low = id(pos_at_lowered);
           bool at_rdy = id(pos_at_ready);
-          // position LEDs: solid when resting at that mode, slow-flashing while heading there
+          // position LEDs: solid when resting at that mode, slow-flashing while heading
+          // there (emergency descent slow-flashes Ready — that's where it's going)
           bool top_on = !bypass && (at_top || (moving && id(goto_mode) == ${M_LIFT} && flash_slow));
-          bool rdy_on = !bypass && (at_rdy || (moving && id(goto_mode) == ${M_READY} && flash_slow));
+          bool rdy_on = !bypass && (at_rdy || ((moving || emerg) && id(goto_mode) == ${M_READY} && flash_slow));
           bool low_on = !bypass && (at_low || (moving && id(goto_mode) == ${M_LOWER} && flash_slow));
           // RED Stop ring cadence:
           //   bypass            -> off (dark panel)
@@ -2502,17 +2516,37 @@ interval:
             id(level_err_filt) = a2 * e + (1.0f - a2) * id(level_err_filt);
           }
 
-          // ---- §21.3 HARD STOP: sides diverging past Tilt Critical (°) is a
+          // ---- §16.2 HARD STOP: sides diverging past Tilt Critical (°) is a
           //      something-is-mechanically-wrong condition — air cannot fix it.
-          //      FAULT + make-safe (both valves closed). Armed whenever both
-          //      sensors are trusted, independent of the Maintain Level switch.
-          //      (% error -> degrees through the master span.) ----
+          //      Armed whenever both sensors are trusted, independent of the
+          //      Auto-Maintain Level switch. (% error -> degrees via master span.)
+          //      ADR-013 response depends on WHERE the boat is:
+          //        · boat HIGH (above the Ready band): sealing in place would hold
+          //          the good side up while the failed side falls — the worst
+          //          response to a burst hose. Instead EMERGENCY DESCENT: vent
+          //          BOTH sides down to Ready, then seal into FAULT.
+          //        · at/below Ready (or Ready not calibrated / height unknown):
+          //          FAULT + make-safe as before — a list down low is harmless. ----
           if (lok && id(have_cal) && !id(test_mode)) {
             float err_deg = fabs(id(level_err_filt)) * fabs(span) / 100.0f;
-            if (err_deg > id(tilt_critical_deg).state && id(lift_state) != ${S_FAULT}) {
-              ESP_LOGE("level", "LEVEL HARD STOP: sides diverged %.1f deg (> %.1f)",
-                       err_deg, id(tilt_critical_deg).state);
-              id(enter_fault)->execute("level_divergence");
+            if (err_deg > id(tilt_critical_deg).state
+                && id(lift_state) != ${S_FAULT} && id(lift_state) != ${S_EMERG}) {
+              bool boat_high = !std::isnan(id(ready_target_pct)) && !std::isnan(id(lift_pct))
+                               && id(lift_pct) > id(ready_target_pct) + id(zone_tol_pct);
+              ESP_LOGE("level", "LEVEL HARD STOP: sides diverged %.1f deg (> %.1f) at %.0f%%",
+                       err_deg, id(tilt_critical_deg).state, id(lift_pct));
+              if (boat_high) {
+                id(rest_pulse) = 0;
+                id(level_throttle) = 0;
+                id(manual_move) = false;
+                id(goto_mode) = ${M_READY};
+                id(lower_start_time) = now;        // Lower Timeout backstops the descent
+                id(lift_state) = ${S_EMERG};
+                id(last_stop_reason) = "EMERGENCY descent: level divergence";
+                ESP_LOGE("level", "EMERGENCY DESCENT: venting both sides to Ready, blower off");
+              } else {
+                id(enter_fault)->execute("level_divergence");
+              }
             }
           }
 
@@ -2862,6 +2896,25 @@ interval:
             }
           }
 
+          // ---- EMERGENCY DESCENT (ADR-013): both valves open, blower off, riding
+          //      down to Ready. Ends sealed in FAULT: on reaching the Ready band
+          //      (or sinking below it — a fast descent can skip the band between
+          //      ticks), or on Lower Timeout. Trust loss does NOT stop it — venting
+          //      down is passively safe (power-loss behaviour with an ending), and
+          //      the timeout still seals. Stop = seal now (handled in request_stop).
+          //      Mode buttons are refused (do_goto only accepts states 0/2/3/6). ----
+          else if (s == ${S_EMERG}) {
+            bool below_ready = id(angle_valid) && !std::isnan(pct)
+                               && !std::isnan(id(ready_target_pct))
+                               && pct <= id(ready_target_pct);
+            unsigned long lt_ms = (unsigned long)(id(lower_timeout_minutes).state * 60000.0f);
+            if (id(pos_at_ready) || below_ready) {
+              id(enter_fault)->execute("level_divergence - descended, sealed at Ready");
+            } else if ((now - id(lower_start_time)) > lt_ms) {
+              id(enter_fault)->execute("level_divergence - descent timeout, sealed");
+            }
+          }
+
           // ---- resting at the bottom: vent stays open, ALWAYS.
           //      Any HOLD that finds itself settled in the Lowered zone —
           //      post-reboot, post-Stop, or a timed-out lower that settles
@@ -3105,6 +3158,7 @@ interval:
           int s = id(lift_state);
           const char* st = "HOLDING";
           if (s == ${S_FAULT})              st = "FAULT";
+          else if (s == ${S_EMERG})         st = "EMERG_DESCEND";
           else if (s == ${S_BYPASS})        st = "BYPASS";
           else if (s == ${S_RAISING})       st = "RAISING";
           else if (s == ${S_LOWERING})      st = "LOWERING";

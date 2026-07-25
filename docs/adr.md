@@ -132,3 +132,13 @@ In-move throttle follows Maintain Level on every go-to. Both switches **default 
 **Rationale:** The proxy predates the second IMU. The two-IMU Level Error measures list directly in calibrated %-space, and a moved or loosened sensor surfaces as persistent level error or divergence. The pitch proxy was unproven and deliberately excluded from Lift Problem — a status entity nobody may act on is clutter, not safety.
 
 **Consequence:** "Sensor moved" Guard B is retired with it; the trust ladder relies on freshness + plausibility + the level hard stop.
+
+---
+
+## ADR-013 — Emergency descent on level divergence with the boat high
+
+**Decision:** When the two sides diverge past `Tilt Critical` (~5°) **and the boat is above the Ready band**, do not seal in place. Enter **EMERG_DESCEND**: both valves open ganged, blower off, ride down to the Ready band (or below it, or `Lower Timeout`), then seal into a latched FAULT. Stop seals immediately (operator override); mode buttons are refused; trust loss does not stop the descent — the timeout still seals. At or below Ready (or without a Ready calibration or known height), the response stays FAULT + make-safe. The trigger is deliberately **only** the divergence hard stop — `level_fail_catchup` and stall keep sealing in place.
+
+**Rationale:** For the catastrophic asymmetric failure (hose off a tank), sealing holds the *good* side aloft while the failed side falls — the controller would actively maximize the twist with the boat high. Opening both valves vents the high side down toward the failed side: the twist shrinks during the descent and the water progressively takes the boat's weight. This extends the system's existing philosophy — power loss drifts down to float, the bottom is the resting truth — to "when leveling has provably failed, give up altitude." A list at Ready is harmless; a list aloft can put the boat off its bunks.
+
+**Consequence:** The controller can initiate motion nobody requested, on a possibly unattended boat. Accepted: the 5° trigger means something is already mechanically wrong, the alternative (twisting aloft) is strictly worse, and power loss already produces an uncontrolled version of the same descent. Panel/HA show `EMERG_DESCEND` / `Emergency Descent`; `Lift Problem` is ON throughout.

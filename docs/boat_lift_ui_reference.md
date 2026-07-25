@@ -12,6 +12,7 @@ The page is ordered top to bottom: **Control → Status → Configuration → Ad
 
 | Reading | Meaning |
 |---|---|
+| `EMERGENCY — descending to Ready (level failure)` | The sides diverged past Tilt Critical with the boat high: both valves are open, blower off, and the lift is riding down to Ready, where it seals into FAULT (ADR-013). **Stop** seals immediately. |
 | `FAULT — stall_no_progress` (etc.) | Latched safe stop + reason. Press **Stop** to clear. |
 | `BYPASS — valve open, blower off (manual override)` | Hands-off manual mode (§6.6). Dark button panel. |
 | `Raising → Lift` / `Lowering → Ready` | Moving, with the destination named. |
@@ -43,7 +44,7 @@ The page is ordered top to bottom: **Control → Status → Configuration → Ad
 - **Boat Present** — the fail-safe presence latch from raise-speed classification (§5.1). ON means *boat aboard or unknown*; it blocks Lift Max. Resets to ON whenever the boat could have changed (at the bottom, or after bypass).
 - **Water Temperature** — DS18B20 in the water. Scanned at boot only — if it shows unknown after a sensor swap, restart.
 - **Maintain Observe** — the keepers' visit summary: `At Lift — 2 top-ups, 1 level fixes — sag −0.30%/h`, or `Not parked at a maintained position`. Counters reset when the lift arrives at a new maintained position.
-- **Lift Activity / Lift Position** — short stable tokens (`Idle/Raising/Lowering/Leveling/Fault/Bypass` and `Lowered/Ready/Lifted/Lifted Max/Between/Unknown`) for exact-match HA automations. They duplicate the human lines above on purpose — trigger on these, read the others.
+- **Lift Activity / Lift Position** — short stable tokens (`Idle/Raising/Lowering/Leveling/Fault/Bypass/Emergency Descent` and `Lowered/Ready/Lifted/Lifted Max/Between/Unknown`) for exact-match HA automations. They duplicate the human lines above on purpose — trigger on these, read the others.
 
 ---
 
