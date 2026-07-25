@@ -277,6 +277,11 @@ Future option (not done): use end-stops as stuck-valve fault triggers.
 Short tokens exist for **exact-match Home Assistant automations**. Embedding a live percentage in status floods the HA recorder.
 
 - **Lift Problem** (binary, `problem`) — ON for fault / bypass / **angle not trusted** / uncalibrated.
+- **Lift In Operation** (binary, `running`) — ON only while a **person-initiated** move runs (any button, panel, web, or HA command), OFF when it settles. Machine-initiated motion — keeper top-ups, ADR-013 emergency descent — deliberately stays OFF; that motion reads in `Lift Activity`. Backed by a `user_cmd_move` flag set in every `request_goto_*` intent and cleared when the keeper starts a top-up (ADR-014).
+
+### 9.2b HA command entity
+
+**`Lift Command`** (select: `— / Lift / Ready / Lower / Lift Max`) — the declarative control for HA automations and scenes: setting an option fires the same `request_*` intent as the matching button, so every interlock applies. Shows the destination while a user-commanded move runs, rests at `—` (a no-op option) so re-selecting always fires. A cover entity was considered and rejected — see ADR-014.
 
 ### 9.3 UI tiers (web_server sorting groups)
 

@@ -38,6 +38,7 @@ The page is ordered top to bottom: **Control → Status → Configuration → Ad
 - **Valve Positions** — the valves' *real* end-stop positions from their feedback contacts, e.g. `Starboard CLOSED · Port CLOSED`. `MOVING` = mid-travel; `FAULT` = both contacts on (contact fault). This is the single source of truth for valve state — trust it over any inference.
 - **Level Status** — how level the lift is / what leveling is doing: `Level OK — Port 0.4% low`, `Leveling — holding Starboard back` (in-move throttle), `Leveling — feeding Port` (at-rest pulse), `Auto-level OFF — …`, or a ganged-fallback reason (`Port IMU offline — ganged`).
 - **Lift Problem** *(binary)* — the one flag to alert on: fault, bypass, angle not trusted, or uncalibrated.
+- **Lift In Operation** *(binary)* — ON while a move *somebody asked for* is running (any button, panel, web, or HA), OFF when it finishes. Keeper top-ups and the emergency descent don't light it — watch Lift Activity for those.
 - **Air Loss Alert** *(binary)* — ON when air is leaving abnormally: sinking while sealed, parked sag rate too high, or too many keeper interventions in one visit (§15.5). The keepers keep correcting either way — this is the "you should know about this" flag. Reason in Diagnostics → Air Loss Detail.
 - **Lift Height** — position as % of the calibrated span (Lowered = 0 %, Lift cal = 100 %). Can read below 0 (settled past the Lowered cal) or above 100 (Lift Max territory, or an empty lift riding high).
 - **Bunk Height** — the same position converted to real inches of bunk rise above the Lowered cal, from arm geometry. Display only.
@@ -85,6 +86,7 @@ All live-editable and stored on the device — an OTA does *not* overwrite value
 - **Level Deadband / Hysteresis / Min Hold / Catch-up Timeout** — the in-move leveling throttle's engage/release behaviour.
 - **Tilt Critical (deg)** — the level-divergence hard stop: sides apart by more than this → FAULT + seal (air can't fix a mechanical split).
 - **Cal Angle — …** sliders — the editable calibration numbers (see §3 above).
+- **Lift Command** *(select)* — built for Home Assistant automations/scenes (`select Lift` on departure): picking a destination fires the same request as the matching button, interlocks included. Reads the destination during a commanded move, otherwise `—`. On this web page just use the buttons — it's filed down here to stay out of the way.
 
 ---
 

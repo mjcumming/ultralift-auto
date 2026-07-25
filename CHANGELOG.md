@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-07-25
+
+Home Assistant control pass ([ADR-014](docs/adr.md)).
+
+### Added
+
+- **`Lift In Operation`** (binary, `running`, Status): ON only while a **person-initiated** move is running — any dock/panel button, the web UI, or HA — and OFF the moment the FSM settles (target reached, Stop, timeout, or fault). Machine-initiated motion (auto-maintain top-ups, ADR-013 emergency descent) deliberately does **not** light it; that motion still reads in `Lift Activity`. Backed by a new `user_cmd_move` flag set in every `request_goto_*` intent and cleared when the keeper fires a top-up.
+- **`Lift Command`** (select: `— / Lift / Ready / Lower / Lift Max`): the declarative HA control — automations and scenes call `select.select_option` instead of pressing stateless buttons. Each option fires the same `request_*` intent as the matching button (all interlocks apply). Shows the destination while a user-commanded move runs, rests at `—` (no-op) so re-selecting the same destination always fires. Filed at the bottom of Advanced on the web page — the buttons remain the way to drive the lift there.
+
+### Decided
+
+- **No HA cover entity** ([ADR-014](docs/adr.md)): covers invite bulk actions ("close all covers", good-night scenes, voice-assistant garage-door mapping) that could lower the boat unattended, and open/close/position-% semantics don't map to the four curated setpoints.
+
 ## [0.7.0] — 2026-07-24
 
 ### Added

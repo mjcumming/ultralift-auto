@@ -110,7 +110,7 @@ esphome:
   build_path: .esphome/build/boat-lift
   project:
     name: ultralift.boat_lift
-    version: "0.7.0 (2026-07-24)"   # ADR-013 emergency descent (level divergence + boat high -> vent to Ready, seal); on 0.6.0 UI pass + Air Loss Alert; build with venv ESPHome 2026.6.x
+    version: "0.8.0 (2026-07-25)"   # HA control pass: Lift In Operation (user-commanded moves only) + Lift Command dropdown; build with venv ESPHome 2026.6.x
 
 esp32:
   board: esp32dev
@@ -265,6 +265,10 @@ globals:
   - id: manual_move            # current move is a manual jog (not position-targeted)
     type: bool
     restore_value: no
+    initial_value: "false"
+  - id: user_cmd_move          # current move was asked for by a person (dock/panel/web/HA)
+    type: bool                 # — not the auto-maintain keeper or emergency descent.
+    restore_value: no          # Drives "Lift In Operation" + the HA command dropdown.
     initial_value: "false"
   # ---- raw decoded angle axes from the WT901 0x53 frame ----
   - id: angle_roll
@@ -1294,6 +1298,19 @@ binary_sensor:
              || id(lift_state) == ${S_EMERG} || !id(angle_trusted)
              || !(id(cal_down_done) && id(cal_up_done));
 
+  # ---- HA convenience: ON = a person asked the lift to move (dock/panel button,
+  #      web, or HA) and that move is still running; OFF when it settles.
+  #      Machine-initiated motion (auto-maintain top-ups, emergency descent)
+  #      stays OFF — this is "someone is operating the lift", not "lift moving". ----
+  - platform: template
+    name: "Lift In Operation"
+    id: lift_in_operation
+    device_class: running
+    web_server: {sorting_group_id: group_status, sorting_weight: 12}
+    lambda: |-
+      return (id(lift_state) == ${S_RAISING} || id(lift_state) == ${S_LOWERING})
+             && id(user_cmd_move);
+
   # ---- boat presence — ON = boat aboard OR unknown (fail-safe; blocks Lift Max).
   #      Classified from raise speed only (§13); resets to ON at LOWERED_VENT/bypass. ----
   - platform: template
@@ -2015,6 +2032,41 @@ button:
   # (rev I: "Calibrate: capture LEVEL ref (pitch)" removed with the pitch proxy.)
 
 # ---------------------------------------------------------------------------
+#  HA command dropdown — one entity automations and scenes can set declaratively
+#  ("select Lift" on departure) instead of pressing stateless buttons. Picking a
+#  destination fires the SAME request_* script as the matching button, so every
+#  interlock still applies. While a user-commanded move runs it reads as the
+#  destination; at rest it reads "—" (selecting "—" does nothing), so re-picking
+#  the same destination always fires. Built for HA — filed at the bottom of
+#  Advanced on the web page, where the buttons remain the way to drive the lift.
+# ---------------------------------------------------------------------------
+select:
+  - platform: template
+    name: "Lift Command"
+    id: lift_command_select
+    icon: "mdi:swap-vertical-bold"
+    options: ["—", "Lift", "Ready", "Lower", "Lift Max"]
+    update_interval: 1s
+    web_server: {sorting_group_id: group_advanced, sorting_weight: 80}
+    lambda: |-
+      if ((id(lift_state) == ${S_RAISING} || id(lift_state) == ${S_LOWERING})
+          && id(user_cmd_move)) {
+        switch (id(goto_mode)) {
+          case ${M_LIFT}:  return std::string("Lift");
+          case ${M_READY}: return std::string("Ready");
+          case ${M_LOWER}: return std::string("Lower");
+          case ${M_MAX}:   return std::string("Lift Max");
+        }
+      }
+      return std::string("—");
+    set_action:
+      - lambda: |-
+          if      (x == "Lift")     id(request_goto_top)->execute();
+          else if (x == "Ready")    id(request_goto_ready)->execute();
+          else if (x == "Lower")    id(request_goto_lowered)->execute();
+          else if (x == "Lift Max") id(request_goto_max)->execute();
+
+# ---------------------------------------------------------------------------
 #  Intents (request_*) — validate against state + interlocks, then transition.
 #  Mode buttons: last press wins — accepted from rest OR mid-move (retarget /
 #  reverse). Stop cancels a move to HOLD. Latched moves, no hold-to-run.
@@ -2128,12 +2180,14 @@ script:
     then:
       - lambda: |-
           if (id(test_mode)) { ESP_LOGI("fsm","bench test: LIFT press ignored"); return; }
+          id(user_cmd_move) = true;   // every request_* caller is a person
           if (id(angle_trusted)) id(do_goto)->execute(id(top_target_pct).state, ${M_LIFT});
           else                   id(manual_raise)->execute();
   - id: request_goto_max        # winter storage — highest out of water; needs max cal + trusted angle
     then:
       - lambda: |-
           if (id(test_mode)) { ESP_LOGI("fsm","bench test: LIFT MAX press ignored"); return; }
+          id(user_cmd_move) = true;
           if (!id(angle_trusted)) { ESP_LOGW("fsm","Lift Max needs a trusted angle"); return; }
           if (!id(cal_max_done)) { ESP_LOGW("fsm","Lift Max not calibrated"); return; }
           if (!id(have_cal)) return;
@@ -2159,12 +2213,14 @@ script:
     then:
       - lambda: |-
           if (id(test_mode)) { ESP_LOGI("fsm","bench test: LOWER press ignored"); return; }
+          id(user_cmd_move) = true;
           if (id(angle_trusted)) id(do_goto)->execute(0.0f, ${M_LOWER});
           else                   id(manual_lower)->execute();
   - id: request_goto_ready      # mid-position needs trusted position; no manual fallback
     then:
       - lambda: |-
           if (id(test_mode)) { ESP_LOGI("fsm","bench test: READY press ignored"); return; }
+          id(user_cmd_move) = true;
           if (!id(angle_trusted)) { ESP_LOGW("fsm","Ready needs a trusted angle"); return; }
           if (!id(cal_float_done)) { ESP_LOGW("fsm","Ready not calibrated"); return; }
           if (std::isnan(id(ready_target_pct))) return;
@@ -3138,6 +3194,7 @@ interval:
             id(obs_act_count)++;
             id(visit_height_count)++;
             id(rest_pulse) = 0;   // height owns the move
+            id(user_cmd_move) = false;   // keeper move — "Lift In Operation" stays OFF
             ESP_LOGW("maintain", "MAINTAIN HEIGHT actuate #%d -> raise to %s (%.1f%%) visit top-ups %d",
                      id(obs_act_count), where, setpoint, id(visit_height_count));
             id(do_goto)->execute(setpoint, md);
