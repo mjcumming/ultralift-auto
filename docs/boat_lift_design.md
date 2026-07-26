@@ -31,6 +31,7 @@ Automate a dual-tank HydroHoist UltraLift so an operator (or Home Assistant) can
 - Blower load: **115 VAC, 11 A**, high inrush; OEM has GFCI + thermal + ~15-min auto-off.
 - A manual PVC-tube exhaust procedure is the no-power manual backstop.
 - **Control valves (as installed):** auto-return valves driven one line each (**Y2** starboard / **Y3** port) — energized = OPEN, de-energized = returns CLOSED. Measured travel ≈ **7 s to open, ≈ 2.3 s to close**. Each carries CR5-02 maintained aux contacts reporting fully-open / fully-closed (§7.1).
+- **Why opening takes ~7 s (dock-observed 2026-07-26 — not a bug):** the relay energizes within one 250 ms control tick of the button press; the wait is *inside the actuator*. These 2-wire auto-return valves charge their internal return reserve on power-up **before** driving the motor open — ~5 s of silence, then ~2 s of travel. Closing is fast (≈2.3 s) because the stored charge dumps straight into the motor; the open/close asymmetry over the same 90° stroke is the tell. No software change can shorten it, and the FSM already budgets for it (manual-valve detector constants, lower timeout). Only a hardware swap (3/5-wire valve — loses the power-loss-seals fail-safe — or a true spring-return actuator) would remove the delay.
 
 Position is sensed via **arm angle** on each side (four-bar parallelogram). Master arm angle → height by two-point calibration; slave angle is compared in calibrated-% space for leveling.
 
@@ -224,6 +225,8 @@ apply_outputs(state):                         # the ONLY writer of blower/valves
 ### 7.1 Valve position feedback (CR5-02 aux contacts)
 
 Maintained dry contacts report each valve’s **real** end-stop position, independent of open-loop travel timing. Debounced 100 ms. Derived per-valve text: `OPEN` / `CLOSED` / `MOVING` / `FAULT` (both contacts on). Combined **Valve Positions** line shows both sides.
+
+> A valve sitting at fully-closed for ~7 s after an open command is **normal** — the actuator's power-up charge dead time, not a control fault (see §2, "Why opening takes ~7 s"). The `valve_cmd` log tag timestamps each Y1/Y2/Y3 relay edge so command-to-motion time is measurable in any log.
 
 Uses today (**display/diagnostic — not an FSM input yet**):
 - Live valve state on Diagnostics, independent of Y2/Y3 commands.

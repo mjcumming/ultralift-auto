@@ -110,7 +110,7 @@ esphome:
   build_path: .esphome/build/boat-lift
   project:
     name: ultralift.boat_lift
-    version: "0.8.0 (2026-07-25)"   # HA control pass: Lift In Operation (user-commanded moves only) + Lift Command dropdown; build with venv ESPHome 2026.6.x
+    version: "0.8.1 (2026-07-26)"   # valve_cmd relay-edge logging + actuator dead-time docs; build with venv ESPHome 2026.6.x
 
 esp32:
   board: esp32dev
@@ -2358,6 +2358,15 @@ script:
             id(blower_relay).turn_off();
             if (va) id(valve_power_open).turn_on();   else id(valve_power_open).turn_off();
             if (vb) id(valve_power_open_b).turn_on(); else id(valve_power_open_b).turn_off();
+          }
+          // Command-edge timestamps: pair with the valve_fb end-stop events to
+          // split relay-to-motion dead time from actuator travel time.
+          {
+            static bool p_va = false, p_vb = false, p_bl = false;
+            if (va != p_va) ESP_LOGI("valve_cmd", "Y2 %s (relay %s)", va ? "OPEN" : "CLOSE", va ? "energized" : "released");
+            if (vb != p_vb) ESP_LOGI("valve_cmd", "Y3 %s (relay %s)", vb ? "OPEN" : "CLOSE", vb ? "energized" : "released");
+            if (blower != p_bl) ESP_LOGI("valve_cmd", "Y1 blower %s", blower ? "ON" : "OFF");
+            p_va = va; p_vb = vb; p_bl = blower;
           }
           // (button LEDs handled by the dedicated 100 ms LED interval)
 

@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.8.1] — 2026-07-26
+
+### Added
+
+- **`valve_cmd` log tag**: `apply_outputs` now logs every Y1/Y2/Y3 relay command edge (`Y2 OPEN (relay energized)` …), so command-to-motion time is measurable in any log next to the `valve_fb` end-stop events.
+
+### Documented
+
+- **Valve opening dead time is the actuator, not the controller** (design §2 + §7.1): the relay energizes within one 250 ms tick of the button press; the 2-wire auto-return actuator charges its internal return reserve for ~5 s before driving, then travels ~2 s. The open/close asymmetry (≈7 s vs ≈2.3 s over the same 90° stroke) is the tell. Dock-observed 2026-07-26; no software fix exists, and the FSM already budgets for it.
+
+### Fixed (device state, not code)
+
+- Stall sliders on the dock nudged to the 0.6.0 defaults via the REST API: Stall Grace 60→20 s, Stall Timeout 120→30 s (flash-persisted values survive OTA; Blower Max Runtime was already at 4 min). The post-OTA nudge noted in 0.6.0 is now complete.
+
 ## [0.8.0] — 2026-07-25
 
 Home Assistant control pass ([ADR-014](docs/adr.md)).
