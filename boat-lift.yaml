@@ -51,7 +51,7 @@ substitutions:
 
   # ---- lift geometry ----
   arm_length_in: "51.0"   # pivot arm 4 ft 3 in — drives the display-only Bunk Height
-                          # sensor (inches above the Lowered cal); no logic uses it
+  bunk_lowered_waterline_in: "-13.0"  # measured bunk height at true Lowered; negative = below water
 
   # ---- FSM state codes (global lift_state). Named so lambdas read as prose.
   #      Values are FROZEN; slot 1 is retired but reserved. ----
@@ -110,7 +110,7 @@ esphome:
   build_path: .esphome/build/boat-lift
   project:
     name: ultralift.boat_lift
-    version: "0.8.1 (2026-07-26)"   # valve_cmd relay-edge logging + actuator dead-time docs; build with venv ESPHome 2026.6.x
+    version: "0.9.0 (2026-08-01)"   # load-aware bounded Ready recovery; build with venv ESPHome 2026.6.x
 
 esp32:
   board: esp32dev
@@ -393,6 +393,12 @@ globals:
     type: int
     restore_value: no
     initial_value: "0"
+  # Stop must be able to seal the valves even while parked in LOWERED_VENT.
+  # Cleared by the next accepted position request (including another Lower press).
+  - id: lowered_vent_stopped
+    type: bool
+    restore_value: no
+    initial_value: "false"
 
   # ---- persisted calibration ----
   - id: cal_angle_down
@@ -442,6 +448,10 @@ globals:
     type: float
     restore_value: yes
     initial_value: "0.0"
+  - id: cal2_angle_max
+    type: float
+    restore_value: yes
+    initial_value: "0.0"
   - id: cal2_down_done
     type: bool
     restore_value: yes
@@ -451,6 +461,10 @@ globals:
     restore_value: yes
     initial_value: "false"
   - id: cal2_float_done
+    type: bool
+    restore_value: yes
+    initial_value: "false"
+  - id: cal2_max_done
     type: bool
     restore_value: yes
     initial_value: "false"
@@ -537,14 +551,23 @@ globals:
     restore_value: no
     initial_value: "0.0"
 
-  # ---- boat presence, classified from RAISE speed only (rev F, §13) ----
-  # Fail-safe polarity: true = boat aboard OR unknown, and true BLOCKS Lift Max
-  # (tower hits the boathouse roof ≈148%). Persisted across reboots; resets to
-  # presumed-ON whenever the boat could have changed (LOWERED_VENT, bypass).
+  # ---- boat presence, classified from RAISE speed only (rev F→G, §5.1) ----
+  # Fail-safe: unknown => boat_present ON + boat_heavy ON (Lift Max blocked).
+  # Lift Max roof guard blocks only Confirmed Cobalt/heavy (tower risk); a
+  # confirmed light boat (e.g. Crestliner) or empty may run Max. Persisted;
+  # resets to unknown/presumed-heavy at LOWERED_VENT / bypass.
   - id: boat_present
     type: bool
     restore_value: yes
     initial_value: "true"
+  - id: boat_heavy               # true = Cobalt-class / tower boat (blocks Lift Max)
+    type: bool                   # only meaningful when boat_load_known && boat_present
+    restore_value: yes
+    initial_value: "true"
+  - id: boat_load_known          # true only after a clean raise-rate classification
+    type: bool                   # false = fail-safe UNKNOWN; persisted until Lowered/bypass
+    restore_value: yes
+    initial_value: "false"
   - id: presence_start_pct       # master height % when the raise began (NAN = not armed)
     type: float
     restore_value: no
@@ -603,6 +626,10 @@ globals:
     type: bool
     restore_value: no
     initial_value: "false"
+  - id: maintain_block_reason     # 0=clear, 1=Ready load, 2=Ready floor, 3=bad config, 4=Max load
+    type: int
+    restore_value: no
+    initial_value: "0"
   - id: obs_shadow_count         # would-be top-ups since boot (counted whether or not we actuate)
     type: int
     restore_value: no
@@ -778,6 +805,21 @@ number:
           id(cal2_angle_up) = x;
           id(cal2_up_done) = true;
           ESP_LOGI("cal", "SLAVE LIFT adjusted to %.2f deg", x);
+  - platform: template
+    name: "Cal ${side_slave} Angle — Lift Max"
+    id: cal2_num_max
+    web_server: {sorting_group_id: group_advanced, sorting_weight: 77}
+    min_value: -35
+    max_value: 65
+    step: 0.05
+    unit_of_measurement: "°"
+    entity_category: config
+    lambda: 'return id(cal2_angle_max);'
+    set_action:
+      - lambda: |-
+          id(cal2_angle_max) = x;
+          id(cal2_max_done) = true;
+          ESP_LOGI("cal", "SLAVE LIFT MAX adjusted to %.2f deg", x);
 
   - platform: template
     name: "Lift Target (%)"
@@ -940,11 +982,10 @@ number:
     entity_category: config
 
   # ---- stall detection (raising) ----
-  # Tightened 2026-07-24 from the field-data replay: in BOTH recorded raises
-  # (loaded 132 s AND empty 16 s) the worst gap between 0.2-deg progress
-  # checkpoints was 4 s — a healthy raise never pauses. Grace covers valve
-  # open (~7 s) + blower spool; timeout is ~7x the worst observed gap. A dead
-  # raise now faults in ~50 s instead of 3 min (blower cap stays the backstop).
+  # Field raises (Cobalt/empty/Crestliner): worst gap between 0.2° progress
+  # checkpoints is 3–4 s — a healthy raise never pauses. Grace covers valve
+  # open (~7 s) + blower spool. Timeout 15 s (~4x worst gap) → dead raise
+  # faults in ~35 s (grace+timeout); blower cap stays the backstop.
   # NOTE these persist in flash (restore_value): an OTA does NOT overwrite
   # values already stored on the device — nudge the sliders once after update.
   - platform: template
@@ -966,7 +1007,7 @@ number:
     web_server: {sorting_group_id: group_advanced, sorting_weight: 31}
     optimistic: true
     restore_value: true
-    initial_value: 30          # no progress for this long (after grace) -> fault
+    initial_value: 15          # no progress for this long (after grace) -> fault
     min_value: 2
     max_value: 300
     step: 5
@@ -986,11 +1027,14 @@ number:
     unit_of_measurement: "°"
     entity_category: config
 
-  # ---- boat-presence classifier (rev F) ----
-  # A raise whose early climb rate is at or above this is classified EMPTY;
-  # slower = BOAT ON. Ships at the unreachable ceiling so every raise reads
-  # "boat on" (and Lift Max stays blocked) until the first real empty- and
-  # loaded-raise baselines are recorded and this is set between them.
+  # ---- boat-presence classifier (rev G — three bands) ----
+  # Early climb rate over the first 15 %-points:
+  #   rate >= Empty Raise Rate Min     -> EMPTY          (Max OK)
+  #   rate <= Heavy Boat Raise Rate Max -> HEAVY/Cobalt  (Max BLOCKED — tower)
+  #   in between                       -> LIGHT boat     (Max OK)
+  # Empty ships at 99 (untuned = never empty). Heavy ships tuned for this
+  # install (Cobalt ~0.40–0.54 %/s, Crestliner ~0.69 %/s); raise toward Empty
+  # on a fresh dock until two loaded baselines exist.
   - platform: template
     name: "Empty Raise Rate Min (% per s)"   # '/' is reserved in ESPHome URL paths
     id: empty_raise_rate_min
@@ -1004,6 +1048,19 @@ number:
     unit_of_measurement: "%/s"
     entity_category: config
 
+  - platform: template
+    name: "Heavy Boat Raise Rate Max (% per s)"
+    id: heavy_raise_rate_max
+    web_server: {sorting_group_id: group_advanced, sorting_weight: 34}
+    optimistic: true
+    restore_value: true
+    initial_value: 0.60        # this install: Cobalt-class at/below; Crestliner above
+    min_value: 0.05
+    max_value: 99
+    step: 0.05
+    unit_of_measurement: "%/s"
+    entity_category: config
+
   # ---- auto-maintain thresholds (observer + Phase-2 actuation) ----
   - platform: template
     name: "Maintain Sag Deadband (%)"
@@ -1011,8 +1068,20 @@ number:
     web_server: {sorting_group_id: group_advanced, sorting_weight: 40}
     optimistic: true
     restore_value: true
-    initial_value: 4           # DATA-CONFIRM: top-up when filtered height sags this far below setpoint
+    initial_value: 3           # loaded Ready trace bounce is ~0.5%; top-up well outside normal settle
     min_value: 1
+    max_value: 15
+    step: 0.5
+    unit_of_measurement: "%"
+    entity_category: config
+  - platform: template
+    name: "Ready Recovery Floor (%)"
+    id: ready_recovery_floor_pct
+    web_server: {sorting_group_id: group_advanced, sorting_weight: 40.5}
+    optimistic: true
+    restore_value: true
+    initial_value: 5           # max drop below Ready where an automatic top-up is still safe
+    min_value: 3
     max_value: 15
     step: 0.5
     unit_of_measurement: "%"
@@ -1175,7 +1244,8 @@ switch:
   # ---- Bypass Mode (manual override) ----
   # ON  = open the valve, blower OFF, sit hands-off (lift vents/floats; FSM idle).
   # OFF = return to normal HOLD operation.
-  # Mirrors the dock control: hold the red Stop button ~3 s to enter; short-press to exit.
+  # Enter via this switch (web/HA) or panel Diagnostics BYPASS_ON — not the dock
+  # red button (Stop remains the universal stop / safe-output control).
   # All button LEDs are OFF while in bypass (dark panel = bypass).
   - platform: template
     name: "Bypass Mode"
@@ -1283,7 +1353,8 @@ output:
 # ---------------------------------------------------------------------------
 #  Inputs — buttons emit INTENTS. (No hardware top-limit fitted; raising stops
 #  on the calibrated Top angle + blower watchdog/runtime cap.)
-#  Mode buttons retarget mid-motion (last press wins); Stop cancels to HOLD.
+#  Mode buttons retarget mid-motion (last press wins); Stop cancels to HOLD
+#  while moving, requests Lift Max when idle (roof-guarded).
 #  'inverted: true' => contact-closed reads as true.
 # ---------------------------------------------------------------------------
 binary_sensor:
@@ -1311,8 +1382,9 @@ binary_sensor:
       return (id(lift_state) == ${S_RAISING} || id(lift_state) == ${S_LOWERING})
              && id(user_cmd_move);
 
-  # ---- boat presence — ON = boat aboard OR unknown (fail-safe; blocks Lift Max).
-  #      Classified from raise speed only (§13); resets to ON at LOWERED_VENT/bypass. ----
+  # ---- boat presence — ON = boat aboard OR unknown (fail-safe occupancy).
+  #      Lift Max roof guard uses Boat Load State (heavy vs light), not this bit alone.
+  #      Classified from raise speed only (§5.1); resets to ON at LOWERED_VENT/bypass. ----
   - platform: template
     name: "Boat Present"
     id: boat_present_sensor
@@ -1389,19 +1461,13 @@ binary_sensor:
       mode: INPUT
       inverted: true
     filters: [delayed_on: 30ms]
-    # Short press = Stop / clear FAULT / exit bypass. Hold ~3 s = enter bypass mode.
-    # (A long hold fires request_stop on press first — harmless: it just stops motion —
-    #  then enters bypass once the hold threshold is met.)
+    # Press = Stop while moving / clear FAULT / exit Bypass / seal Lowered vent.
+    # Dock long-hold Bypass removed — use Bypass Mode (web/HA) or panel Diagnostics.
     on_press:
       - logger.log: {format: "INPUT: Button STOP (DI12) PRESSED", tag: "input_test", level: INFO}
       - script.execute: request_stop
     on_release:
       - logger.log: {format: "INPUT: Button STOP (DI12) released", tag: "input_test", level: INFO}
-    on_click:
-      min_length: 3000ms
-      max_length: 15000ms
-      then:
-        - script.execute: enter_bypass
 
   - platform: gpio
     id: btn_lowered
@@ -1550,11 +1616,11 @@ sensor:
     update_interval: 1s          # rev G: was 250 ms — nothing consumes this sensor
     lambda: 'return id(lift_pct);'   # single-source height % (250 ms supervisor)
 
-  # ---- pseudo bunk height in INCHES above the Lowered cal (display only) ----
+  # ---- pseudo bunk height in INCHES relative to the waterline (display only) ----
   # Vertical travel of a 51 in pivot arm: Δh = L·(sin θ_lowered − sin θ). Height %
   # is linear in ANGLE, so inches-per-% grows toward the top of the stroke
-  # (~0.9 in/° near horizontal vs ~0.55 in/° at the settled bottom) — this sensor
-  # shows the true rise. Negative = settled below the Lowered cal (loaded bottom).
+  # (~0.9 in/° near horizontal vs ~0.55 in/° at the settled bottom). Add the
+  # surveyed Lowered datum so negative values are below water and positive above.
   - platform: template
     name: "Bunk Height"
     id: bunk_height_in
@@ -1565,8 +1631,9 @@ sensor:
     lambda: |-
       if (!id(have_cal) || !id(angle_valid)) return NAN;
       const float d2r = M_PI / 180.0f;
-      return ${arm_length_in} * (sinf(id(cal_angle_down) * d2r)
-                               - sinf(id(current_angle)  * d2r));
+      return ${bunk_lowered_waterline_in}
+             + ${arm_length_in} * (sinf(id(cal_angle_down) * d2r)
+                                  - sinf(id(current_angle)  * d2r));
 
   # ---- leveling data products (single-source globals, 250 ms supervisor) ----
   # Level Error lives in Diagnostics (rev E.1): at rest it just reflects the
@@ -1868,9 +1935,13 @@ text_sensor:
     web_server: {sorting_group_id: group_status, sorting_weight: 7}
     update_interval: 1s
     lambda: |-
-      if (!id(have_cal2))     return std::string("${side_slave} not calibrated — ganged");
-      if (!id(angle2_valid))  return std::string("${side_slave} IMU offline — ganged");
-      if (!id(level_ok_now))  return std::string("Not trusted — ganged");
+      if (!id(have_cal))       return std::string("${side_master} not calibrated — ganged");
+      if (!id(have_cal2))      return std::string("${side_slave} not calibrated — ganged");
+      if (!id(angle_valid))    return std::string("${side_master} IMU offline — ganged");
+      if (!id(angle2_valid))   return std::string("${side_slave} IMU offline — ganged");
+      if (!id(angle_trusted))  return std::string("${side_master} outside calibrated range — ganged");
+      if (!id(angle2_trusted)) return std::string("${side_slave} outside calibrated range — ganged");
+      if (!id(level_ok_now))   return std::string("Not trusted — ganged");
       int rp = id(rest_pulse);
       if (rp == 1) return std::string("Leveling — feeding ${side_master}");
       if (rp == 2) return std::string("Leveling — feeding ${side_slave}");
@@ -1905,6 +1976,14 @@ text_sensor:
     web_server: {sorting_group_id: group_status, sorting_weight: 40}
     update_interval: 1s
     lambda: |-
+      if (id(maintain_block_reason) == 1)
+        return std::string("Ready recovery OFF — loaded boat not confirmed");
+      if (id(maintain_block_reason) == 2)
+        return std::string("Ready recovery INHIBITED — below safe floor");
+      if (id(maintain_block_reason) == 3)
+        return std::string("Ready recovery OFF — floor must exceed sag deadband");
+      if (id(maintain_block_reason) == 4)
+        return std::string("Lift Max maintenance OFF — need empty or light boat");
       const char* where = id(visit_pos) == 1 ? "Lift"
                         : (id(visit_pos) == 2 ? "Ready"
                         : (id(visit_pos) == 3 ? "Lift Max" : nullptr));
@@ -1913,6 +1992,18 @@ text_sensor:
       snprintf(b, sizeof(b), "At %s — %d top-ups, %d level fixes — sag %+.2f%%/h",
                where, id(visit_height_count), id(visit_level_count), id(obs_sag_rate));
       return std::string(b);
+
+  - platform: template
+    name: "Boat Load State"
+    id: boat_load_state_text
+    entity_category: diagnostic
+    web_server: {sorting_group_id: group_diag, sorting_weight: 18}
+    update_interval: 1s
+    lambda: |-
+      if (!id(boat_load_known)) return std::string("Unknown");
+      if (!id(boat_present)) return std::string("Confirmed empty");
+      return id(boat_heavy) ? std::string("Confirmed Cobalt")
+                            : std::string("Confirmed other boat");
 
 # ---------------------------------------------------------------------------
 #  HA-facing controls (mirror the dock buttons through the SAME intents)
@@ -1940,8 +2031,8 @@ button:
     name: "Lift Max"
     web_server: {sorting_group_id: group_control, sorting_weight: 5}
     on_press: {script.execute: request_goto_max}
-  # (rev G: the "Reset Fault" button was removed — Stop is the universal
-  #  clear-it control: it already clears a latched FAULT and exits BYPASS.)
+  # (rev G: the "Reset Fault" button was removed — Stop clears a latched FAULT
+  #  and exits BYPASS.)
   # (rev H: Reset Auto-Maintain Lockout removed with the sticky lockout.)
   - platform: restart
     name: "Restart"
@@ -2006,6 +2097,16 @@ button:
           id(cal2_num_top).publish_state(id(cal2_angle_up));
           ESP_LOGI("cal", "SLAVE LIFT set to %.2f deg", id(cal2_angle_up));
   - platform: template
+    name: "Calibrate ${side_slave}: set LIFT MAX"
+    entity_category: config
+    web_server: {sorting_group_id: group_config, sorting_weight: 54}
+    on_press:
+      - lambda: |-
+          id(cal2_angle_max) = id(current_angle2);
+          id(cal2_max_done) = true;
+          id(cal2_num_max).publish_state(id(cal2_angle_max));
+          ESP_LOGI("cal", "SLAVE LIFT MAX set to %.2f deg", id(cal2_angle_max));
+  - platform: template
     name: "Calibrate ${side_slave}: set READY"
     entity_category: config
     web_server: {sorting_group_id: group_config, sorting_weight: 56}
@@ -2069,7 +2170,8 @@ select:
 # ---------------------------------------------------------------------------
 #  Intents (request_*) — validate against state + interlocks, then transition.
 #  Mode buttons: last press wins — accepted from rest OR mid-move (retarget /
-#  reverse). Stop cancels a move to HOLD. Latched moves, no hold-to-run.
+#  reverse). Red/Stop always cancels motion and commands safe outputs.
+#  Latched moves, no hold-to-run.
 # ---------------------------------------------------------------------------
 script:
   # ---- go-to-position core: pick raise vs lower from current height ----
@@ -2094,6 +2196,7 @@ script:
           float tol = id(zone_tol_pct);
           bool was_moving = (prev_s == ${S_RAISING} || prev_s == ${S_LOWERING});
           id(rest_pulse) = 0;   // any go-to preempts an at-rest level pulse
+          id(lowered_vent_stopped) = false;  // new mode releases Stop's Lowered seal
           id(goto_target_pct) = target; id(goto_mode) = mode; id(manual_move) = false;
           // clear leveling scratch on any (re)target (throttle/catch-up/shadow dedupe)
           id(level_catchup_start) = 0; id(level_since) = 0; id(level_shadow_want) = 0;
@@ -2127,6 +2230,8 @@ script:
             if (next_s == ${S_LOWERED_VENT}) {
               if (!id(boat_present)) ESP_LOGI("presence", "retarget LOWERED_VENT -> presence reset to presumed BOAT ON");
               id(boat_present) = true;
+              id(boat_heavy) = true;
+              id(boat_load_known) = false;
             }
           }
           id(lift_state) = next_s;
@@ -2149,6 +2254,7 @@ script:
           int prev_s = id(lift_state);
           if (prev_s != ${S_HOLD} && prev_s != ${S_LOWERED_VENT}
               && prev_s != ${S_RAISING} && prev_s != ${S_LOWERING}) return;
+          id(lowered_vent_stopped) = false;
           id(goto_target_pct) = 200.0f; id(goto_mode) = ${M_LIFT}; id(manual_move) = true;
           if (prev_s != ${S_RAISING}) {
             id(blower_on_since) = millis();
@@ -2166,6 +2272,7 @@ script:
           int prev_s = id(lift_state);
           if (prev_s != ${S_HOLD} && prev_s != ${S_LOWERED_VENT}
               && prev_s != ${S_RAISING} && prev_s != ${S_LOWERING}) return;
+          id(lowered_vent_stopped) = false;
           id(goto_target_pct) = -100.0f; id(goto_mode) = ${M_LOWER}; id(manual_move) = true;
           if (prev_s != ${S_LOWERING}) {
             id(lower_start_time) = millis();
@@ -2191,21 +2298,25 @@ script:
           if (!id(angle_trusted)) { ESP_LOGW("fsm","Lift Max needs a trusted angle"); return; }
           if (!id(cal_max_done)) { ESP_LOGW("fsm","Lift Max not calibrated"); return; }
           if (!id(have_cal)) return;
-          // ROOF GUARD ("decide en route"):
-          // Max ≈148% puts the boat tower into the boathouse roof. From a LOW
-          // start the classifier window (first 15%-pts of climb) resolves far
-          // below the roof, and the in-flight clamp demotes Max -> Lift on any
-          // non-EMPTY outcome — so an unknown/boat-on press may launch and the
-          // lift decides on the way up. From a HIGH start the window can't
-          // finish before the roof, so without a positive EMPTY verdict from
-          // the last raise the press stays hard-blocked. (NAN-safe: !(pct<50)
-          // blocks when height is unknown.)
-          if (id(boat_present) && !(id(lift_pct) < 50.0f)) {
-            ESP_LOGW("fsm","Lift Max BLOCKED: presence unknown/boat-on and start too high (%.0f%%) for en-route classification", id(lift_pct));
+          // ROOF GUARD (rev G): Max ≈148% can put a *tower* boat into the
+          // boathouse roof. Block when Confirmed Cobalt/heavy. Allow when
+          // Confirmed empty or Confirmed other (light) boat. Unknown from a
+          // LOW start may launch — classifier demotes Max→Lift only on a
+          // heavy verdict (or throttle abort). Unknown/heavy from a HIGH
+          // start is hard-blocked (window can't finish before the roof).
+          // (NAN-safe: !(pct<50) blocks when height is unknown.)
+          bool known_heavy = id(boat_load_known) && id(boat_present) && id(boat_heavy);
+          bool max_roof_ok = id(boat_load_known) && (!id(boat_present) || !id(boat_heavy));
+          if (known_heavy) {
+            ESP_LOGW("fsm","Lift Max BLOCKED: Confirmed Cobalt/heavy boat (tower roof guard)");
             return;
           }
-          if (id(boat_present))
-            ESP_LOGW("fsm","Lift Max from low start, presence unknown/ON -> classifier decides en route (demotes to Lift unless EMPTY)");
+          if (!max_roof_ok && !(id(lift_pct) < 50.0f)) {
+            ESP_LOGW("fsm","Lift Max BLOCKED: load unknown and start too high (%.0f%%) for en-route classification", id(lift_pct));
+            return;
+          }
+          if (!max_roof_ok)
+            ESP_LOGW("fsm","Lift Max from low start, load unknown -> classifier decides en route (demotes to Lift on Cobalt/heavy)");
           float span = id(cal_angle_up) - id(cal_angle_down);
           float mp = (id(cal_angle_max) - id(cal_angle_down)) / span * 100.0f;
           id(do_goto)->execute(mp, ${M_MAX});
@@ -2224,14 +2335,15 @@ script:
           if (!id(angle_trusted)) { ESP_LOGW("fsm","Ready needs a trusted angle"); return; }
           if (!id(cal_float_done)) { ESP_LOGW("fsm","Ready not calibrated"); return; }
           if (std::isnan(id(ready_target_pct))) return;
+          // Manual mode selection is authoritative: Ready is accepted from rest or
+          // mid-move just like Lift and Lower. Load classification only constrains
+          // unattended Ready maintenance; it never blocks an operator command.
           id(do_goto)->execute(id(ready_target_pct), ${M_READY});
 
   - id: request_stop
     then:
-      # Highest-priority intent and the universal "make it stop / clear it" control.
-      # Ends any moving state, CLEARS a latched FAULT (e.g. stall_no_progress,
-      # runtime_watchdog), and exits BYPASS. A short press while in BYPASS exits
-      # bypass back to HOLD ("press again for real mode").
+      # Universal red control: stop motion, abort leveling, close the Lowered vent,
+      # clear FAULT, seal EMERG, or exit BYPASS. It never selects another mode.
       - lambda: |-
           if (id(test_mode)) {
             // Red button = universal kill even on the bench: blower off + valves
@@ -2242,6 +2354,7 @@ script:
             ESP_LOGW("fsm", "bench test: STOP press -> all outputs COMMANDED off (verify the blower actually stopped — a welded Y1 keeps running; breaker if so)");
             return;
           }
+          id(lowered_vent_stopped) = true;
           if (id(lift_state) == ${S_EMERG}) {
             // operator override: seal NOW, latch the fault (second press clears -> HOLD)
             id(enter_fault)->execute("level_divergence - operator stop");
@@ -2256,18 +2369,12 @@ script:
             id(rest_pulse) = 0;
             id(lift_state) = ${S_HOLD};
             ESP_LOGI("fsm", "request_stop -> exit BYPASS -> HOLD");
-          } else if (id(lift_state) == ${S_RAISING} || id(lift_state) == ${S_LOWERING}) {
-            // (rev F.4: LOWERED_VENT removed from this clause — at the bottom
-            //  the vent stays open ALWAYS; the 250 ms rest-vent rule would
-            //  reopen it within a tick anyway, so Stop there is a no-op.)
+          } else if (id(lift_state) == ${S_RAISING} || id(lift_state) == ${S_LOWERING}
+                     || id(lift_state) == ${S_HOLD} || id(lift_state) == ${S_LOWERED_VENT}) {
             id(rest_pulse) = 0;
             id(lift_state) = ${S_HOLD};
             id(last_stop_reason) = "Stop pressed";
             ESP_LOGI("fsm", "request_stop -> HOLD");
-          } else if (id(rest_pulse) != 0) {
-            id(rest_pulse) = 0;
-            id(last_stop_reason) = "Stop pressed (rest level)";
-            ESP_LOGI("fsm", "request_stop -> abort rest level pulse");
           }
       - script.execute: apply_outputs
 
@@ -2280,6 +2387,8 @@ script:
           id(manual_move) = false;
           id(rest_pulse) = 0;
           id(boat_present) = true;   // hands-off manual: anything can happen -> presence unknown = presumed ON
+          id(boat_heavy) = true;     // fail-safe: presume tower boat until reclassified
+          id(boat_load_known) = false;
           id(lift_state) = ${S_BYPASS};          // BYPASS: apply_outputs opens valve, blower off
           ESP_LOGW("fsm", "BYPASS engaged -> valve OPEN, blower OFF (hands-off)");
       - lambda: 'id(bypass_mode_switch).publish_state(true);'
@@ -2566,6 +2675,10 @@ interval:
             float lo2 = id(cal2_angle_down), hi2 = id(cal2_angle_down);
             if (id(cal2_angle_up) < lo2) lo2 = id(cal2_angle_up);
             if (id(cal2_angle_up) > hi2) hi2 = id(cal2_angle_up);
+            if (id(cal2_max_done)) {
+              if (id(cal2_angle_max) < lo2) lo2 = id(cal2_angle_max);
+              if (id(cal2_angle_max) > hi2) hi2 = id(cal2_angle_max);
+            }
             float m2 = id(angle_margin_deg).state;
             x2_plausible = (id(current_angle2) >= lo2 - m2 && id(current_angle2) <= hi2 + m2);
           }
@@ -2828,21 +2941,20 @@ interval:
                 }
               }
             }
-            // ---- boat-presence classification (rev F): raise cycles ONLY ----
-            // Time the first PRESENCE_WINDOW %-points of climb; rate at/above the
-            // Empty Raise Rate Min slider = EMPTY, slower = BOAT ON. Leveling
-            // throttle bias is DIRECTION-dependent (rev F.2 fix): master-closed
-            // (level_throttle=1) starves the master and under-reads its rate —
-            // safe, biases "boat on". Slave-closed (=2) feeds ALL air to the
-            // master and INFLATES the measured rate — could fake EMPTY with a
-            // boat aboard, so that direction ABORTS classification for this
-            // raise (the previous latch holds). Classifies once per raise.
+            // ---- boat-presence classification (rev G): raise cycles ONLY ----
+            // Time the first PRESENCE_WINDOW %-points of climb; three bands:
+            //   >= Empty Raise Rate Min      -> EMPTY
+            //   <= Heavy Boat Raise Rate Max -> HEAVY / Cobalt (tower)
+            //   in between                   -> LIGHT / other boat
+            // Leveling throttle bias (rev F.2): master-closed under-reads
+            // (safe); slave-closed inflates master rate — ABORTS classification
+            // (previous latch holds). Classifies once per raise.
             {
               const float PRESENCE_WINDOW = 15.0f;   // %-points timed before deciding
-              bool resolved_not_empty = false;       // rev F.3: any non-EMPTY resolution demotes an in-flight Max
+              bool demote_max = false;               // heavy verdict OR throttle abort
               if (!id(presence_classified) && id(level_throttle) == 2) {
                 id(presence_classified) = true;      // master rate inflated -> unusable
-                resolved_not_empty = true;
+                demote_max = true;                   // fail-safe: don't continue Max
                 ESP_LOGI("presence", "slave-side throttle mid-window -> classification aborted (latch holds)");
               }
               if (!id(presence_classified) && !id(manual_move) && id(angle_valid)
@@ -2852,21 +2964,24 @@ interval:
                   float dt = (now - id(move_start_ms)) / 1000.0f;
                   float rate = (dt > 0.5f) ? (climb / dt) : 0.0f;
                   bool empty = rate >= id(empty_raise_rate_min).state;
+                  bool heavy = !empty && rate <= id(heavy_raise_rate_max).state;
                   id(presence_classified) = true;
                   id(boat_present) = !empty;
-                  if (!empty) resolved_not_empty = true;
-                  ESP_LOGI("presence", "raise %.1f%% in %.1fs = %.2f %%/s -> %s (empty >= %.2f)",
-                           climb, dt, rate, empty ? "EMPTY" : "BOAT ON",
-                           id(empty_raise_rate_min).state);
+                  id(boat_heavy) = empty ? false : heavy;
+                  id(boat_load_known) = true;
+                  if (heavy) demote_max = true;
+                  const char* band = empty ? "EMPTY" : (heavy ? "COBALT/HEAVY" : "OTHER/LIGHT");
+                  ESP_LOGI("presence", "raise %.1f%% in %.1fs = %.2f %%/s -> %s (heavy <= %.2f, empty >= %.2f)",
+                           climb, dt, rate, band,
+                           id(heavy_raise_rate_max).state, id(empty_raise_rate_min).state);
                 }
               }
-              // rev F.3 in-flight roof guard ("decide en route"): a Max raise
-              // whose classification resolves as anything but EMPTY — BOAT ON
-              // verdict OR throttle abort — demotes to the boat-safe Lift target.
-              if (resolved_not_empty && id(goto_mode) == ${M_MAX}) {
+              // in-flight roof guard: demote Max→Lift only on Cobalt/heavy or
+              // classification abort — light boat and empty continue to Max.
+              if (demote_max && id(goto_mode) == ${M_MAX}) {
                 id(goto_target_pct) = id(top_target_pct).state;
                 id(goto_mode) = ${M_LIFT};
-                ESP_LOGW("presence", "Max demoted to Lift %.0f%% (no EMPTY verdict — roof guard)",
+                ESP_LOGW("presence", "Max demoted to Lift %.0f%% (Cobalt/heavy or class abort — roof guard)",
                          id(goto_target_pct));
               }
             }
@@ -2922,6 +3037,8 @@ interval:
                 // floating: the boat can drive on/off here -> presence unknown = presumed ON
                 if (!id(boat_present)) ESP_LOGI("presence", "LOWERED_VENT -> presence reset to presumed BOAT ON");
                 id(boat_present) = true;
+                id(boat_heavy) = true;
+                id(boat_load_known) = false;
                 ESP_LOGI("fsm", "lowered threshold reached -> LOWERED_VENT (valves stay open)");
               } else {
                 // Two-sided completion: master at target, slave must be level too
@@ -2956,7 +3073,11 @@ interval:
               // A Lowered-bound descent may have reached floating depth
               // without ever confirming the zone — the boat could have changed,
               // so presence resets to presumed ON just like the LOWERED_VENT path.
-              if (id(goto_mode) == ${M_LOWER}) id(boat_present) = true;
+              if (id(goto_mode) == ${M_LOWER}) {
+                id(boat_present) = true;
+                id(boat_heavy) = true;
+                id(boat_load_known) = false;
+              }
               ESP_LOGI("fsm", "lower timeout -> HOLD");
             }
           }
@@ -2980,15 +3101,18 @@ interval:
             }
           }
 
-          // ---- resting at the bottom: vent stays open, ALWAYS.
+          // ---- resting at the bottom: vent stays open unless Stop sealed it.
           //      Any HOLD that finds itself settled in the Lowered zone —
-          //      post-reboot, post-Stop, or a timed-out lower that settles
+          //      post-reboot or a timed-out lower that settles
           //      in later — re-enters LOWERED_VENT so the tanks keep venting
-          //      indefinitely. Boat can come/go at the bottom, so presence
-          //      resets to presumed ON here too. ----
-          else if (s == ${S_HOLD} && id(angle_trusted) && id(pos_at_lowered)) {
+          //      indefinitely. Stop latches it sealed until the next mode request.
+          //      Boat can come/go at the bottom, so presence resets to presumed ON. ----
+          else if (s == ${S_HOLD} && id(angle_trusted) && id(pos_at_lowered)
+                   && !id(lowered_vent_stopped)) {
             id(lift_state) = ${S_LOWERED_VENT};
             id(boat_present) = true;
+            id(boat_heavy) = true;
+            id(boat_load_known) = false;
             id(last_stop_reason) = "at lowered - vent reopened";
             ESP_LOGI("fsm", "HOLD in Lowered zone -> LOWERED_VENT (vent stays open)");
           }
@@ -3013,9 +3137,11 @@ interval:
               } else {
                 id(presence_start_pct) = NAN;
                 id(presence_classified) = true;
-                // rev F.3: a Max launch whose classifier can't arm (angle blip
-                // at start) must not sail up unclassified — demote to Lift.
-                if (cs == ${S_RAISING} && id(goto_mode) == ${M_MAX} && id(boat_present)) {
+                // Max launch whose classifier can't arm (angle blip at start)
+                // must not sail up unclassified unless load is already known
+                // roof-safe (empty or light boat).
+                if (cs == ${S_RAISING} && id(goto_mode) == ${M_MAX}
+                    && !(id(boat_load_known) && (!id(boat_present) || !id(boat_heavy)))) {
                   id(goto_target_pct) = id(top_target_pct).state;
                   id(goto_mode) = ${M_LIFT};
                   ESP_LOGW("presence", "Max launch without classifier arm -> demoted to Lift (roof guard)");
@@ -3134,6 +3260,8 @@ interval:
           int zone = at_max ? 3 : (at_top ? 1 : (at_ready ? 2 : 0));
           int s = id(lift_state);
           bool resting = (s == ${S_HOLD});
+          int prev_maintain_block = id(maintain_block_reason);
+          id(maintain_block_reason) = 0;
           // Start/reset visit when we arrive HOLD at a maintained zone different
           // from the current visit. Top-up raises leave HOLD briefly but keep
           // visit_pos so counters survive the automatic recovery.
@@ -3162,9 +3290,26 @@ interval:
           }
 
           if (id(obs_arm_mode) == 0) {
-            if (zone == 3)      { id(obs_arm_mode) = 3; id(obs_settled_since) = now; id(obs_below_since) = 0; }
+            if (zone == 3) {
+              // Max height keep: empty OR light boat (Crestliner). Cobalt/heavy blocked.
+              if (id(boat_load_known) && (!id(boat_present) || !id(boat_heavy))) {
+                id(obs_arm_mode) = 3; id(obs_settled_since) = now; id(obs_below_since) = 0;
+              } else {
+                id(maintain_block_reason) = 4;
+                if (prev_maintain_block != 4)
+                  ESP_LOGW("maintain", "Lift Max maintenance OFF: need confirmed empty or light boat");
+              }
+            }
             else if (zone == 1) { id(obs_arm_mode) = 1; id(obs_settled_since) = now; id(obs_below_since) = 0; }
-            else if (zone == 2) { id(obs_arm_mode) = 2; id(obs_settled_since) = now; id(obs_below_since) = 0; }
+            else if (zone == 2) {
+              if (id(boat_load_known) && id(boat_present)) {
+                id(obs_arm_mode) = 2; id(obs_settled_since) = now; id(obs_below_since) = 0;
+              } else {
+                id(maintain_block_reason) = 1;
+                if (prev_maintain_block != 1)
+                  ESP_LOGW("maintain", "Ready recovery OFF: loaded boat not confirmed");
+              }
+            }
             return;
           }
 
@@ -3174,6 +3319,45 @@ interval:
           } else if (id(obs_arm_mode) == 3) {
             float span = id(cal_angle_up) - id(cal_angle_down);
             setpoint = (id(cal_angle_max) - id(cal_angle_down)) / span * 100.0f;
+          }
+          // Ready is the only maintained height close to the floating posture.
+          // It requires a positive loaded classification and may only recover
+          // inside the narrow band between sag deadband and the safe floor.
+          if (id(obs_arm_mode) == 2) {
+            float floor_drop = id(ready_recovery_floor_pct).state;
+            float deadband = id(maintain_sag_deadband).state;
+            if (!id(boat_load_known) || !id(boat_present)) {
+              id(maintain_block_reason) = 1;
+              id(obs_below_since) = 0;
+              if (prev_maintain_block != 1)
+                ESP_LOGW("maintain", "Ready recovery OFF: loaded boat no longer confirmed");
+              return;
+            }
+            if (floor_drop <= deadband) {
+              id(maintain_block_reason) = 3;
+              id(obs_below_since) = 0;
+              if (prev_maintain_block != 3)
+                ESP_LOGE("maintain", "Ready recovery OFF: floor %.1f%% must exceed deadband %.1f%%",
+                         floor_drop, deadband);
+              return;
+            }
+            float safe_floor = setpoint - floor_drop;
+            if (pct < safe_floor || (id(obs_height_filt) > -900.0f && id(obs_height_filt) < safe_floor)) {
+              id(maintain_block_reason) = 2;
+              id(obs_below_since) = 0;
+              if (prev_maintain_block != 2)
+                ESP_LOGE("maintain", "Ready recovery INHIBITED: live %.1f%% filtered %.1f%% below safe floor %.1f%%",
+                         pct, id(obs_height_filt), safe_floor);
+              return;
+            }
+          }
+          if (id(obs_arm_mode) == 3
+              && !(id(boat_load_known) && (!id(boat_present) || !id(boat_heavy)))) {
+            id(maintain_block_reason) = 4;
+            id(obs_below_since) = 0;
+            if (prev_maintain_block != 4)
+              ESP_LOGW("maintain", "Lift Max maintenance OFF: empty/light load state lost");
+            return;
           }
           unsigned long settle_ms = (unsigned long)(id(maintain_settle_seconds).state * 1000.0f);
           bool settled = (now - id(obs_settled_since)) >= settle_ms;

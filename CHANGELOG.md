@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Lift Max roof guard is Cobalt/heavy-only (rev G).** Raise-rate classifier is three bands: empty (≥ `Empty Raise Rate Min`), light/other boat (between), Cobalt/heavy (≤ new `Heavy Boat Raise Rate Max`, default **0.60 %/s**). `Boat Load State` reports `Confirmed empty` / `Confirmed other boat` / `Confirmed Cobalt` / `Unknown`. Max is allowed for empty or light boat; blocked for Confirmed Cobalt; unknown still hard-blocks from high and demotes en route only on a heavy verdict. Max height maintain follows the same roof-safe rule. Requires OTA.
+- **Raise stall timeout 30→15 s** (grace stays 20 s). Field raises never pause more than ~4 s between 0.2° progress; 15 s is still ~4× that. A dead raise now faults in ~35 s (blower off, valves closed). Flash-persisted — nudge the live slider after OTA / set via HA.
+- **Red Stop button is Stop-only:** it cancels raising/lowering, aborts at-rest leveling, seals the continuously venting Lowered mode, clears FAULT, seals emergency descent, and exits Bypass. It never selects Lift Max. Press Lower again to resume Lowered venting. Dock long-hold Bypass remains removed; enter Bypass via the labeled **Bypass Mode** switch (web/HA) or panel Diagnostics only.
+
+## [0.9.0] — 2026-08-01
+
+### Fixed
+
+- **Slave IMU trust now covers Lift Max.** Port gets its own persisted Lift Max angle, editable number, and capture button; that capture extends the Port plausibility window just as the existing master Lift Max capture extends Starboard. This prevents a healthy, level lift at Max from degrading to `Port outside calibrated range — ganged` merely because Max lies beyond the ordinary Lift capture. Level Status now names the exact side and whether it is offline, uncalibrated, or outside its calibrated range instead of the generic `Not trusted — ganged`.
+- **Bunk Height is waterline-relative.** The arm-geometry estimate is anchored to the measured true-Lowered position of −13 in, so negative readings mean below water and positive readings mean above water instead of merely reporting rise above the Lowered calibration.
+- **Ready recovery is load-aware and bounded.** A new persisted classification-confidence bit separates `Confirmed boat`, `Confirmed empty`, and `Unknown`. Manual Ready requests remain authoritative and retarget from rest or mid-move; only unattended Ready recovery requires a confirmed loaded boat. Recovery runs after the normal 3 % / 180 s / 60 s qualification and only while the lift remains above the new 5 % `Ready Recovery Floor`. Below that floor, automatic inflation is inhibited so the controller cannot pick up a potentially floating or shifted boat. Continuous level monitoring and in-move throttling remain global; parked level correction remains Lift-only.
+
 ## [0.8.1] — 2026-07-26
 
 ### Added

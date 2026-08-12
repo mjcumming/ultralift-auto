@@ -23,13 +23,13 @@ The page is ordered top to bottom: **Control → Status → Configuration → Ad
 | `Not calibrated` | No target moves until Lift + Lowered are captured. |
 | `Lifted` / `Ready` / `Lowered` / `Lifted (max)` / `Between ready/lifted` … | Resting position. |
 
-**Lift · Ready · Stop · Lower** — the same intents as the dock buttons, in the same order as the physical panel. Press a position and the controller picks raise vs lower itself; a press mid-move retargets (last press wins); **Stop** cancels any move, clears a FAULT, and exits Bypass. **Lift Max** sits last: the roof-clearance position, only reachable when the lift is confident the boat is off (§5.1) — expect it to refuse or demote to Lift otherwise.
+**Lift · Ready · Stop · Lower** — the same intents as the dock buttons, in the same order as the physical panel. Press a position and the controller picks raise vs lower itself; a press mid-move retargets (last press wins). **Stop** always cancels motion and commands safe outputs; at Lowered it seals the vent until Lower is pressed again. Stop also clears a FAULT and exits Bypass. **Lift Max** sits last as a separate explicit control.
 
-**Auto-Maintain Height** *(default ON)* — automatically tops the lift back up when it sags at Ready, Lift, or Lift Max. Up-only; never auto-lowers.
+**Auto-Maintain Height** *(default ON)* — automatically tops up Lift and roof-safe Lift Max (confirmed empty or light boat). Ready recovery requires a confirmed loaded boat and acts only from 3 % low through the 5 % safe floor; below that, inflation is inhibited. Up-only; never auto-lowers.
 
 **Auto-Maintain Level** *(default ON)* — keeps the two sides even: throttles the side that's ahead during every move, and corrects a developing list while parked at Lift. OFF = valves ganged, decisions still logged as `LEVEL(shadow)`.
 
-**Bypass Mode** — opens both valves, blower off, controller idle (same as holding the red dock button ~3 s). The lift vents and floats; all button LEDs go dark. Turn OFF (or short-press Stop) to return to normal.
+**Bypass Mode** — opens both valves, blower off, controller idle (web/HA or panel Diagnostics; the dock red button no longer enters Bypass). The lift vents and floats; all button LEDs go dark. Turn OFF (or short-press Stop) to return to normal.
 
 ---
 
@@ -41,8 +41,9 @@ The page is ordered top to bottom: **Control → Status → Configuration → Ad
 - **Lift In Operation** *(binary)* — ON while a move *somebody asked for* is running (any button, panel, web, or HA), OFF when it finishes. Keeper top-ups and the emergency descent don't light it — watch Lift Activity for those.
 - **Air Loss Alert** *(binary)* — ON when air is leaving abnormally: sinking while sealed, parked sag rate too high, or too many keeper interventions in one visit (§15.5). The keepers keep correcting either way — this is the "you should know about this" flag. Reason in Diagnostics → Air Loss Detail.
 - **Lift Height** — position as % of the calibrated span (Lowered = 0 %, Lift cal = 100 %). Can read below 0 (settled past the Lowered cal) or above 100 (Lift Max territory, or an empty lift riding high).
-- **Bunk Height** — the same position converted to real inches of bunk rise above the Lowered cal, from arm geometry. Display only.
-- **Boat Present** — the fail-safe presence latch from raise-speed classification (§5.1). ON means *boat aboard or unknown*; it blocks Lift Max. Resets to ON whenever the boat could have changed (at the bottom, or after bypass).
+- **Bunk Height** — estimated bunk elevation relative to the waterline, from arm geometry. The surveyed true-Lowered datum is −13 in (below water); positive values are above water. Display only.
+- **Boat Present** — the fail-safe presence latch from raise-speed classification (§5.1). ON means *boat aboard or unknown*.
+- **Boat Load State** *(Diagnostics)* — `Confirmed empty`, `Confirmed other boat`, `Confirmed Cobalt`, or `Unknown`. Ready needs any confirmed boat; Lift Max is allowed for empty or other boat and blocked for Cobalt/unknown-from-high. Tunable via `Empty Raise Rate Min` and `Heavy Boat Raise Rate Max`. Resets to `Unknown` wherever the boat could have changed.
 - **Water Temperature** — DS18B20 in the water. Scanned at boot only — if it shows unknown after a sensor swap, restart.
 - **Maintain Observe** — the keepers' visit summary: `At Lift — 2 top-ups, 1 level fixes — sag −0.30%/h`, or `Not parked at a maintained position`. Counters reset when the lift arrives at a new maintained position.
 - **Lift Activity / Lift Position** — short stable tokens (`Idle/Raising/Lowering/Leveling/Fault/Bypass/Emergency Descent` and `Lowered/Ready/Lifted/Lifted Max/Between/Unknown`) for exact-match HA automations. They duplicate the human lines above on purpose — trigger on these, read the others.
@@ -58,7 +59,7 @@ The lift measures **arm angle**, not height. Calibration teaches it what your do
 1. Drive the lift all the way down (true bottom, settled) → press **Calibrate: set LOWERED**, then **Calibrate Port: set LOWERED**.
 2. Float the boat level at the almost-down position → **Calibrate: set READY** + **Calibrate Port: set READY**.
 3. Raise to the everyday stored height, verified level → **Calibrate: set LIFT** + **Calibrate Port: set LIFT**.
-4. (Boat OFF only) raise to the winter/max height → **Calibrate: set LIFT MAX** (master only).
+4. (Boat OFF only) raise to the winter/max height, verified level → **Calibrate: set LIFT MAX** + **Calibrate Port: set LIFT MAX**.
 
 Why the Port captures too: the frame racks slightly, so the port sensor gets its *own* captures at the same physical positions — leveling then compares the two sides in percent space, and the racking cancels out (§16.1).
 
@@ -78,9 +79,11 @@ All live-editable and stored on the device — an OTA does *not* overwrite value
 - **Blower Max Runtime (min)** — absolute blower cap, any mode. The hard backstop; must exceed a real full raise (measured 134 s loaded → default 4 min).
 - **Lower Timeout (min)** — a descent that never confirms its target gives up and seals after this.
 - **Angle Plausibility Margin (°) / Angle Freshness (s)** — the trust ladder (§9.4): how far outside the calibrated span, and how stale, the angle may be before auto moves stop.
-- **Stall Grace / Stall Timeout / Stall Min Progress** — raising must make progress (0.2°) at least every Timeout after Grace, or FAULT. Tuned from field data: 20 s / 30 s.
-- **Empty Raise Rate Min (% per s)** — the boat-presence bar (§5.1): early climb at/above this = empty. Ships at 99 (= never empty) until you record an empty and a loaded raise and set it between them.
-- **Maintain Sag Deadband / Persist / Min Interval / Settle Delay / Smoothing** — when a sag counts and how often a top-up may fire.
+- **Stall Grace / Stall Timeout / Stall Min Progress** — raising must make progress (0.2°) at least every Timeout after Grace, or FAULT. Tuned from field data: 20 s / 15 s.
+- **Empty Raise Rate Min (% per s)** — early climb at/above this = empty (§5.1). Ships at 99 (= never empty) until tuned.
+- **Heavy Boat Raise Rate Max (% per s)** — early climb at/below this = Cobalt/heavy (blocks Lift Max). This install **0.60 %/s**; between this and Empty = other/light boat (Max allowed).
+- **Maintain Sag Deadband / Persist / Min Interval / Settle Delay / Smoothing** — when a sag counts and how often a top-up may fire. Defaults make a Ready top-up eligible after roughly four minutes below the trigger.
+- **Ready Recovery Floor** — maximum allowed drop below Ready for automatic inflation (default 5 %). It must exceed the sag deadband; crossing it inhibits recovery and requires an operator.
 - **Air Alert Sealed Drop / Sag Rate / Visit Events** — the three Air Loss Alert triggers (§15.5).
 - **Rest Level Trigger / Persist** — when a parked list earns a correction pulse.
 - **Level Deadband / Hysteresis / Min Hold / Catch-up Timeout** — the in-move leveling throttle's engage/release behaviour.

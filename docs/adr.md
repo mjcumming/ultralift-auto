@@ -30,18 +30,20 @@ Status values: **Accepted**.
 
 **Decision:**
 
-| Position | Maintain Height | Maintain Level (at rest) |
+| Position / load | Maintain Height | Maintain Level (at rest) |
 |---|---|---|
-| Lift | yes | yes |
-| Ready | yes | no |
-| Lift Max | yes | no |
-| Lowered | no | no |
+| Lift / any load | yes | yes |
+| Ready / confirmed boat | yes, only from 3 % low through the 5 % safe floor | no |
+| Ready / empty or unknown | no | no |
+| Lift Max / confirmed empty | yes | no |
+| Lift Max / boat or unknown | prohibited by roof guard | no |
+| Lowered / any load | no | no |
 
 In-move throttle follows Maintain Level on every go-to. Both switches **default ON**.
 
-**Rationale:** Everyday storage (Lift) needs height and level. Ready is a float-away risk if height sags, but at-rest level pulses there are lower priority than getting height back. Lift Max is a roof-clearance / storage extreme — height only. Lowered means the boat is floating.
+**Rationale:** Everyday storage (Lift) needs height and level. Ready is a boat-supported posture: a positively classified load may receive height-only recovery inside a narrow envelope, but below the safe floor the boat may be floating or shifted, so automatic inflation is inhibited. An empty lift cannot reliably hold Ready. Lift Max is a confirmed-empty roof-clearance/storage extreme and remains height-only. Lowered means the boat is floating.
 
-**Consequence:** List at Ready or Max is visible in Level Error / Observe but not auto-pulsed at rest; height top-ups still run where allowed.
+**Consequence:** Level monitoring and the divergence hard stop remain live everywhere trusted, while parked level pulses remain Lift-only. Manual Ready requests always select Ready; load classification limits only unattended Ready recovery, and `Maintain Observe` reports any recovery inhibition.
 
 ---
 
