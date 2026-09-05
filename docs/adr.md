@@ -22,7 +22,7 @@ Status values: **Accepted**.
 
 **Rationale:** One blower can only feed one path at a time. A parallel “level FSM” would fight go-to and maintain. Biasing which valve is open reuses every existing safety backstop.
 
-**Consequence:** Stall detection must be feed-aware. Move completion for Ready/Lift/Max waits for both master-at-target and level-within-deadband.
+**Consequence:** Stall detection must be feed-aware. Move completion for Ready/Lift waits for both master-at-target and level-within-deadband.
 
 ---
 
@@ -32,16 +32,14 @@ Status values: **Accepted**.
 
 | Position / load | Maintain Height | Maintain Level (at rest) |
 |---|---|---|
-| Lift / any load | yes | yes |
+| Lift / any load | yes (to the load-selected shutoff) | yes |
 | Ready / confirmed boat | yes, only from 3 % low through the 5 % safe floor | no |
 | Ready / empty or unknown | no | no |
-| Lift Max / confirmed empty | yes | no |
-| Lift Max / boat or unknown | prohibited by roof guard | no |
 | Lowered / any load | no | no |
 
 In-move throttle follows Maintain Level on every go-to. Both switches **default ON**.
 
-**Rationale:** Everyday storage (Lift) needs height and level. Ready is a boat-supported posture: a positively classified load may receive height-only recovery inside a narrow envelope, but below the safe floor the boat may be floating or shifted, so automatic inflation is inhibited. An empty lift cannot reliably hold Ready. Lift Max is a confirmed-empty roof-clearance/storage extreme and remains height-only. Lowered means the boat is floating.
+**Rationale:** Everyday storage (Lift) needs height and level. Ready is a boat-supported posture: a positively classified load may receive height-only recovery inside a narrow envelope, but below the safe floor the boat may be floating or shifted, so automatic inflation is inhibited. An empty lift cannot reliably hold Ready. Lowered means the boat is floating.
 
 **Consequence:** Level monitoring and the divergence hard stop remain live everywhere trusted, while parked level pulses remain Lift-only. Manual Ready requests always select Ready; load classification limits only unattended Ready recovery, and `Maintain Observe` reports any recovery inhibition.
 
@@ -67,13 +65,13 @@ In-move throttle follows Maintain Level on every go-to. Both switches **default 
 
 ---
 
-## ADR-006 — Boat presence from raise rate; Lift Max roof guard
+## ADR-006 — Boat presence from raise rate; two Lift shutoffs
 
-**Decision:** Infer presence from early climb rate on raises (loaded is much slower than empty). Unknown = boat ON. Boat ON blocks Lift Max. From a low start with unknown presence, allow Max to start and **demote to Lift** if the verdict is not EMPTY (“decide en route”).
+**Decision:** Infer presence from early climb rate on raises (loaded is much slower than empty). Unknown = boat ON. **Lift is one command** with two shutoffs: confirmed empty → empty-max ceiling; any boat or unknown → boat (Cobalt) ceiling. Each ceiling is approached to `Lift Target %` so a heavier day still arrives. A Lift from unknown starts at the boat ceiling and **raises the target mid-move** if the verdict is empty.
 
-**Rationale:** No reliable presence switch on many installs. Lift Max can collide with a boathouse roof if a boat is aboard. Fail-safe polarity prefers a blocked Max over a roof strike.
+**Rationale:** A loaded lift cannot reach the empty-tank equilibrium, and boat weight varies (fuel, gear). A separate Lift Max mode is unnecessary once the beam/roof constraint is gone: every boat parks at the Cobalt height; only an empty lift uses the higher stored empty-max. Fail-safe polarity prefers the lower (boat) shutoff.
 
-**Consequence:** Tune `Empty Raise Rate Min` from local empty vs loaded profiles. Slave-side throttle during the timing window aborts classification for that raise.
+**Consequence:** Tune `Empty Raise Rate Min` from local empty vs loaded profiles. Slave-side throttle during the timing window aborts classification for that raise (boat shutoff holds). There is no Lift Max destination; `cal_max` remains the empty ceiling and the upper plausibility bound. Supersedes the earlier roof-guard form of this ADR.
 
 ---
 
@@ -147,8 +145,8 @@ In-move throttle follows Maintain Level on every go-to. Both switches **default 
 
 ## ADR-014 — Home Assistant control surface: buttons + command select, no cover
 
-**Decision:** Home Assistant drives the lift through the same five stateless buttons as the web UI, plus a **`Lift Command` select** (`— / Lift / Ready / Lower / Lift Max`) whose set-action fires the matching `request_*` intent — one entity automations and scenes can set declaratively. A **`Lift In Operation`** binary (`running`) is ON only while a **person-initiated** move runs: a `user_cmd_move` flag is set by every `request_goto_*` intent (dock buttons, panel, web, HA — all human paths) and cleared when the auto-maintain keeper starts a top-up; emergency descent is excluded outright. The select mirrors the destination of a user-commanded move and rests at `—` (selecting `—` is a no-op), so re-selecting the same destination always fires. A HA **cover entity is deliberately rejected**.
+**Decision:** Home Assistant drives the lift through the same four stateless buttons as the web UI, plus a **`Lift Command` select** (`— / Lift / Ready / Lower`) whose set-action fires the matching `request_*` intent — one entity automations and scenes can set declaratively. A **`Lift In Operation`** binary (`running`) is ON only while a **person-initiated** move runs: a `user_cmd_move` flag is set by every `request_goto_*` intent (dock buttons, panel, web, HA — all human paths) and cleared when the auto-maintain keeper starts a top-up; emergency descent is excluded outright. The select mirrors the destination of a user-commanded move and rests at `—` (selecting `—` is a no-op), so re-selecting the same destination always fires. A HA **cover entity is deliberately rejected**.
 
-**Rationale:** "The lift is in operation" means *someone asked it to do something* — keeper top-ups and the ADR-013 descent are housekeeping and emergency response, and lighting a "running" flag for them would train people to ignore it (motion is still visible in `Lift Activity`). A cover maps badly on every axis: covers get swept into bulk actions ("close all covers", good-night scenes, voice assistants exposing a garage door) — a scene quietly lowering a boat is exactly the failure ADR-010's request-only philosophy exists to prevent; open/close/position-% semantics also collapse the four curated setpoints (Ready's almost-down meaning, LOWERED_VENT, the Lift Max roof guard) into an ambiguous slider.
+**Rationale:** "The lift is in operation" means *someone asked it to do something* — keeper top-ups and the ADR-013 descent are housekeeping and emergency response, and lighting a "running" flag for them would train people to ignore it (motion is still visible in `Lift Activity`). A cover maps badly on every axis: covers get swept into bulk actions ("close all covers", good-night scenes, voice assistants exposing a garage door) — a scene quietly lowering a boat is exactly the failure ADR-010's request-only philosophy exists to prevent; open/close/position-% semantics also collapse the curated setpoints (Ready's almost-down meaning, LOWERED_VENT, load-selected Lift shutoffs) into an ambiguous slider.
 
 **Consequence:** HA automations use `select.select_option` (or button presses); there is no single open/close entity for voice assistants — accepted as the point, not a limitation. The select is HA-furniture and files at the bottom of Advanced on the web page (the web server has no per-entity hide), where the buttons remain the way to drive the lift.

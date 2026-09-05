@@ -8,10 +8,10 @@ Built for a HydroHoist **UltraLift UL2 8800** with **per-tank valves and inclino
 
 ## What it does
 
-- **Go-to-position FSM** — four calibrated setpoints (Lift / Ready / Lowered / Lift Max). Press a button; the controller picks raise vs lower, drives blower + vent valves, and stops on the calibrated zone. Mode buttons retarget mid-move (last press wins); red Stop always cancels motion and commands safe outputs.
-- **Auto-Maintain Height / Auto-Maintain Level** (default ON) — height top-ups at Lift and roof-safe Lift Max (empty or light boat), plus load-confirmed Ready recovery only inside a bounded 3–5 % sag envelope. Below the Ready floor, automatic inflation is inhibited. In-move throttle runs on every go-to; at-rest leveling remains Lift-only. Per-visit counters live on `Maintain Observe`.
+- **Go-to-position FSM** — three modes (Lift / Ready / Lowered). Press a button; the controller picks raise vs lower, drives blower + vent valves, and stops on the calibrated zone. Lift uses two shutoffs: boat ceiling with any boat (or unknown), empty ceiling when confirmed empty. Mode buttons retarget mid-move (last press wins); red Stop always cancels motion and commands safe outputs.
+- **Auto-Maintain Height / Auto-Maintain Level** (default ON) — height top-ups at Lift (to the load-selected shutoff), plus load-confirmed Ready recovery only inside a bounded 3–5 % sag envelope. Below the Ready floor, automatic inflation is inhibited. In-move throttle runs on every go-to; at-rest leveling remains Lift-only. Per-visit counters live on `Maintain Observe`.
 - **Two-valve / two-IMU leveling** — each tank has its own vent/fill valve and inclinometer; divergence past a hard limit faults the lift safe.
-- **Boat-presence detection** — no sensor needed: raise speed classifies empty vs light boat vs Cobalt/heavy. Lift Max is blocked only for Confirmed Cobalt or unknown-from-high; a light boat or empty may go Max, with en-route demote if a heavy verdict lands mid-raise.
+- **Boat-presence detection** — no sensor needed: raise speed classifies empty vs light boat vs Cobalt/heavy. That class picks the Lift shutoff (empty vs any boat); unknown stays on the boat ceiling and may raise the target mid-move if the raise proves empty.
 - **Safety supervisor** — angle trust ladder (freshness + plausibility, per sensor), stall detection, absolute blower runtime cap in every mode, valve position feedback with a manual-operation detector, degraded manual mode when sensing is lost, latched faults with reasons, power-loss-safe defaults.
 - **Dock UX** — four illuminated buttons with state-aware LED cadences, a decluttered on-device web UI (all tunables live-editable and flash-persisted — no recompiles to retune), and short-token status sensors (`Lift Activity`, `Lift Position`) built for exact-match Home Assistant automations.
 - **Optional touch panel** — an RS485-linked ESP32-S3 display that is a pure request/display surface; every command it sends goes through the same validated intents as a physical button.
@@ -50,7 +50,7 @@ Full bill of materials, wiring, and I/O map: **[docs/boat_lift_design.md](docs/b
    ```
 
    (Serial logging is off — UART0 feeds the second IMU — so use `esphome logs` over WiFi.)
-4. Commission with the lift, not the desk: capture the four master setpoints and four slave captures from real positions, verify each output channel physically, confirm the sensor sign convention (§2.2). **Auto-Maintain Height** and **Auto-Maintain Level** (Control section switches, default ON) — confirm both on a supervised first night, and watch **Visit Height Top-ups** / **Visit Level Events** (Diagnostics).
+4. Commission with the lift, not the desk: capture Lift / Ready / Lowered / Empty Max on both IMUs from real positions, verify each output channel physically, confirm the sensor sign convention (§2.2). **Auto-Maintain Height** and **Auto-Maintain Level** (Control section switches, default ON) — confirm both on a supervised first night, and watch **Visit Height Top-ups** / **Visit Level Events** (Diagnostics).
 
 > **Note on device naming:** this repo uses `device_name: boat-lift`. If you previously flashed under a different ESPHome device name, Home Assistant will see a **new** device; entity history and flash-stored calibrations under the old name do not carry over automatically.
 

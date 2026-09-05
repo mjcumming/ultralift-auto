@@ -63,10 +63,10 @@ substitutions:
   S_LOWERED_VENT: "6"
   S_EMERG: "7"      # emergency descent to Ready (level divergence, boat high)
   # ---- go-to mode codes (global goto_mode) ----
-  M_LIFT: "0"       # everyday stored position (Lift Target %)
+  M_LIFT: "0"       # stored position — boat ceiling or empty ceiling (§5.1)
   M_READY: "1"      # almost down, not yet floating
   M_LOWER: "2"      # all the way down (boat floats free)
-  M_MAX: "3"        # winter storage — max out of water
+  M_MAX: "3"        # retired — Lift Max is no longer a mode (slot kept)
 
   # ---- Output channel numbers on PCF8574 outputs_1_8 (0x24), pins 0-7 ----
   blower_out_pin: "0"        # Y01 -> blower relay coil (RIB2401B / NT90)
@@ -110,7 +110,7 @@ esphome:
   build_path: .esphome/build/boat-lift
   project:
     name: ultralift.boat_lift
-    version: "0.9.0 (2026-08-01)"   # load-aware bounded Ready recovery; build with venv ESPHome 2026.6.x
+    version: "0.9.1 (2026-09-05)"   # two Lift shutoffs, no Lift Max mode; build with venv ESPHome 2026.6.x
 
 esp32:
   board: esp32dev
@@ -384,7 +384,7 @@ globals:
     type: std::string
     restore_value: no
     initial_value: '""'
-  # go-to-position target: where a move is heading, and which mode (0=Lift,1=Ready,2=Lower,3=Lift Max)
+  # go-to-position target: where a move is heading, and which mode (0=Lift,1=Ready,2=Lower)
   - id: goto_target_pct
     type: float
     restore_value: no
@@ -393,6 +393,12 @@ globals:
     type: int
     restore_value: no
     initial_value: "0"
+  # Lift shutoff % — boat ceiling (Lift Target % of cal_up) or empty ceiling
+  # (same fraction of cal_max). Fail-safe: unknown / any boat → boat ceiling.
+  - id: lift_shutoff_pct
+    type: float
+    restore_value: no
+    initial_value: "NAN"
   # Stop must be able to seal the valves even while parked in LOWERED_VENT.
   # Cleared by the next accepted position request (including another Lower press).
   - id: lowered_vent_stopped
@@ -552,15 +558,15 @@ globals:
     initial_value: "0.0"
 
   # ---- boat presence, classified from RAISE speed only (rev F→G, §5.1) ----
-  # Fail-safe: unknown => boat_present ON + boat_heavy ON (Lift Max blocked).
-  # Lift Max roof guard blocks only Confirmed Cobalt/heavy (tower risk); a
-  # confirmed light boat (e.g. Crestliner) or empty may run Max. Persisted;
-  # resets to unknown/presumed-heavy at LOWERED_VENT / bypass.
+  # Fail-safe: unknown => boat_present ON + boat_heavy ON (boat Lift shutoff).
+  # Lift uses two shutoffs: confirmed empty → empty-max ceiling; any boat or
+  # unknown → boat (Cobalt) ceiling. Persisted; resets to unknown/presumed-
+  # heavy at LOWERED_VENT / bypass.
   - id: boat_present
     type: bool
     restore_value: yes
     initial_value: "true"
-  - id: boat_heavy               # true = Cobalt-class / tower boat (blocks Lift Max)
+  - id: boat_heavy               # true = Cobalt-class / tower boat (diagnostic class)
     type: bool                   # only meaningful when boat_load_known && boat_present
     restore_value: yes
     initial_value: "true"
@@ -610,7 +616,7 @@ globals:
     type: float
     restore_value: no
     initial_value: "0.0"
-  - id: obs_arm_mode             # latched: 0=idle, 1=Lift, 2=Ready, 3=Lift Max
+  - id: obs_arm_mode             # latched: 0=idle, 1=Lift, 2=Ready
     type: int
     restore_value: no
     initial_value: "0"
@@ -643,7 +649,7 @@ globals:
     restore_value: no
     initial_value: "0"
   # ---- per-visit maintain counters (reset when arriving at a new maintained position) ----
-  - id: visit_pos                # 0=none/ended, 1=Lift, 2=Ready, 3=Lift Max
+  - id: visit_pos                # 0=none/ended, 1=Lift, 2=Ready
     type: int
     restore_value: no
     initial_value: "0"
@@ -741,7 +747,7 @@ number:
           id(cal_up_done) = true;
           ESP_LOGI("cal", "LIFT adjusted to %.2f deg", x);
   - platform: template
-    name: "Cal Angle — Lift Max"
+    name: "Cal Angle — Empty Max"
     id: cal_num_max
     web_server: {sorting_group_id: group_advanced, sorting_weight: 73}
     min_value: -35      # tightened 2026-07-18 from ±90: field range is ~-21° (above
@@ -755,7 +761,7 @@ number:
           id(cal_angle_max) = x;
           id(cal_max_done) = true;
           float mt = id(zone_tol_deg).state;
-          ESP_LOGI("cal", "LIFT MAX adjusted to %.2f deg (zone: %.2f .. %.2f)",
+          ESP_LOGI("cal", "EMPTY MAX adjusted to %.2f deg (zone: %.2f .. %.2f)",
                    x, x - mt, x + mt);
 
   # ---- SLAVE (IMU #2) calibration setpoints — captured at the SAME physical
@@ -806,7 +812,7 @@ number:
           id(cal2_up_done) = true;
           ESP_LOGI("cal", "SLAVE LIFT adjusted to %.2f deg", x);
   - platform: template
-    name: "Cal ${side_slave} Angle — Lift Max"
+    name: "Cal ${side_slave} Angle — Empty Max"
     id: cal2_num_max
     web_server: {sorting_group_id: group_advanced, sorting_weight: 77}
     min_value: -35
@@ -819,7 +825,7 @@ number:
       - lambda: |-
           id(cal2_angle_max) = x;
           id(cal2_max_done) = true;
-          ESP_LOGI("cal", "SLAVE LIFT MAX adjusted to %.2f deg", x);
+          ESP_LOGI("cal", "SLAVE EMPTY MAX adjusted to %.2f deg", x);
 
   - platform: template
     name: "Lift Target (%)"
@@ -827,7 +833,7 @@ number:
     web_server: {sorting_group_id: group_config, sorting_weight: 40}
     optimistic: true
     restore_value: true
-    initial_value: 98
+    initial_value: 97
     min_value: 50
     max_value: 100
     step: 1
@@ -838,8 +844,9 @@ number:
   # Position Tolerance % — the supervisor converts this to % of span as zone_tol_pct):
   #   lowered band:  angle > (cal lowered − this)         (one-sided; lowered = high angle)
   #   ready band:    cal ready ± this
-  #   lift-max band: cal max ± this
-  #   lift band:     height ≥ Lift Target % − (this as %)
+  #   lift band:     height ≥ boat Lift Target % − (this as %)
+  # Lift Target % is how close we approach the load-selected ceiling (boat or
+  # empty) so a heavier day still arrives — do not set to 100.
   - platform: template
     name: "Zone Tolerance (°)"
     id: zone_tol_deg
@@ -1029,9 +1036,9 @@ number:
 
   # ---- boat-presence classifier (rev G — three bands) ----
   # Early climb rate over the first 15 %-points:
-  #   rate >= Empty Raise Rate Min     -> EMPTY          (Max OK)
-  #   rate <= Heavy Boat Raise Rate Max -> HEAVY/Cobalt  (Max BLOCKED — tower)
-  #   in between                       -> LIGHT boat     (Max OK)
+  #   rate >= Empty Raise Rate Min     -> EMPTY          (empty-max Lift shutoff)
+  #   rate <= Heavy Boat Raise Rate Max -> HEAVY/Cobalt  (boat Lift shutoff)
+  #   in between                       -> LIGHT boat     (boat Lift shutoff)
   # Empty ships at 99 (untuned = never empty). Heavy ships tuned for this
   # install (Cobalt ~0.40–0.54 %/s, Crestliner ~0.69 %/s); raise toward Empty
   # on a fresh dock until two loaded baselines exist.
@@ -1264,7 +1271,7 @@ switch:
 
   # ---- Auto-Maintain Height / Auto-Maintain Level (Control — dock-facing keepers) ----
   # rev I: renamed back to Auto-* so the automation is explicit on the page.
-  # Height: Ready/Lift/Lift Max. Level: BOTH the in-move throttle on every go-to
+  # Height: Ready / Lift (boat or empty ceiling). Level: BOTH the in-move throttle on every go-to
   # AND the at-rest correction pulses while parked at Lift. Defaults ON.
   - platform: template
     name: "Auto-Maintain Height"
@@ -1353,8 +1360,7 @@ output:
 # ---------------------------------------------------------------------------
 #  Inputs — buttons emit INTENTS. (No hardware top-limit fitted; raising stops
 #  on the calibrated Top angle + blower watchdog/runtime cap.)
-#  Mode buttons retarget mid-motion (last press wins); Stop cancels to HOLD
-#  while moving, requests Lift Max when idle (roof-guarded).
+#  Mode buttons retarget mid-motion (last press wins); Stop cancels to HOLD.
 #  'inverted: true' => contact-closed reads as true.
 # ---------------------------------------------------------------------------
 binary_sensor:
@@ -1383,7 +1389,7 @@ binary_sensor:
              && id(user_cmd_move);
 
   # ---- boat presence — ON = boat aboard OR unknown (fail-safe occupancy).
-  #      Lift Max roof guard uses Boat Load State (heavy vs light), not this bit alone.
+  #      Lift shutoff uses Boat Load State (empty vs any boat), not this bit alone.
   #      Classified from raise speed only (§5.1); resets to ON at LOWERED_VENT/bypass. ----
   - platform: template
     name: "Boat Present"
@@ -1806,11 +1812,9 @@ text_sensor:
         n += snprintf(b + n, sizeof(b) - n, "  Lift: —");
       }
       if (id(cal_max_done)) {
-        float mt = id(zone_tol_deg).state;
-        n += snprintf(b + n, sizeof(b) - n, "  Max: %.1f..%.1f°",
-                      id(cal_angle_max) - mt, id(cal_angle_max) + mt);
+        n += snprintf(b + n, sizeof(b) - n, "  Empty: %.1f°", id(cal_angle_max));
       } else {
-        n += snprintf(b + n, sizeof(b) - n, "  Max: —");
+        n += snprintf(b + n, sizeof(b) - n, "  Empty: —");
       }
       return std::string(b);
 
@@ -1849,7 +1853,6 @@ text_sensor:
         return std::string("Unknown");
       if (id(pos_at_lowered)) return std::string("Lowered");
       if (id(pos_at_ready))   return std::string("Ready");
-      if (id(pos_at_max))     return std::string("Lifted Max");
       if (id(pos_at_top))     return std::string("Lifted");
       return std::string("Between");
 
@@ -1868,8 +1871,7 @@ text_sensor:
       bool have_pct = id(have_cal) && !std::isnan(pct);
       int s = id(lift_state);
       const char* mn = id(goto_mode) == ${M_LIFT} ? "Lift"
-                     : (id(goto_mode) == ${M_READY} ? "Ready"
-                     : (id(goto_mode) == ${M_LOWER} ? "Lower" : "Lift Max"));
+                     : (id(goto_mode) == ${M_READY} ? "Ready" : "Lower");
       // 1) emergency descent (ADR-013) — outranks everything but shares FAULT's tier
       if (s == ${S_EMERG}) return std::string("EMERGENCY — descending to Ready (level failure)");
       // 1a) fault
@@ -1895,7 +1897,6 @@ text_sensor:
       if (!have_pct) return std::string("Not calibrated");
       if (id(pos_at_lowered))  return std::string("Lowered");
       if (id(pos_at_ready))    return std::string("Ready");
-      if (id(pos_at_max))      return std::string("Lifted (max)");
       if (id(pos_at_top))      return std::string("Lifted");
       if (!std::isnan(id(ready_target_pct))) {
         if (pct < id(ready_target_pct)) return std::string("Between lowered/ready");
@@ -1982,11 +1983,8 @@ text_sensor:
         return std::string("Ready recovery INHIBITED — below safe floor");
       if (id(maintain_block_reason) == 3)
         return std::string("Ready recovery OFF — floor must exceed sag deadband");
-      if (id(maintain_block_reason) == 4)
-        return std::string("Lift Max maintenance OFF — need empty or light boat");
       const char* where = id(visit_pos) == 1 ? "Lift"
-                        : (id(visit_pos) == 2 ? "Ready"
-                        : (id(visit_pos) == 3 ? "Lift Max" : nullptr));
+                        : (id(visit_pos) == 2 ? "Ready" : nullptr);
       if (where == nullptr) return std::string("Not parked at a maintained position");
       char b[96];
       snprintf(b, sizeof(b), "At %s — %d top-ups, %d level fixes — sag %+.2f%%/h",
@@ -2010,7 +2008,7 @@ text_sensor:
 # ---------------------------------------------------------------------------
 button:
   # rev I: order matches the physical dock panel (Lift / Ready / Stop / Lower) so
-  # web and dock share one muscle memory; Lift Max sits last (guarded, rare).
+  # web and dock share one muscle memory.
   - platform: template
     name: "Lift"
     web_server: {sorting_group_id: group_control, sorting_weight: 1}
@@ -2027,10 +2025,6 @@ button:
     name: "Lower"
     web_server: {sorting_group_id: group_control, sorting_weight: 4}
     on_press: {script.execute: request_goto_lowered}
-  - platform: template
-    name: "Lift Max"
-    web_server: {sorting_group_id: group_control, sorting_weight: 5}
-    on_press: {script.execute: request_goto_max}
   # (rev G: the "Reset Fault" button was removed — Stop clears a latched FAULT
   #  and exits BYPASS.)
   # (rev H: Reset Auto-Maintain Lockout removed with the sticky lockout.)
@@ -2050,7 +2044,7 @@ button:
           id(cal_num_top).publish_state(id(cal_angle_up));
           ESP_LOGI("cal", "LIFT set to %.2f deg", id(cal_angle_up));
   - platform: template
-    name: "Calibrate: set LIFT MAX"
+    name: "Calibrate: set EMPTY MAX"
     entity_category: config
     web_server: {sorting_group_id: group_config, sorting_weight: 50}
     on_press:
@@ -2059,7 +2053,7 @@ button:
           id(cal_max_done) = true;
           id(cal_num_max).publish_state(id(cal_angle_max));
           float mt = id(zone_tol_deg).state;
-          ESP_LOGI("cal", "LIFT MAX set to %.2f deg (zone: %.2f .. %.2f)",
+          ESP_LOGI("cal", "EMPTY MAX set to %.2f deg (zone: %.2f .. %.2f)",
                    id(cal_angle_max), id(cal_angle_max) - mt, id(cal_angle_max) + mt);
   - platform: template
     name: "Calibrate: set READY"
@@ -2097,7 +2091,7 @@ button:
           id(cal2_num_top).publish_state(id(cal2_angle_up));
           ESP_LOGI("cal", "SLAVE LIFT set to %.2f deg", id(cal2_angle_up));
   - platform: template
-    name: "Calibrate ${side_slave}: set LIFT MAX"
+    name: "Calibrate ${side_slave}: set EMPTY MAX"
     entity_category: config
     web_server: {sorting_group_id: group_config, sorting_weight: 54}
     on_press:
@@ -2105,7 +2099,7 @@ button:
           id(cal2_angle_max) = id(current_angle2);
           id(cal2_max_done) = true;
           id(cal2_num_max).publish_state(id(cal2_angle_max));
-          ESP_LOGI("cal", "SLAVE LIFT MAX set to %.2f deg", id(cal2_angle_max));
+          ESP_LOGI("cal", "SLAVE EMPTY MAX set to %.2f deg", id(cal2_angle_max));
   - platform: template
     name: "Calibrate ${side_slave}: set READY"
     entity_category: config
@@ -2146,7 +2140,7 @@ select:
     name: "Lift Command"
     id: lift_command_select
     icon: "mdi:swap-vertical-bold"
-    options: ["—", "Lift", "Ready", "Lower", "Lift Max"]
+    options: ["—", "Lift", "Ready", "Lower"]
     update_interval: 1s
     web_server: {sorting_group_id: group_advanced, sorting_weight: 80}
     lambda: |-
@@ -2156,16 +2150,14 @@ select:
           case ${M_LIFT}:  return std::string("Lift");
           case ${M_READY}: return std::string("Ready");
           case ${M_LOWER}: return std::string("Lower");
-          case ${M_MAX}:   return std::string("Lift Max");
         }
       }
       return std::string("—");
     set_action:
       - lambda: |-
-          if      (x == "Lift")     id(request_goto_top)->execute();
-          else if (x == "Ready")    id(request_goto_ready)->execute();
-          else if (x == "Lower")    id(request_goto_lowered)->execute();
-          else if (x == "Lift Max") id(request_goto_max)->execute();
+          if      (x == "Lift")  id(request_goto_top)->execute();
+          else if (x == "Ready") id(request_goto_ready)->execute();
+          else if (x == "Lower") id(request_goto_lowered)->execute();
 
 # ---------------------------------------------------------------------------
 #  Intents (request_*) — validate against state + interlocks, then transition.
@@ -2203,8 +2195,7 @@ script:
 
           bool in_zone = (mode == ${M_LOWER} && id(pos_at_lowered))
                       || (mode == ${M_READY} && id(pos_at_ready))
-                      || (mode == ${M_MAX}   && id(pos_at_max))
-                      || (mode == ${M_LIFT}  && id(pos_at_top));
+                      || (mode == ${M_LIFT}  && !std::isnan(cur) && cur >= target - tol);
           int next_s;
           if (in_zone || !(cur < target - tol || cur > target + tol)) {
             // already there — rest (Lowered keeps the vent open)
@@ -2288,38 +2279,14 @@ script:
       - lambda: |-
           if (id(test_mode)) { ESP_LOGI("fsm","bench test: LIFT press ignored"); return; }
           id(user_cmd_move) = true;   // every request_* caller is a person
-          if (id(angle_trusted)) id(do_goto)->execute(id(top_target_pct).state, ${M_LIFT});
-          else                   id(manual_raise)->execute();
-  - id: request_goto_max        # winter storage — highest out of water; needs max cal + trusted angle
+          if (id(angle_trusted)) {
+            float tgt = id(lift_shutoff_pct);
+            if (std::isnan(tgt)) tgt = id(top_target_pct).state;
+            id(do_goto)->execute(tgt, ${M_LIFT});
+          } else                   id(manual_raise)->execute();
+  - id: request_goto_max        # retired alias — old panel LIFT_MAX / MAX → Lift
     then:
-      - lambda: |-
-          if (id(test_mode)) { ESP_LOGI("fsm","bench test: LIFT MAX press ignored"); return; }
-          id(user_cmd_move) = true;
-          if (!id(angle_trusted)) { ESP_LOGW("fsm","Lift Max needs a trusted angle"); return; }
-          if (!id(cal_max_done)) { ESP_LOGW("fsm","Lift Max not calibrated"); return; }
-          if (!id(have_cal)) return;
-          // ROOF GUARD (rev G): Max ≈148% can put a *tower* boat into the
-          // boathouse roof. Block when Confirmed Cobalt/heavy. Allow when
-          // Confirmed empty or Confirmed other (light) boat. Unknown from a
-          // LOW start may launch — classifier demotes Max→Lift only on a
-          // heavy verdict (or throttle abort). Unknown/heavy from a HIGH
-          // start is hard-blocked (window can't finish before the roof).
-          // (NAN-safe: !(pct<50) blocks when height is unknown.)
-          bool known_heavy = id(boat_load_known) && id(boat_present) && id(boat_heavy);
-          bool max_roof_ok = id(boat_load_known) && (!id(boat_present) || !id(boat_heavy));
-          if (known_heavy) {
-            ESP_LOGW("fsm","Lift Max BLOCKED: Confirmed Cobalt/heavy boat (tower roof guard)");
-            return;
-          }
-          if (!max_roof_ok && !(id(lift_pct) < 50.0f)) {
-            ESP_LOGW("fsm","Lift Max BLOCKED: load unknown and start too high (%.0f%%) for en-route classification", id(lift_pct));
-            return;
-          }
-          if (!max_roof_ok)
-            ESP_LOGW("fsm","Lift Max from low start, load unknown -> classifier decides en route (demotes to Lift on Cobalt/heavy)");
-          float span = id(cal_angle_up) - id(cal_angle_down);
-          float mp = (id(cal_angle_max) - id(cal_angle_down)) / span * 100.0f;
-          id(do_goto)->execute(mp, ${M_MAX});
+      - script.execute: request_goto_top
   - id: request_goto_lowered
     then:
       - lambda: |-
@@ -2630,6 +2597,19 @@ interval:
                       ? id(zone_tol_deg).state / fabs(span) * 100.0f : 0.0f;
           id(ready_target_pct) = (id(have_cal) && id(cal_float_done))
                       ? (id(cal_angle_float) - id(cal_angle_down)) / span * 100.0f : NAN;
+          // Lift shutoff: confirmed empty uses Empty Max; any boat / unknown uses
+          // the boat (Cobalt) ceiling. Lift Target % is the always-reach fraction.
+          if (id(have_cal)) {
+            float frac = id(top_target_pct).state / 100.0f;
+            float boat_tgt = id(top_target_pct).state;
+            float empty_tgt = boat_tgt;
+            if (id(cal_max_done) && fabs(span) > 0.5f)
+              empty_tgt = (id(cal_angle_max) - id(cal_angle_down)) / span * 100.0f * frac;
+            bool empty = id(boat_load_known) && !id(boat_present);
+            id(lift_shutoff_pct) = empty ? empty_tgt : boat_tgt;
+          } else {
+            id(lift_shutoff_pct) = NAN;
+          }
 
           // ---- angle TRUST: valid AND within the calibrated arm range (+ margin) ----
           bool x_plausible = true;
@@ -2785,9 +2765,11 @@ interval:
               const unsigned long FEED_MS = 45000UL;
               const unsigned long VENT_MS = 10000UL;
               const unsigned long REST_GAP_MS = 60000UL;  // min off-time between pulses
-              bool at_lift_only = (s0 == ${S_HOLD}) && id(pos_at_top) && !id(pos_at_max);
+              bool at_lift_only = (s0 == ${S_HOLD}) && id(pos_at_top);
+              float lift_sp = std::isnan(id(lift_shutoff_pct))
+                            ? id(top_target_pct).state : id(lift_shutoff_pct);
               bool height_ok = !std::isnan(id(lift_pct))
-                               && id(lift_pct) >= id(top_target_pct).state
+                               && id(lift_pct) >= lift_sp
                                               - id(maintain_sag_deadband).state;
               bool lvl_on = id(auto_level_switch).state && !id(test_mode);
 
@@ -2798,7 +2780,7 @@ interval:
                 bool timed_out = (now - id(rest_pulse_since)) >= lim;
                 // vent floor: never trade Lift height away
                 if (id(rest_pulse) >= 3 && !std::isnan(id(lift_pct))
-                    && id(lift_pct) < id(top_target_pct).state - id(zone_tol_pct)) {
+                    && id(lift_pct) < lift_sp - id(zone_tol_pct)) {
                   abort = true;
                   ESP_LOGW("level", "REST-LEVEL: vent aborted (height floor)");
                 }
@@ -2836,7 +2818,7 @@ interval:
                              || (now - id(rest_last_pulse_ms)) >= REST_GAP_MS;
                   if ((now - id(rest_level_below_since)) >= persist_ms && gap_ok) {
                     bool slave_high = id(level_err_filt) > 0.0f;
-                    bool at_or_below = id(lift_pct) <= id(top_target_pct).state;
+                    bool at_or_below = id(lift_pct) <= lift_sp;
                     int want = at_or_below ? (slave_high ? 1 : 2)   // feed LOW
                                            : (slave_high ? 3 : 4);  // vent HIGH
                     id(rest_pulse) = want;
@@ -2951,10 +2933,8 @@ interval:
             // (previous latch holds). Classifies once per raise.
             {
               const float PRESENCE_WINDOW = 15.0f;   // %-points timed before deciding
-              bool demote_max = false;               // heavy verdict OR throttle abort
               if (!id(presence_classified) && id(level_throttle) == 2) {
                 id(presence_classified) = true;      // master rate inflated -> unusable
-                demote_max = true;                   // fail-safe: don't continue Max
                 ESP_LOGI("presence", "slave-side throttle mid-window -> classification aborted (latch holds)");
               }
               if (!id(presence_classified) && !id(manual_move) && id(angle_valid)
@@ -2969,20 +2949,32 @@ interval:
                   id(boat_present) = !empty;
                   id(boat_heavy) = empty ? false : heavy;
                   id(boat_load_known) = true;
-                  if (heavy) demote_max = true;
                   const char* band = empty ? "EMPTY" : (heavy ? "COBALT/HEAVY" : "OTHER/LIGHT");
                   ESP_LOGI("presence", "raise %.1f%% in %.1fs = %.2f %%/s -> %s (heavy <= %.2f, empty >= %.2f)",
                            climb, dt, rate, band,
                            id(heavy_raise_rate_max).state, id(empty_raise_rate_min).state);
                 }
               }
-              // in-flight roof guard: demote Max→Lift only on Cobalt/heavy or
-              // classification abort — light boat and empty continue to Max.
-              if (demote_max && id(goto_mode) == ${M_MAX}) {
-                id(goto_target_pct) = id(top_target_pct).state;
-                id(goto_mode) = ${M_LIFT};
-                ESP_LOGW("presence", "Max demoted to Lift %.0f%% (Cobalt/heavy or class abort — roof guard)",
-                         id(goto_target_pct));
+              // Recompute shutoff after this tick's verdict, then retarget Lift.
+              // Empty may raise the target mid-move; any boat / unknown stays
+              // on the boat ceiling (fail-safe).
+              if (id(have_cal)) {
+                float frac = id(top_target_pct).state / 100.0f;
+                float boat_tgt = id(top_target_pct).state;
+                float empty_tgt = boat_tgt;
+                float spn = id(cal_angle_up) - id(cal_angle_down);
+                if (id(cal_max_done) && fabs(spn) > 0.5f)
+                  empty_tgt = (id(cal_angle_max) - id(cal_angle_down)) / spn * 100.0f * frac;
+                bool empty = id(boat_load_known) && !id(boat_present);
+                id(lift_shutoff_pct) = empty ? empty_tgt : boat_tgt;
+              }
+              if (id(goto_mode) == ${M_LIFT} && !id(manual_move)
+                  && !std::isnan(id(lift_shutoff_pct))
+                  && fabs(id(goto_target_pct) - id(lift_shutoff_pct)) > 0.5f) {
+                ESP_LOGI("presence", "Lift shutoff %.0f%% -> %.0f%% (%s)",
+                         id(goto_target_pct), id(lift_shutoff_pct),
+                         (id(boat_load_known) && !id(boat_present)) ? "empty" : "boat");
+                id(goto_target_pct) = id(lift_shutoff_pct);
               }
             }
             // target stop: calibrated angle (no hardware top-limit fitted)
@@ -2990,7 +2982,6 @@ interval:
               bool reached = false;
               if (id(goto_mode) == ${M_LOWER} && id(pos_at_lowered)) reached = true;
               else if (id(goto_mode) == ${M_READY} && id(pos_at_ready)) reached = true;
-              else if (id(goto_mode) == ${M_MAX} && id(pos_at_max)) reached = true;
               else if (id(angle_valid) && !std::isnan(pct) && pct >= id(goto_target_pct)) reached = true;
               // Two-sided completion: master at target, but the slave must be
               // inside the level band too — the throttle (master valve closed)
@@ -3023,7 +3014,6 @@ interval:
             bool at_target = false;
             if (id(goto_mode) == ${M_LOWER} && id(pos_at_lowered)) at_target = true;
             else if (id(goto_mode) == ${M_READY} && id(pos_at_ready)) at_target = true;
-            else if (id(goto_mode) == ${M_MAX} && id(pos_at_max)) at_target = true;
             else if (id(angle_valid) && !std::isnan(pct) && pct <= id(goto_target_pct)) at_target = true;
             unsigned long lt_ms = (unsigned long)(id(lower_timeout_minutes).state * 60000.0f);
             if (at_target) {
@@ -3137,15 +3127,6 @@ interval:
               } else {
                 id(presence_start_pct) = NAN;
                 id(presence_classified) = true;
-                // Max launch whose classifier can't arm (angle blip at start)
-                // must not sail up unclassified unless load is already known
-                // roof-safe (empty or light boat).
-                if (cs == ${S_RAISING} && id(goto_mode) == ${M_MAX}
-                    && !(id(boat_load_known) && (!id(boat_present) || !id(boat_heavy)))) {
-                  id(goto_target_pct) = id(top_target_pct).state;
-                  id(goto_mode) = ${M_LIFT};
-                  ESP_LOGW("presence", "Max launch without classifier arm -> demoted to Lift (roof guard)");
-                }
               }
               ESP_LOGI("move", "%s %s angle=%.2f° mode=%d manual=%d",
                        (ps_move && ps != cs) ? "REDIRECT" : "START",
@@ -3164,7 +3145,7 @@ interval:
       - script.execute: apply_outputs
 
   # ---- MAINTAIN HEIGHT observer + actuator ----
-  # Measures wave amplitude + sag rate. Confirmed sag at Ready / Lift / Lift Max
+  # Measures wave amplitude + sag rate. Confirmed sag at Ready / Lift
   # fires a real top-up via do_goto when Maintain Height is ON. No sticky lockout.
   # Per-visit counters reset when arriving at a new maintained position.
   - interval: 250ms
@@ -3252,12 +3233,11 @@ interval:
             id(air_alert) = on;
           }
 
-          // ---- visit + height-arm at Ready / Lift / Lift Max (Max preferred over Lift) ----
+          // ---- visit + height-arm at Ready / Lift ----
           float ready_pct = id(ready_target_pct);
-          bool at_max   = good && id(pos_at_max);
-          bool at_top   = good && id(pos_at_top) && !id(pos_at_max);
+          bool at_top   = good && id(pos_at_top);
           bool at_ready = good && id(pos_at_ready);
-          int zone = at_max ? 3 : (at_top ? 1 : (at_ready ? 2 : 0));
+          int zone = at_top ? 1 : (at_ready ? 2 : 0);
           int s = id(lift_state);
           bool resting = (s == ${S_HOLD});
           int prev_maintain_block = id(maintain_block_reason);
@@ -3270,7 +3250,7 @@ interval:
             id(visit_height_count) = 0;
             id(visit_level_count) = 0;
             ESP_LOGI("maintain", "visit start at %s",
-                     zone == 1 ? "Lift" : zone == 2 ? "Ready" : "Lift Max");
+                     zone == 1 ? "Lift" : "Ready");
           } else if (resting && zone == 0 && id(visit_pos) != 0) {
             ESP_LOGI("maintain", "visit end (left maintained zone)");
             id(visit_pos) = 0;   // counts frozen on Maintain Observe until next visit
@@ -3278,7 +3258,9 @@ interval:
 
           // Height arm only while HOLD + trusted (rest-level pulse aborts on height sag above)
           if (id(rest_pulse) != 0 && good && id(obs_height_filt) > -900.0f && zone == 1) {
-            if (id(obs_height_filt) < id(top_target_pct).state - id(maintain_sag_deadband).state) {
+            float lift_sp = std::isnan(id(lift_shutoff_pct))
+                          ? id(top_target_pct).state : id(lift_shutoff_pct);
+            if (id(obs_height_filt) < lift_sp - id(maintain_sag_deadband).state) {
               ESP_LOGW("maintain", "height sag during rest pulse -> abort pulse, yield to height");
               id(rest_pulse) = 0;
             }
@@ -3290,17 +3272,7 @@ interval:
           }
 
           if (id(obs_arm_mode) == 0) {
-            if (zone == 3) {
-              // Max height keep: empty OR light boat (Crestliner). Cobalt/heavy blocked.
-              if (id(boat_load_known) && (!id(boat_present) || !id(boat_heavy))) {
-                id(obs_arm_mode) = 3; id(obs_settled_since) = now; id(obs_below_since) = 0;
-              } else {
-                id(maintain_block_reason) = 4;
-                if (prev_maintain_block != 4)
-                  ESP_LOGW("maintain", "Lift Max maintenance OFF: need confirmed empty or light boat");
-              }
-            }
-            else if (zone == 1) { id(obs_arm_mode) = 1; id(obs_settled_since) = now; id(obs_below_since) = 0; }
+            if (zone == 1) { id(obs_arm_mode) = 1; id(obs_settled_since) = now; id(obs_below_since) = 0; }
             else if (zone == 2) {
               if (id(boat_load_known) && id(boat_present)) {
                 id(obs_arm_mode) = 2; id(obs_settled_since) = now; id(obs_below_since) = 0;
@@ -3315,10 +3287,8 @@ interval:
 
           float setpoint = ready_pct;
           if (id(obs_arm_mode) == 1) {
-            setpoint = id(top_target_pct).state;
-          } else if (id(obs_arm_mode) == 3) {
-            float span = id(cal_angle_up) - id(cal_angle_down);
-            setpoint = (id(cal_angle_max) - id(cal_angle_down)) / span * 100.0f;
+            setpoint = std::isnan(id(lift_shutoff_pct))
+                     ? id(top_target_pct).state : id(lift_shutoff_pct);
           }
           // Ready is the only maintained height close to the floating posture.
           // It requires a positive loaded classification and may only recover
@@ -3351,14 +3321,6 @@ interval:
               return;
             }
           }
-          if (id(obs_arm_mode) == 3
-              && !(id(boat_load_known) && (!id(boat_present) || !id(boat_heavy)))) {
-            id(maintain_block_reason) = 4;
-            id(obs_below_since) = 0;
-            if (prev_maintain_block != 4)
-              ESP_LOGW("maintain", "Lift Max maintenance OFF: empty/light load state lost");
-            return;
-          }
           unsigned long settle_ms = (unsigned long)(id(maintain_settle_seconds).state * 1000.0f);
           bool settled = (now - id(obs_settled_since)) >= settle_ms;
           bool below = settled && (id(obs_height_filt) > -900.0f)
@@ -3374,16 +3336,14 @@ interval:
           id(obs_shadow_count)++;
           id(obs_last_shadow) = now;
           id(obs_below_since) = 0;
-          const char* where = id(obs_arm_mode) == 1 ? "Lift"
-                            : (id(obs_arm_mode) == 3 ? "Lift Max" : "Ready");
+          const char* where = id(obs_arm_mode) == 1 ? "Lift" : "Ready";
           ESP_LOGW("maintain", "top-up #%d at %s (filt %.1f%% < %.1f%% - %.1f)",
                    id(obs_shadow_count), where,
                    id(obs_height_filt), setpoint, id(maintain_sag_deadband).state);
 
           // Real top-up when Maintain Height is ON — no lockout; visit counter only.
           if (id(auto_maintain_switch).state && !id(test_mode) && id(lift_state) == ${S_HOLD}) {
-            int md = (id(obs_arm_mode) == 1) ? ${M_LIFT}
-                   : (id(obs_arm_mode) == 3) ? ${M_MAX} : ${M_READY};
+            int md = (id(obs_arm_mode) == 1) ? ${M_LIFT} : ${M_READY};
             id(obs_act_count)++;
             id(visit_height_count)++;
             id(rest_pulse) = 0;   // height owns the move
@@ -3416,7 +3376,6 @@ interval:
           else if (have && id(angle_trusted) && !std::isnan(pct)) {   // HOLD: resting position
             if (id(pos_at_lowered))       st = "LOWERED";
             else if (id(pos_at_ready))    st = "READY";
-            else if (id(pos_at_max))      st = "LIFTED_MAX";
             else if (id(pos_at_top))      st = "LIFTED";
             else if (!std::isnan(id(ready_target_pct)))
               st = (pct < id(ready_target_pct)) ? "BETWEEN_LOWERED_READY" : "BETWEEN_READY_LIFTED";
@@ -3450,7 +3409,7 @@ interval:
                   if (e != std::string::npos) req = req.substr(0, e);
                   ESP_LOGI("link", "RX CMD req=%s", req.c_str());
                   if      (req == "LIFT" || req == "TOP")              id(request_goto_top)->execute();
-                  else if (req == "LIFT_MAX" || req == "MAX")          id(request_goto_max)->execute();
+                  else if (req == "LIFT_MAX" || req == "MAX")          id(request_goto_top)->execute();
                   else if (req == "READY")      id(request_goto_ready)->execute();
                   else if (req == "LOWER" || req == "LOWERED")         id(request_goto_lowered)->execute();
                   else if (req == "STOP")       id(request_stop)->execute();

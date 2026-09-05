@@ -18,7 +18,7 @@
 #
 #  Link protocol (implemented on the lift; human-readable key=value, ignore-unknown):
 #    Lift -> Panel : STA v=1 st=RAISING h=63 prob=0 trust=1 water=18.4 msg=...
-#    Panel -> Lift : CMD v=1 req=LOWER|READY|LIFT|LIFT_MAX|STOP|RESET|BYPASS_ON|BYPASS_OFF
+#    Panel -> Lift : CMD v=1 req=LOWER|READY|LIFT|STOP|RESET|BYPASS_ON|BYPASS_OFF
 #
 #  Hardware (confirmed by I2C scan 2026-06-20):
 #    - ESP32-S3-Touch-LCD-4B with a CH422G IO expander (probes at 0x3C; the
@@ -451,10 +451,10 @@ interval:
               if (s == "EMERG_DESCEND") return std::string("EMERGENCY");
               if (s == "RAISING")  return std::string("RAISING");
               if (s == "LOWERING") return std::string("LOWERING");
-              if (s == "LIFTED" || s == "TOP")          return std::string("LIFTED");
+              if (s == "LIFTED" || s == "TOP" || s == "LIFTED_MAX" || s == "LIFT_MAX")
+                                                    return std::string("LIFTED");
               if (s == "READY")                         return std::string("READY");
               if (s == "LOWERED")                       return std::string("LOWERED");
-              if (s == "LIFTED_MAX" || s == "LIFT_MAX") return std::string("LIFTED MAX");
               if (s == "BETWEEN_LOWERED_READY")         return std::string("LOWERED/READY");
               if (s == "BETWEEN_READY_LIFTED")          return std::string("READY/LIFTED");
               return std::string("HOLDING");

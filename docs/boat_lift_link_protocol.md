@@ -134,8 +134,7 @@ CMD v=1 req=LIFT
 |---|---|---|
 | `LOWER` | `request_goto_lowered` | go-to Lower setpoint |
 | `READY` | `request_goto_ready` | go-to Ready setpoint |
-| `LIFT` | `request_goto_top` | go-to Lift setpoint |
-| `LIFT_MAX` | `request_goto_max` | go-to Lift Max setpoint |
+| `LIFT` | `request_goto_top` | go-to Lift (load-selected shutoff) |
 | `STOP` | `request_stop` | always honoured; no confirm |
 | `RESET` | `request_reset` | clear a latched FAULT (panel gates behind a confirm) |
 | `BYPASS_ON` | `enter_bypass` | deliberate hands-off override (design doc §6.6) |
@@ -145,7 +144,7 @@ The lift validates **every** `CMD` exactly as if it were a dock-button press —
 same interlocks, same refusals. A `CMD` is never a direct output command.
 
 Backward-compat aliases are accepted during migration: `TOP` -> `LIFT`,
-`MAX` -> `LIFT_MAX`, and `LOWERED` -> `LOWER`.
+`LIFT_MAX` / `MAX` -> `LIFT`, and `LOWERED` -> `LOWER`.
 
 Unknown `req=` value → the lift ignores it (rule 3).
 
@@ -166,7 +165,6 @@ full human text always comes in `msg=`.
 | `READY` | resting at Ready | "READY" |
 | `BETWEEN_READY_LIFTED` | between Ready and Lifted | "READY/LIFTED" |
 | `LIFTED` | resting at Lifted | "LIFTED" |
-| `LIFTED_MAX` | resting at Lift Max | "LIFTED MAX" |
 | `BYPASS` | bypass override active | full-screen BYPASS lock |
 | `FAULT` | latched fault | "ERROR" + reset affordance |
 | `EMERG_DESCEND` | emergency descent to Ready (level divergence, ADR-013); `prob=1` rides along | "EMERGENCY" |

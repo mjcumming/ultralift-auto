@@ -15,7 +15,7 @@ Automate a dual-tank HydroHoist UltraLift so an operator (or Home Assistant) can
 - Picks raise vs lower automatically
 - Steers air per tank to keep the cradle level while moving
 - Holds parked height (and, at Lift, level) against slow air loss
-- Infers boat presence from raise physics to guard the roof-clearance setpoint
+- Infers boat presence from raise physics to pick the Lift shutoff (boat vs empty)
 - Exposes status for HA automations without putting HA in the safety loop
 
 ---
@@ -114,35 +114,41 @@ A small **go-to-position FSM** beneath an always-on **safety supervisor** that c
 
 ## 5. Position Modes & Setpoints
 
-Four **calibrated setpoints**, each a target the lift can be sent to:
+Three **calibrated setpoints**, each a target the lift can be sent to:
 
 | Mode | Button (LED) | Position | Setpoint |
 |---|---|---|---|
-| **Lift** | White | Everyday stored position | **`Lift Target %`** (default 98 % of the calibrated span — a percent target, not a captured zone) |
-| **Lift Max** | *(HA/web/panel)* | Maximum out of water, beyond Lift | `cal_max` (captured angle) |
+| **Lift** | White | Everyday stored position | load-selected shutoff: **boat ceiling** or **empty ceiling**, each approached to `Lift Target %` |
 | **Ready** | Orange | Almost down — lowered, not yet floating | `cal_ready` (captured angle) |
 | **Lowered** | Green | All the way down (boat floating free) | `cal_lowered` (~0 %) |
 
-Plus red **Stop** (§6.3): cancels motion and commands safe outputs in every operating state. Height % is derived linearly between `cal_lift` (100 %) and `cal_lowered` (0 %); Ready and Lift Max are captured as their own angles. **Naming:** buttons/UI say *Lift / Ready / Lower*; firmware internal calibration ids remain `up` / `float` / `down` / `max` for flash-persistence compatibility.
+Plus red **Stop** (§6.3): cancels motion and commands safe outputs in every operating state. Height % is derived linearly between `cal_lift` (100 % — max with the heavy boat) and `cal_lowered` (0 %); Ready is its own angle; `cal_max` is the empty-lift ceiling, not a mode. **Naming:** buttons/UI say *Lift / Ready / Lower*; firmware internal calibration ids remain `up` / `float` / `down` / `max` for flash-persistence compatibility.
 
-The **current resting mode** is derived from the live angle vs each setpoint (within the Zone Tolerance band, §6.2): *Lifted (max) / Lifted / Ready / Lowered / Between*.
+The **current resting mode** is derived from the live angle vs each setpoint (within the Zone Tolerance band, §6.2): *Lifted / Ready / Lowered / Between*.
 
-### 5.1 Boat-presence classifier + Lift Max roof guard
+### 5.1 Boat-presence classifier + two Lift shutoffs
 
-**Why:** Lift Max (~148 % of the everyday span) can drive a **tower** boat into a boathouse roof. Empty lifts and low-profile boats (no tower) may use Max; the Cobalt-class boat must not.
+**Why:** A loaded lift cannot reach the empty-tank ceiling (more weight → lower equilibrium). Targeting the exact captured “as high as today” angle fails on a heavier day (stall / blower cap). Lift is one command with two shutoffs:
+
+| Load | Ceiling (captured angle) | Lift parks at |
+|---|---|---|
+| Confirmed empty | `cal_max` (empty max) | `Lift Target %` of that span |
+| Any boat or unknown | `cal_lift` (max with Cobalt) | `Lift Target %` of the boat span |
+
+`Lift Target %` (default **97**) is the always-reach fraction — stop short of the captured ceiling so weight variation still arrives. Unknown is fail-safe boat.
 
 **How:** presence is classified on **raise cycles only**, from the early climb rate over the first 15 %-points (three bands):
 
-| Band | Rate (this install) | `Boat Load State` | Lift Max |
+| Band | Rate (this install) | `Boat Load State` | Lift shutoff |
 |---|---|---|---|
-| Empty | ≥ `Empty Raise Rate Min` (**1.20 %/s**) | Confirmed empty | allowed |
-| Light / other | between the two sliders (Crestliner ~**0.69 %/s**) | Confirmed other boat | allowed |
-| Heavy / Cobalt | ≤ `Heavy Boat Raise Rate Max` (**0.60 %/s**; Cobalt ~**0.40–0.54 %/s**) | Confirmed Cobalt | **blocked** |
-| Unknown | no clean raise yet | Unknown | blocked from high; may decide en route from low |
+| Empty | ≥ `Empty Raise Rate Min` (**1.20 %/s**) | Confirmed empty | empty ceiling |
+| Light / other | between the two sliders (Crestliner ~**0.69 %/s**) | Confirmed other boat | boat ceiling |
+| Heavy / Cobalt | ≤ `Heavy Boat Raise Rate Max` (**0.60 %/s**; Cobalt ~**0.40–0.54 %/s**) | Confirmed Cobalt | boat ceiling |
+| Unknown | no clean raise yet | Unknown | boat ceiling |
 
 `Boat Present` stays fail-safe ON for boat-or-unknown. Both the occupancy latch and the heavy/light class persist across reboots and reset to unknown / presumed-heavy wherever the boat could change (LOWERED_VENT, bypass entry).
 
-**Decide en route:** a Max press from a LOW start (<50 %) with load unknown may launch — the classifier resolves on the way up and demotes Max → Lift only on a **Cobalt/heavy** verdict (or a slave-throttle classification abort). A confirmed light boat or empty continues to Max. Confirmed Cobalt is always refused. Unknown high starts stay hard-blocked. Ready still requires any confirmed boat (light or heavy); confirmed-empty Ready is refused. Leveling interaction unchanged: slave-side throttle mid-window aborts classification.
+**Decide en route:** Lift from unknown starts toward the **boat** ceiling. A later empty verdict raises the target to the empty ceiling mid-move. A boat verdict (or a slave-throttle classification abort) keeps the boat ceiling. Manual Ready remains authoritative; only unattended Ready recovery requires a confirmed boat. Leveling interaction unchanged: slave-side throttle mid-window aborts classification.
 
 A `Boat Present` occupancy sensor exposes the latch. Display-only `Bunk Height` reports estimated inches relative to the waterline from arm geometry, anchored to the surveyed true-Lowered datum of −13 in.
 
@@ -159,7 +165,7 @@ Pressing a mode button sends the lift to that setpoint; the controller **chooses
 | **HOLD** | OFF | CLOSED | Resting (at a mode, or between). |
 | **RAISING** | ON | OPEN / throttled | Pumping air in; rising toward target. Blower + valves energize **together**. |
 | **LOWERING** | OFF | OPEN / throttled | Venting; descending toward target. |
-| **LOWERED_VENT** | OFF | **OPEN** | Resting at Lowered with vents left open — the lift keeps settling indefinitely. New commands accepted. **The vent stays open at the bottom, always** (a standing supervisor rule re-enters LOWERED_VENT from any HOLD settled in the Lowered zone; a latched FAULT still seals). Idle red here requests Lift Max (§6.3). |
+| **LOWERED_VENT** | OFF | **OPEN** | Resting at Lowered with vents left open — the lift keeps settling indefinitely. New commands accepted. **The vent stays open at the bottom, always** (a standing supervisor rule re-enters LOWERED_VENT from any HOLD settled in the Lowered zone; a latched FAULT still seals). |
 | **FAULT** | OFF | CLOSED | Latched safe state + reason. |
 | **BYPASS** | OFF | **OPEN** | Manual override (§6.6): valves open, blower off, FSM idle. |
 | **EMERG_DESCEND** | OFF | **OPEN** (ganged) | Emergency descent (§16.3, ADR-013): level divergence with the boat high — vent both sides down to Ready, then seal into FAULT. Stop = seal now; mode buttons refused. |
@@ -171,20 +177,20 @@ Pressing a mode button sends the lift to that setpoint; the controller **chooses
 Accepted from **rest** (HOLD / LOWERED_VENT) **or mid-move** (RAISING / LOWERING) — last mode press wins. Red is always the cancel path (→ HOLD with safe outputs). FAULT / BYPASS refuse go-to.
 
 ```
-target = setpoint(mode)                 # Lift Target % / cal_max / cal_ready / cal_lowered
+target = setpoint(mode)                 # load-selected Lift shutoff / cal_ready / cal_lowered
 if  height < target - tol:  raise  ->  RAISING   (blower + valves ON together)
 elif height > target + tol: lower  ->  LOWERING  (valves ON, blower off)
 else:                       already there -> HOLD (or LOWERED_VENT for Lowered)
 ```
 
-So **Ready (and Lift Max) are reachable from above or below**, and a mid-move press may **reverse** direction if the new target is on the other side of the live height.
+So **Ready is reachable from above or below**, and a mid-move press may **reverse** direction if the new target is on the other side of the live height. Lift is one-sided: at or above the load-selected shutoff counts as there (it will not lower an empty lift that is already past the boat ceiling).
 
 Same-direction retarget only updates the destination (stall / blower / presence trackers keep running). A reverse (raise↔lower) re-arms the move-scoped timers and, on a fresh raise, the boat-presence classifier.
 
 Position checks use **one captured setpoint per mode + one configurable band**: **`Zone Tolerance (°)`**. The band defines both "already there" and "at mode":
 - **Lowered:** one-sided — angle > `cal_lowered` − tol (at the lowered cal *or settled beyond it*; valid for the confirmed sensor sign, §2.2).
-- **Ready / Lift Max:** captured angle ± tol.
-- **Lift:** height ≥ `Lift Target %` − tol (tolerance converted °→% through the calibrated span).
+- **Ready:** captured angle ± tol.
+- **Lift:** height ≥ boat `Lift Target %` − tol (tolerance converted °→% through the calibrated span). Empty parked above that is still Lifted.
 
 ### 6.3 Stopping
 
@@ -274,7 +280,7 @@ Future option (not done): use end-stops as stuck-valve fault triggers.
 ### 9.2 Roll-up entities (status trio)
 
 - **`Lift Activity`** *(machine-friendly — what the lift is DOING)*: exactly one of `Idle / Raising / Lowering / Leveling / Fault / Bypass / Emergency Descent`. `LOWERED_VENT` reads as `Idle`.
-- **`Lift Position`** *(machine-friendly — WHERE it is)*: exactly one of `Lowered / Ready / Lifted / Lifted Max / Between / Unknown`.
+- **`Lift Position`** *(machine-friendly — WHERE it is)*: exactly one of `Lowered / Ready / Lifted / Between / Unknown`.
 - **`Lift Status`** *(human-readable line, feeds the panel `msg=`; shown as the **headline at the top of the web Control group**)* via a priority ladder:
   1. `EMERGENCY — descending to Ready (level failure)` (ADR-013)
   2. `FAULT — <reason>`
@@ -284,7 +290,7 @@ Future option (not done): use end-stops as stuck-valve fault triggers.
   6. `Manual valve` (feedback disagrees with closed command, §7.1)
   7. `Angle sensor OFFLINE — manual control` / `Angle OUT OF RANGE — manual control`
   8. `Not calibrated`
-  9. Resting → `Lowered`, `Ready`, `Lifted`, `Lifted (max)`, `Between …`, or `Holding`
+  9. Resting → `Lowered`, `Ready`, `Lifted`, `Between …`, or `Holding`
 
 Short tokens exist for **exact-match Home Assistant automations**. Embedding a live percentage in status floods the HA recorder.
 
@@ -293,7 +299,7 @@ Short tokens exist for **exact-match Home Assistant automations**. Embedding a l
 
 ### 9.2b HA command entity
 
-**`Lift Command`** (select: `— / Lift / Ready / Lower / Lift Max`) — the declarative control for HA automations and scenes: setting an option fires the same `request_*` intent as the matching button, so every interlock applies. Shows the destination while a user-commanded move runs, rests at `—` (a no-op option) so re-selecting always fires. A cover entity was considered and rejected — see ADR-014.
+**`Lift Command`** (select: `— / Lift / Ready / Lower`) — the declarative control for HA automations and scenes: setting an option fires the same `request_*` intent as the matching button, so every interlock applies. Shows the destination while a user-commanded move runs, rests at `—` (a no-op option) so re-selecting always fires. A cover entity was considered and rejected — see ADR-014.
 
 ### 9.3 UI tiers (web_server sorting groups)
 
@@ -318,8 +324,8 @@ Size the `angle_valid` gate to the *mounted* sensor. With the confirmed mounting
 
 ## 10. Calibration & Persistence
 
-- **Four master captures** on the lift: **Lift**, **Lift Max**, **Ready**, **Lowered** — each records the current master angle. Positions are setpoints plus the `Zone Tolerance` band.
-- **Four slave captures** at the same physical positions (Lowered / Ready / Lift / Lift Max). Lowered and Lift calibrate the slave's height %, Ready records the shared posture, and Lift Max extends the slave plausibility range through the full mechanical stroke (§16.2).
+- **Four master captures** on the lift: **Lift** (max with boat), **Empty Max**, **Ready**, **Lowered** — each records the current master angle. Lift / Ready / Lowered are modes; Empty Max is the no-boat Lift ceiling and the upper plausibility bound, not a destination.
+- **Four slave captures** at the same physical positions (Lowered / Ready / Lift / Empty Max). Lowered and Lift calibrate the slave's height %, Ready records the shared posture, and Empty Max extends the slave plausibility range through the full mechanical stroke (§16.2).
 - Each capture is also an **editable number** (Advanced Tuning) so a setpoint can be nudged or restored without re-running the lift. A **Calibration Summary** line shows every zone edge.
 - Height % is linear between Lift and Lowered (negative span — lowered is the *high* angle, §2.2).
 - Stored in flash (`restore_value: yes`).
@@ -407,11 +413,9 @@ Hold the lift at its parked setpoint against slow air loss (**height**) and, at 
 
 | Parked position / load | Maintain Height | Maintain Level (at-rest) |
 |---|---|---|
-| **Lift / any load** | yes | **yes** (feed-low / vent-high pulses) |
+| **Lift / any load** | yes (to the load-selected shutoff) | **yes** (feed-low / vent-high pulses) |
 | **Ready / confirmed boat** | yes, bounded | no |
 | **Ready / empty or unknown** | no | no |
-| **Lift Max / confirmed empty or light boat** | yes | no |
-| **Lift Max / Cobalt/heavy or unknown** | prohibited | no |
 | **Lowered / any load** | never | never |
 
 In-move throttle follows **Maintain Level** during any go-to, not only at Lift.
@@ -419,7 +423,7 @@ In-move throttle follows **Maintain Level** during any go-to, not only at Lift.
 ### 15.2 Height keeper
 
 - **Observer always runs:** filters height, estimates sag rate and wave movement.
-- **`Auto-Maintain Height`** (default ON): confirmed sag fires a **real top-up through `do_goto()`**. Arms while idle at Lift, roof-safe Lift Max (confirmed empty or light boat), or load-confirmed Ready. Detector: settle delay → filtered height below `setpoint − deadband` for persist time → min interval between top-ups. Defaults: sag deadband **3 %**, settle 180 s, persist 60 s, min interval 12 min.
+- **`Auto-Maintain Height`** (default ON): confirmed sag fires a **real top-up through `do_goto()`**. Arms while idle at Lift (boat or empty shutoff) or load-confirmed Ready. Detector: settle delay → filtered height below `setpoint − deadband` for persist time → min interval between top-ups. Defaults: sag deadband **3 %**, settle 180 s, persist 60 s, min interval 12 min.
 - **Ready recovery envelope:** automatic Ready inflation is permitted only while both live and filtered height remain no more than **5 %** below Ready. Below that floor—or without a positive loaded classification—recovery is inhibited and surfaced in `Maintain Observe`; it never guesses that a potentially floating/shifted boat is safe to pick up.
 - **Up-only** — never auto-lowers.
 - **Priority over rest-level:** if master height is below the sag deadband, any rest-level pulse aborts and height owns the recovery.
@@ -439,7 +443,7 @@ In-move throttle follows **Maintain Level** during any go-to, not only at Lift.
 
 - **Notify immediately:** Lift Problem on; latched fault; angle offline/out of range; blower-cap or stall; level divergence hard stop.
 - **Notify as warning:** high visit top-up or level counts; unusually negative sag rate.
-- **Never auto-correct:** unknown position; untrusted angle; lowered/floating state; list at Ready or Lift Max (height only there).
+- **Never auto-correct:** unknown position; untrusted angle; lowered/floating state; list at Ready (height only there).
 
 ### 15.5 Air Loss Alert
 
@@ -456,7 +460,7 @@ Catches seal failure, a manually opened valve, the §14.2 compression spiral, an
 ### 15.6 Baselines to record at commissioning
 
 - Lift / lower time with and without boat
-- Normal top-up duration and overnight visit counts at Lift / Ready / Max
+- Normal top-up duration and overnight visit counts at Lift / Ready
 - Idle sag rate, wave peak-to-peak, and level-error range at rest
 
 ---
@@ -502,7 +506,7 @@ Anti-chatter: level error is EMA-filtered (~3 s); throttle engages above deadban
 
 ### 16.5 At-rest leveling — at Lift only
 
-While parked at **Lift**, a list is corrected by the at-rest keeper. Ready and Lift Max are **height-only**.
+While parked at **Lift**, a list is corrected by the at-rest keeper. Ready is **height-only**.
 
 **Direction rule:** if reference height is at or below target → **feed air to the low side**; if reference is above target with a list → **vent the high side**.
 
@@ -519,7 +523,7 @@ While parked at **Lift**, a list is corrected by the at-rest keeper. Ready and L
 
 ### 16.6 FSM interactions
 
-- **Two-sided completion:** Ready/Lift/Max moves end when master is at target **and** |level error| ≤ deadband. Catch-up timer faults (`level_fail_catchup`) if the slave cannot close the gap. Lowered-target moves skip the gate (LOWERED_VENT leaves both valves open).
+- **Two-sided completion:** Ready/Lift moves end when master is at target **and** |level error| ≤ deadband. Catch-up timer faults (`level_fail_catchup`) if the slave cannot close the gap. Lowered-target moves skip the gate (LOWERED_VENT leaves both valves open).
 - **Feed-aware stall:** during RAISING with the master valve throttled, progress is tracked on the side being fed.
 - **Auto-maintain top-ups** are normal go-to raises; the leveling layer rides along.
 - **Manual moves** (angle untrusted): leveling disabled, both valves ganged.
@@ -534,12 +538,13 @@ While parked at **Lift**, a list is corrected by the at-rest keeper. Ready and L
 | Sides diverge past hard stop | FAULT + make-safe |
 | Slave can't catch up in time | `level_fail_catchup` FAULT |
 
-### 16.8 Calibration (six captures + level check)
+### 16.8 Calibration (eight captures + level check)
 
 1. True Lowered → capture LOWERED on **both** sensors.
 2. Ready (boat floating level) → capture READY on both.
-3. Lift height, verified level → capture LIFT on both.
-4. Verify Level Error ≈ 0 % at each setpoint.
+3. Lift (max with the heavy boat), verified level → capture LIFT on both.
+4. Empty Max (boat off, tanks at the empty ceiling) → capture EMPTY MAX on both.
+5. Verify Level Error ≈ 0 % at each setpoint.
 
 ### 16.9 Key entities (leveling)
 

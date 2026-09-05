@@ -92,7 +92,7 @@ nouns (Lift/Ready/Lowered). Colors are tied to the mode, not the word.
 |---|---|---|---|---|
 | **LOWER** (left) | Lowered | Green `0x27AE60` | 0 | `cal_lowered` |
 | **READY** (mid) | Ready | Orange `0xE0792E` | 20 | `cal_ready` (near bottom) |
-| **RAISE** (right) | Lift | Blue `0x2E86DE` | 100 | `cal_lift` / Lift Target % |
+| **RAISE** (right) | Lift | Blue `0x2E86DE` | 100 | load-selected shutoff (boat or empty ceiling) |
 | **STOP** (bar) | — | Red `0xC0392B` | — (halt) | — |
 
 **Decision — verbs not nouns on the buttons:** "LIFT" would collide with the

@@ -21,11 +21,11 @@ The page is ordered top to bottom: **Control → Status → Configuration → Ad
 | `Manual valve` | A valve's real position disagrees with what's commanded — someone operated it by hand (or it's stuck). |
 | `Angle sensor OFFLINE - manual control` / `Angle OUT OF RANGE - manual control` | Height feedback lost; only manual jogs and Stop work (§6.5). |
 | `Not calibrated` | No target moves until Lift + Lowered are captured. |
-| `Lifted` / `Ready` / `Lowered` / `Lifted (max)` / `Between ready/lifted` … | Resting position. |
+| `Lifted` / `Ready` / `Lowered` / `Between ready/lifted` … | Resting position. |
 
-**Lift · Ready · Stop · Lower** — the same intents as the dock buttons, in the same order as the physical panel. Press a position and the controller picks raise vs lower itself; a press mid-move retargets (last press wins). **Stop** always cancels motion and commands safe outputs; at Lowered it seals the vent until Lower is pressed again. Stop also clears a FAULT and exits Bypass. **Lift Max** sits last as a separate explicit control.
+**Lift · Ready · Stop · Lower** — the same intents as the dock buttons, in the same order as the physical panel. Press a position and the controller picks raise vs lower itself; a press mid-move retargets (last press wins). **Stop** always cancels motion and commands safe outputs; at Lowered it seals the vent until Lower is pressed again. Stop also clears a FAULT and exits Bypass. Lift parks at the **boat ceiling** with a boat aboard (or unknown) and the **empty ceiling** when confirmed empty.
 
-**Auto-Maintain Height** *(default ON)* — automatically tops up Lift and roof-safe Lift Max (confirmed empty or light boat). Ready recovery requires a confirmed loaded boat and acts only from 3 % low through the 5 % safe floor; below that, inflation is inhibited. Up-only; never auto-lowers.
+**Auto-Maintain Height** *(default ON)* — automatically tops up Lift (to the load-selected shutoff). Ready recovery requires a confirmed loaded boat and acts only from 3 % low through the 5 % safe floor; below that, inflation is inhibited. Up-only; never auto-lowers.
 
 **Auto-Maintain Level** *(default ON)* — keeps the two sides even: throttles the side that's ahead during every move, and corrects a developing list while parked at Lift. OFF = valves ganged, decisions still logged as `LEVEL(shadow)`.
 
@@ -40,31 +40,31 @@ The page is ordered top to bottom: **Control → Status → Configuration → Ad
 - **Lift Problem** *(binary)* — the one flag to alert on: fault, bypass, angle not trusted, or uncalibrated.
 - **Lift In Operation** *(binary)* — ON while a move *somebody asked for* is running (any button, panel, web, or HA), OFF when it finishes. Keeper top-ups and the emergency descent don't light it — watch Lift Activity for those.
 - **Air Loss Alert** *(binary)* — ON when air is leaving abnormally: sinking while sealed, parked sag rate too high, or too many keeper interventions in one visit (§15.5). The keepers keep correcting either way — this is the "you should know about this" flag. Reason in Diagnostics → Air Loss Detail.
-- **Lift Height** — position as % of the calibrated span (Lowered = 0 %, Lift cal = 100 %). Can read below 0 (settled past the Lowered cal) or above 100 (Lift Max territory, or an empty lift riding high).
+- **Lift Height** — position as % of the calibrated span (Lowered = 0 %, Lift / boat-max cal = 100 %). Can read below 0 (settled past the Lowered cal) or above 100 (empty lift riding toward Empty Max).
 - **Bunk Height** — estimated bunk elevation relative to the waterline, from arm geometry. The surveyed true-Lowered datum is −13 in (below water); positive values are above water. Display only.
 - **Boat Present** — the fail-safe presence latch from raise-speed classification (§5.1). ON means *boat aboard or unknown*.
-- **Boat Load State** *(Diagnostics)* — `Confirmed empty`, `Confirmed other boat`, `Confirmed Cobalt`, or `Unknown`. Ready needs any confirmed boat; Lift Max is allowed for empty or other boat and blocked for Cobalt/unknown-from-high. Tunable via `Empty Raise Rate Min` and `Heavy Boat Raise Rate Max`. Resets to `Unknown` wherever the boat could have changed.
+- **Boat Load State** *(Diagnostics)* — `Confirmed empty`, `Confirmed other boat`, `Confirmed Cobalt`, or `Unknown`. Ready recovery needs any confirmed boat. Lift uses empty vs any-boat to pick the shutoff (unknown = boat ceiling). Tunable via `Empty Raise Rate Min` and `Heavy Boat Raise Rate Max`. Resets to `Unknown` wherever the boat could have changed.
 - **Water Temperature** — DS18B20 in the water. Scanned at boot only — if it shows unknown after a sensor swap, restart.
 - **Maintain Observe** — the keepers' visit summary: `At Lift — 2 top-ups, 1 level fixes — sag −0.30%/h`, or `Not parked at a maintained position`. Counters reset when the lift arrives at a new maintained position.
-- **Lift Activity / Lift Position** — short stable tokens (`Idle/Raising/Lowering/Leveling/Fault/Bypass/Emergency Descent` and `Lowered/Ready/Lifted/Lifted Max/Between/Unknown`) for exact-match HA automations. They duplicate the human lines above on purpose — trigger on these, read the others.
+- **Lift Activity / Lift Position** — short stable tokens (`Idle/Raising/Lowering/Leveling/Fault/Bypass/Emergency Descent` and `Lowered/Ready/Lifted/Between/Unknown`) for exact-match HA automations. They duplicate the human lines above on purpose — trigger on these, read the others.
 
 ---
 
 ## 3 · Configuration — calibration, explained
 
-The lift measures **arm angle**, not height. Calibration teaches it what your dock's angles mean: you park the lift at each real position and press a capture button; the controller records the current angle. Height % is then drawn linearly between two of those captures — **Lowered = 0 %** and **Lift = 100 %** — and Ready / Lift Max are remembered as their own angles on that same scale.
+The lift measures **arm angle**, not height. Calibration teaches it what your dock's angles mean: you park the lift at each real position and press a capture button; the controller records the current angle. Height % is then drawn linearly between two of those captures — **Lowered = 0 %** and **Lift (max with boat) = 100 %** — Ready is its own angle, and Empty Max is the no-boat Lift ceiling (not a mode).
 
 **The workflow (once, at commissioning — §16.8):**
 
 1. Drive the lift all the way down (true bottom, settled) → press **Calibrate: set LOWERED**, then **Calibrate Port: set LOWERED**.
 2. Float the boat level at the almost-down position → **Calibrate: set READY** + **Calibrate Port: set READY**.
-3. Raise to the everyday stored height, verified level → **Calibrate: set LIFT** + **Calibrate Port: set LIFT**.
-4. (Boat OFF only) raise to the winter/max height, verified level → **Calibrate: set LIFT MAX** + **Calibrate Port: set LIFT MAX**.
+3. Raise as high as the heavy boat will go, verified level → **Calibrate: set LIFT** + **Calibrate Port: set LIFT**.
+4. (Boat OFF only) raise to the empty-tank ceiling, verified level → **Calibrate: set EMPTY MAX** + **Calibrate Port: set EMPTY MAX**.
 
 Why the Port captures too: the frame racks slightly, so the port sensor gets its *own* captures at the same physical positions — leveling then compares the two sides in percent space, and the racking cancels out (§16.1).
 
-- **Calibration Summary** — every zone edge the captures produce, on one line: `Lowered: >48.0° (cal 50.0°)  Ready: 42.2..46.2°  Lift: 5.5°  Max: -18.0..-14.0°`. If a zone looks wrong, this is where you see it.
-- **Lift Target (%)** — where "Lift" actually parks, as % of the span (default 98). This exists so the everyday position can sit safely *below* the Lift capture (e.g. roof clearance margin) without re-capturing.
+- **Calibration Summary** — every zone edge the captures produce, on one line: `Lowered: >48.0° (cal 50.0°)  Ready: 42.2..46.2°  Lift: -5.4°  Empty: -23.9°`. If a zone looks wrong, this is where you see it.
+- **Lift Target (%)** — how close Lift approaches the load-selected ceiling (default 97). Stop short of the captured max so a heavier day still arrives; 100 % will miss when the boat is heavier than the capture.
 - **Zone Tolerance (°)** — the single "close enough" band used for every position zone: at-Ready means within ±this of the Ready angle, and so on. Wider = zones easier to hit but sloppier; default 2°.
 - **Restart** — reboots the controller (state is safe: it always boots to HOLD; at the bottom the vent rule reopens the vents itself).
 
@@ -81,7 +81,7 @@ All live-editable and stored on the device — an OTA does *not* overwrite value
 - **Angle Plausibility Margin (°) / Angle Freshness (s)** — the trust ladder (§9.4): how far outside the calibrated span, and how stale, the angle may be before auto moves stop.
 - **Stall Grace / Stall Timeout / Stall Min Progress** — raising must make progress (0.2°) at least every Timeout after Grace, or FAULT. Tuned from field data: 20 s / 15 s.
 - **Empty Raise Rate Min (% per s)** — early climb at/above this = empty (§5.1). Ships at 99 (= never empty) until tuned.
-- **Heavy Boat Raise Rate Max (% per s)** — early climb at/below this = Cobalt/heavy (blocks Lift Max). This install **0.60 %/s**; between this and Empty = other/light boat (Max allowed).
+- **Heavy Boat Raise Rate Max (% per s)** — early climb at/below this = Cobalt/heavy. This install **0.60 %/s**; between this and Empty = other/light boat. Both boat bands use the boat Lift shutoff; only Confirmed empty uses Empty Max.
 - **Maintain Sag Deadband / Persist / Min Interval / Settle Delay / Smoothing** — when a sag counts and how often a top-up may fire. Defaults make a Ready top-up eligible after roughly four minutes below the trigger.
 - **Ready Recovery Floor** — maximum allowed drop below Ready for automatic inflation (default 5 %). It must exceed the sag deadband; crossing it inhibits recovery and requires an operator.
 - **Air Alert Sealed Drop / Sag Rate / Visit Events** — the three Air Loss Alert triggers (§15.5).
