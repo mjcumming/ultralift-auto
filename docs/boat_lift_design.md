@@ -302,7 +302,7 @@ Short tokens exist for **exact-match Home Assistant automations**. Embedding a l
 
 **`Lift Command`** (select: `— / Lift / Ready / Guide / Lower`) — the declarative control for HA automations and scenes: setting an option fires the same `request_*` intent as the matching button, so every interlock applies. Shows the destination while a user-commanded move runs, rests at `—` (a no-op option) so re-selecting always fires. Guide and Lower stay on this select (and their web buttons) for deliberate remote use.
 
-**`Lift Ready`** (cover) — everyday HA open/close/stop: Open = Lift, Close = Ready, Stop = Stop. Two-state only (no position slider, not a garage device class). Open above the Ready band, closed at or below Ready. See ADR-014.
+**`Lift Ready`** (cover, `blind`) — everyday HA raise/lower/stop: raise = Lift, lower = Ready, stop = Stop. Position is Lift Height %; above 95% reports fully raised. A partial set-position is ignored. See ADR-014.
 
 ### 9.3 UI tiers (web_server sorting groups)
 

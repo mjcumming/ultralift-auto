@@ -2309,22 +2309,25 @@ select:
           else if (x == "Lower") id(request_goto_lowered)->execute();
 
 # ---------------------------------------------------------------------------
-#  HA cover — everyday envelope only: Open = Lift, Close = Ready, Stop = Stop.
-#  No position slider (has_position: false) so HA cannot send 50%.
-#  Full Lower stays on Lift Command / the Lower button (phone on the walk).
-#  No device_class: garage — voice assistants must not treat this as a door.
-#  State is published from the 250 ms tick (no restore-and-call — that would
-#  fire a move on boot).
+#  HA cover — everyday envelope only: raise/open = Lift, lower/close = Ready,
+#  Stop = Stop. device_class blind (no tilt) so assistants say raise/lower
+#  rather than treating it as a garage door. Position is Lift Height %
+#  (0 = Lowered cal, 100 = Lift cal); above 95% reports fully open so a
+#  normal Lift arrival does not sit at 97. A partial set-position is ignored
+#  — only the raise and lower commands move the lift. Full Lower stays on
+#  Lift Command / the Lower button. No restore-and-call (that would move
+#  on boot). State is published from the 250 ms tick.
 # ---------------------------------------------------------------------------
 cover:
   - platform: template
     name: "Lift Ready"
     id: lift_ready_cover
+    device_class: blind
     icon: "mdi:arrow-up-down-bold"
     restore_mode: NO_RESTORE
     optimistic: false
     assumed_state: false
-    has_position: false
+    has_position: true
     web_server: {sorting_group_id: group_control, sorting_weight: 5}
     open_action:
       - script.execute: request_goto_top
@@ -2332,6 +2335,10 @@ cover:
       - script.execute: request_goto_ready
     stop_action:
       - script.execute: request_stop
+    position_action:
+      - lambda: |-
+          ESP_LOGW("cover", "set-position %.0f%% ignored — raise goes to Lift, lower goes to Ready",
+                   pos * 100.0f);
 
 # ---------------------------------------------------------------------------
 #  Intents (request_*) — validate against state + interlocks, then transition.
@@ -3469,19 +3476,20 @@ interval:
             id(prev_lift_state) = cs;
           }
 
-          // ---- HA Lift/Ready cover: open = above Ready, closed = at/below Ready
-          //      (incl. Lowered). Opening/closing only for user Lift/Ready moves
-          //      and emergency descent (destination is Ready, or Lowered if
-          //      residual list remains). A Lower from the
-          //      select/button is not this entity — leave operation idle.
+          // ---- HA Lift Ready blind: position is Lift Height %. Above 95%
+          //      reports fully open so a Lift-target arrival (~97) reads 100.
+          //      Unknown height keeps the last position. Opening/closing only
+          //      for user Lift/Ready moves and emergency descent. A Lower from
+          //      the select/button is not this entity — leave operation idle.
           {
-            float pos = 0.0f;   // COVER_CLOSED
+            float pos = id(lift_ready_cover).position;
             if (id(angle_trusted) && id(have_cal) && !std::isnan(id(lift_pct))) {
-              if (!std::isnan(id(ready_target_pct))
-                  && id(lift_pct) > id(ready_target_pct) + id(zone_tol_pct))
-                pos = 1.0f;     // COVER_OPEN
-              else if (id(pos_at_top))
-                pos = 1.0f;
+              if (id(lift_pct) > 95.0f) pos = 1.0f;
+              else {
+                pos = id(lift_pct) / 100.0f;
+                if (pos < 0.0f) pos = 0.0f;
+              }
+              pos = lroundf(pos * 100.0f) / 100.0f;
             }
             cover::CoverOperation op = cover::COVER_OPERATION_IDLE;
             int cs0 = id(lift_state);
@@ -3496,7 +3504,7 @@ interval:
                 || id(lift_ready_cover).current_operation != op) {
               id(lift_ready_cover).position = pos;
               id(lift_ready_cover).current_operation = op;
-              id(lift_ready_cover).publish_state();
+              id(lift_ready_cover).publish_state(false);
             }
           }
       # re-assert outputs from (possibly updated) state every tick

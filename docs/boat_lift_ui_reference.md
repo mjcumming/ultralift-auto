@@ -33,7 +33,7 @@ The page is ordered top to bottom: **Control → Status → Configuration → Ad
 
 **Bypass Mode** — opens both valves, blower off, controller idle (web/HA or panel Diagnostics; the dock red button no longer enters Bypass). The lift vents and floats; all button LEDs go dark. Turn OFF (or short-press Stop) to return to normal.
 
-**Lift Ready** *(cover)* — Home Assistant open/close/stop for the everyday envelope only. Open sends Lift, Close sends Ready, Stop is Stop. It does not go to Lower (use the Lower button or `Lift Command` → Lower). Not a height slider.
+**Lift Ready** *(cover, blind)* — Home Assistant raise/lower/stop for the everyday envelope. Raise sends Lift, lower sends Ready, Stop is Stop. Its position is Lift Height; above 95% it shows fully raised. It does not go to Lower (use the Lower button or `Lift Command` → Lower), and a partial position command is ignored.
 
 ---
 

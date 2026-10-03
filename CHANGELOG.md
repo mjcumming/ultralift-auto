@@ -10,7 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **Guide height** ([ADR-016](docs/adr.md)): “boat floating, bunks still centering the hull in the slip.” Web **Guide** button, `Lift Command` → Guide, panel `req=GUIDE`. Arrival is HOLD + sealed (not `LOWERED_VENT`). Status / Position / panel `st=GUIDE` in-zone. Stop stays sealed. No dock button or LED, no firmware auto-trigger. Capture with **Calibrate: set GUIDE** on both sides only when Stop-sealed at the intended height — go-to refuses until then. Requires OTA.
 - **`Test: inject level fail`** (Bench): one-shot switch that drives the real level hard-stop path into emergency descent. ALWAYS_OFF on boot; clears itself when the descent starts. For proving ADR-015 without faking IMU cal or winding the frame. **Moves the lift.** Requires OTA.
-- **`Lift Ready` cover for Home Assistant.** Open = Lift, Close = Ready, Stop = Stop. Two-state only (no position slider, not a garage device class) so bulk "close all covers" cannot send the boat to Lower. Full Lower stays on `Lift Command` and the Lower button. Requires OTA. Amends [ADR-014](docs/adr.md).
+- **`Lift Ready` cover for Home Assistant.** A blind: raise = Lift, lower = Ready, Stop = Stop. Position is Lift Height %; above 95% reports fully raised. A partial set-position is ignored, so the boat cannot be sent to an arbitrary height. Full Lower stays on `Lift Command` and the Lower button. Requires OTA. Amends [ADR-014](docs/adr.md).
 
 ### Fixed
 
