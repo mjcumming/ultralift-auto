@@ -134,6 +134,7 @@ CMD v=1 req=LIFT
 |---|---|---|
 | `LOWER` | `request_goto_lowered` | go-to Lower setpoint |
 | `READY` | `request_goto_ready` | go-to Ready setpoint |
+| `GUIDE` | `request_goto_guide` | go-to Guide (sealed float + bunks as slip guides) |
 | `LIFT` | `request_goto_top` | go-to Lift (load-selected shutoff) |
 | `STOP` | `request_stop` | always honoured; no confirm |
 | `RESET` | `request_reset` | clear a latched FAULT (panel gates behind a confirm) |
@@ -160,14 +161,15 @@ full human text always comes in `msg=`.
 | `HOLDING` | resting, but no precise position bucket available | "HOLDING" |
 | `RAISING` | MOVING_VALVE_OPENING or MOVING_UP | "RAISING" |
 | `LOWERING` | MOVING_DOWN | "LOWERING" |
-| `LOWERED` | resting at Lowered (floating) | "LOWERED" |
-| `BETWEEN_LOWERED_READY` | between Lowered and Ready | "LOWERED/READY" |
+| `LOWERED` | resting at Lowered (keep venting) | "LOWERED" |
+| `GUIDE` | resting at Guide — floating, bunks still a slip centerline (ADR-016) | "GUIDE" |
+| `BETWEEN_LOWERED_READY` | between Lowered and Ready (and not in the Guide zone) | "LOWERED/READY" |
 | `READY` | resting at Ready | "READY" |
 | `BETWEEN_READY_LIFTED` | between Ready and Lifted | "READY/LIFTED" |
 | `LIFTED` | resting at Lifted | "LIFTED" |
 | `BYPASS` | bypass override active | full-screen BYPASS lock |
 | `FAULT` | latched fault | "ERROR" + reset affordance |
-| `EMERG_DESCEND` | emergency descent to Ready (level divergence, ADR-013); `prob=1` rides along | "EMERGENCY" |
+| `EMERG_DESCEND` | emergency descent (ADR-015): to Ready, or continuing to Lowered / locked at Lowered with vents open; `prob=1` rides along | "EMERGENCY" |
 
 `prob=1` independently drives the error banner; `trust=0` independently drives the
 degraded/manual treatment (below). They can coexist with any `st`.

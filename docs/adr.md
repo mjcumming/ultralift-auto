@@ -137,16 +137,64 @@ In-move throttle follows Maintain Level on every go-to. Both switches **default 
 
 ## ADR-013 — Emergency descent on level divergence with the boat high
 
-**Decision:** When the two sides diverge past `Tilt Critical` (~5°) **and the boat is above the Ready band**, do not seal in place. Enter **EMERG_DESCEND**: both valves open ganged, blower off, ride down to the Ready band (or below it, or `Lower Timeout`), then seal into a latched FAULT. Stop seals immediately (operator override); mode buttons are refused; trust loss does not stop the descent — the timeout still seals. At or below Ready (or without a Ready calibration or known height), the response stays FAULT + make-safe. The trigger is deliberately **only** the divergence hard stop — `level_fail_catchup` and stall keep sealing in place.
+**Amended by [ADR-015](#adr-015).** The descent maneuver (ganged vent, blower off, while the boat is high) stands. Trigger set, 3° never-exceed, catch-up aloft, and the staged Ready→Lowered ending are in ADR-015.
+
+**Decision:** When the two sides diverge past `Tilt Critical` **and the boat is above the Ready band**, do not seal in place. Enter **EMERG_DESCEND**: both valves open ganged, blower off, ride down to the Ready band (or below it, or `Lower Timeout`), then seal into a latched FAULT. Stop seals immediately (operator override); mode buttons are refused; trust loss does not stop the descent — the timeout still seals. At or below Ready (or without a Ready calibration or known height), the response stays FAULT + make-safe. (Original trigger was only the divergence hard stop at ~5° — `level_fail_catchup` and stall sealed in place.)
 
 **Rationale:** For the catastrophic asymmetric failure (hose off a tank), sealing holds the *good* side aloft while the failed side falls — the controller would actively maximize the twist with the boat high. Opening both valves vents the high side down toward the failed side: the twist shrinks during the descent and the water progressively takes the boat's weight. This extends the system's existing philosophy — power loss drifts down to float, the bottom is the resting truth — to "when leveling has provably failed, give up altitude." A list at Ready is harmless; a list aloft can put the boat off its bunks.
 
 **Consequence:** The controller can initiate motion nobody requested, on a possibly unattended boat. Accepted: the 5° trigger means something is already mechanically wrong, the alternative (twisting aloft) is strictly worse, and power loss already produces an uncontrolled version of the same descent. Panel/HA show `EMERG_DESCEND` / `Emergency Descent`; `Lift Problem` is ON throughout.
 
-## ADR-014 — Home Assistant control surface: buttons + command select, no cover
+## ADR-014 — Home Assistant control surface: buttons + command select + Lift/Ready cover
 
-**Decision:** Home Assistant drives the lift through the same four stateless buttons as the web UI, plus a **`Lift Command` select** (`— / Lift / Ready / Lower`) whose set-action fires the matching `request_*` intent — one entity automations and scenes can set declaratively. A **`Lift In Operation`** binary (`running`) is ON only while a **person-initiated** move runs: a `user_cmd_move` flag is set by every `request_goto_*` intent (dock buttons, panel, web, HA — all human paths) and cleared when the auto-maintain keeper starts a top-up; emergency descent is excluded outright. The select mirrors the destination of a user-commanded move and rests at `—` (selecting `—` is a no-op), so re-selecting the same destination always fires. A HA **cover entity is deliberately rejected**.
+**Decision:** Home Assistant drives the lift through the same four stateless buttons as the web UI, plus a **`Lift Command` select** (`— / Lift / Ready / Lower`) whose set-action fires the matching `request_*` intent, plus a **`Lift Ready` cover** whose open/close/stop map to Lift / Ready / Stop only. A **`Lift In Operation`** binary (`running`) is ON only while a **person-initiated** move runs: a `user_cmd_move` flag is set by every `request_goto_*` intent (dock buttons, panel, web, HA — all human paths) and cleared when the auto-maintain keeper starts a top-up; emergency descent is excluded outright. The select mirrors the destination of a user-commanded move and rests at `—` (selecting `—` is a no-op), so re-selecting the same destination always fires.
 
-**Rationale:** "The lift is in operation" means *someone asked it to do something* — keeper top-ups and the ADR-013 descent are housekeeping and emergency response, and lighting a "running" flag for them would train people to ignore it (motion is still visible in `Lift Activity`). A cover maps badly on every axis: covers get swept into bulk actions ("close all covers", good-night scenes, voice assistants exposing a garage door) — a scene quietly lowering a boat is exactly the failure ADR-010's request-only philosophy exists to prevent; open/close/position-% semantics also collapse the curated setpoints (Ready's almost-down meaning, LOWERED_VENT, load-selected Lift shutoffs) into an ambiguous slider.
+The cover is a **two-state door, not a height slider**: open = above the Ready band (Lift / between), closed = at or below Ready (including Lowered). It has no `set_cover_position`, no `device_class: garage`, and does not restore-and-call on boot. **Full Lower stays on `Lift Command` and the Lower button** — intentional remote use (phone on the walk to the dock), not an everyday dashboard action.
 
-**Consequence:** HA automations use `select.select_option` (or button presses); there is no single open/close entity for voice assistants — accepted as the point, not a limitation. The select is HA-furniture and files at the bottom of Advanced on the web page (the web server has no per-entity hide), where the buttons remain the way to drive the lift.
+**Rationale:** "The lift is in operation" means *someone asked it to do something* — keeper top-ups and the ADR-013 descent are housekeeping and emergency response, and lighting a "running" flag for them would train people to ignore it (motion is still visible in `Lift Activity`). An unbounded cover was rejected: covers get swept into bulk actions ("close all covers", good-night scenes, voice assistants exposing a garage door), and open/close/position-% semantics collapse Ready, LOWERED_VENT, and the load-selected Lift shutoffs into an ambiguous slider. A Lift↔Ready-only cover keeps the dashboard/voice envelope on the bunks (Ready is still boat-supported and sealed). Lower remains available as an explicit select/button so a walk-up launch is still one phone tap, not one "close all covers" away.
+
+**Consequence:** Everyday HA automations and dashboards use the cover (`cover.open` / `cover.close` / `cover.stop`) or `select.select_option` Lift/Ready. Lower is still on the select and the Lower button. Do not add the cover to a generic "all covers" scene. The select stays HA-furniture at the bottom of Advanced on the web page; the cover files in Control after the four buttons.
+
+---
+
+## ADR-015 — Correction-effectiveness fail-safe; staged emergency descent
+
+**Decision:** Treat a slow leak as *correct then notify*, and a leak the correction cannot win as *give up altitude* (ADR-013 maneuver). Detect and feed-low stay as they are. Fail the correction if either:
+
+- live list ≥ **`Tilt Critical`** (default **3°** of arm — HydroHoist UL2 “stop if more than 3 inches side-to-side”; on this 51 in arm that is ~3° at Lift), or
+- a rest-level pulse has had **~30 s of real air** (clock starts when the feed valve’s OPEN contact is true, else after 8 s actuator grace) and the list is **not shrinking**. Not-yet-level while the list **is** shrinking is not a fail and **not** a reason to stop: keep correcting until the same release as in-move (`Level Deadband` − hysteresis) or the vent height floor. The air clock is only a not-winning detector.
+
+Above Ready, that fail (and the 3° never-exceed, and in-move **`level_fail_catchup`**) enter **EMERG_DESCEND**. At/below Ready they still **FAULT + seal**. Stall still seals. Air Loss Alert stays notify-only.
+
+Descent is staged: ride to Ready with both valves open, blower off. If list has collapsed under `Tilt Critical` and is not still growing (~2 s look), **FAULT + seal**. If list is still past `Tilt Critical`, still growing, or level trust is lost so we cannot confirm the bunks have the boat, **keep venting to Lowered**. Arrival at Lowered goes to **LOWERED_VENT** with **`emerg_lock`**: vents stay open (ADR-009), `Lift Problem` ON, mode buttons refused, Stop acknowledges into FAULT + seal. `Lower Timeout` still seals as backstop.
+
+**Rationale:** You cannot measure a clean leak rate while correcting, and you should not sit idle to measure one. A 5° wall is already past the OEM 3-inch operating limit (~2.7 in of bunk step at Lift). Waiting for it while rest-level pulses abort and retry winds the torsion bars. Sealing a failed catch-up aloft is the same “hold the good side up” mistake as sealing a hose-off. Ready is the right first rest; full Lower is only if Ready did not unload the tanks.
+
+**Consequence:** `Tilt Critical` default 5° → 3°. The entity is flash-persisted — OTA does not move a live device; nudge the slider to 3 after flash. Panel token stays `EMERG_DESCEND`. Status names Ready vs Lowered vs “lowered, vents open.” No new timeout slider (30 s is a safety budget, not a dock tweak).
+
+---
+
+## ADR-016 — Guide: floating + bunks as slip centerline
+
+**Decision:** Add a fourth calibrated height, **Guide**: the boat is **floating**, but the bunks are still high enough to **center the hull in the slip** while docking. Go-to from the web **Guide** button, `Lift Command` → Guide, and panel `req=GUIDE`. Arrival is **HOLD + sealed** (like Ready), never `LOWERED_VENT`. No physical dock button or LED. No firmware auto-trigger (leave-then-raise-later is an HA / human decision).
+
+**Name:** **Guide** — short, says what the bunks do. Rejected or deferred:
+
+| Name | Why not (this pass) |
+|---|---|
+| **Guide** | Chosen. Bunks guide the hull. Internal id `guide`. |
+| Slip | Fine everyday word; sounds like “the boat slipped off.” |
+| Dock / Docking | Overloaded with “the dock” and the dock buttons. |
+| Align / Center | Accurate, but less about the bunks. |
+| Guided entry | What it is, too long for Status / panel `st=`. |
+| Float | **Do not use.** `cal_angle_float` is already Ready. |
+
+**Rationale:** Dock 2026-09-10 showed three different jobs at the bottom of the stroke that today’s three modes cannot share:
+
+- **Ready** — boat *on* the bunks, sealed, walkable (~13% / ~46° after recapture).
+- **The useful docking height** — boat floating, bunks still a centerline fence (~1–5% / ~51–53° that morning).
+- **Lowered** — keep venting (ADR-009). Entering the Lowered zone from HOLD re-opens both valves. That is why the “pretty good” float ran away toward the 53.8° bottom.
+
+Stealing Ready would give up the walkable seal. Stealing Lowered would break continuous vent at the true bottom. The new zone will overlap Lowered’s one-sided band (`cal_lowered − zone_tol`), so Guide **must win**: report Guide before Lowered; Stop at Guide stays sealed (`HOLD` + `pos_at_guide` must not re-enter `LOWERED_VENT`); green Lowered LED is `pos_at_lowered && !pos_at_guide`. No fifth LED.
+
+**Consequence:** Empty `cal_guide_done` / `cal2_guide_done` until the operator Stop-seals at the intended height and presses **Calibrate: set GUIDE** (both sides). Do not invent an angle from a moving dump. HA `number.set_value` on template cals often does not publish — use the capture buttons while sitting still. Panel `st=GUIDE` when HOLD and `pos_at_guide`. Go-to refuses until captured. Cover stays Lift↔Ready only. Do not add a firmware “after N minutes at Lowered, raise to Guide” — that guess is often wrong (boat still there, want to stay down, extra draft); HA can fire Guide when you actually decide.

@@ -6,8 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Guide height** ([ADR-016](docs/adr.md)): “boat floating, bunks still centering the hull in the slip.” Web **Guide** button, `Lift Command` → Guide, panel `req=GUIDE`. Arrival is HOLD + sealed (not `LOWERED_VENT`). Status / Position / panel `st=GUIDE` in-zone. Stop stays sealed. No dock button or LED, no firmware auto-trigger. Capture with **Calibrate: set GUIDE** on both sides only when Stop-sealed at the intended height — go-to refuses until then. Requires OTA.
+- **`Test: inject level fail`** (Bench): one-shot switch that drives the real level hard-stop path into emergency descent. ALWAYS_OFF on boot; clears itself when the descent starts. For proving ADR-015 without faking IMU cal or winding the frame. **Moves the lift.** Requires OTA.
+- **`Lift Ready` cover for Home Assistant.** Open = Lift, Close = Ready, Stop = Stop. Two-state only (no position slider, not a garage device class) so bulk "close all covers" cannot send the boat to Lower. Full Lower stays on `Lift Command` and the Lower button. Requires OTA. Amends [ADR-014](docs/adr.md).
+
+### Fixed
+
+- **Emergency descent no longer times out on the same tick it starts.** `start_emergency_descent` stamps `lower_start_time` with `millis()` after the supervisor already sampled `now`; unsigned wrap looked like a 15 min timeout and sealed at Lift with `descent timeout` (inject test 2026-09-10, boat never moved). Timeout now requires `now >= start`. Requires OTA.
+- **Air Loss no longer trips on a finished lower.** Sag rate is measured only while HOLD; a commanded descent is discarded, and the sag-rate trigger shares the sealed-drop 60 s settle grace. A Ready arrival (2026-09-06) had been alerting `sag rate high` for ~3 min after a clean 149 s go-to. Requires OTA.
+- **Power-up must not open the valves.** A cold boot (or power restore) could publish one plausible-but-wrong IMU frame before both sensors settled; the level EMA then crossed Tilt Critical in under a second and ADR-013 emergency-descended — both valves open, boat high. Stop during that descent latched `FAULT: level_divergence - operator stop`. The hard stop now waits for 8 s of continuous dual-IMU trust before it can vent or fault, so a power cycle stays HOLD / valves closed. A real divergence hours later still trips immediately. Requires OTA.
+
 ### Changed
 
+- **Parked level pulse no longer stops while it is winning.** The 10 s vent / 30 s feed clocks are only a *not-shrinking* fail-safe. A winning pulse keeps going until the same release as a raise (`Level Deadband` − hysteresis). Dock 2026-09-10: a 10 s vent ended at 2.7% in the 2–3% hole and never retried. Requires OTA.
+- **Rest-level defaults tightened** (live sliders set 2026-09-10; yaml initials match for new flashes): Trigger **3% → 2.5%**, Persist **30 s → 15 s**, in-move Deadband **2% → 1.5%** (~0.9°). Hysteresis stays 1%. Tilt Critical stays 3°. Live device already has the slider values; OTA is only for the winning-pulse change.
+- **`Tilt Critical` slider is 1–5°** (was 1–30). 3° remains the operating default; 1° is only a test trip. Past 5° is dump/slip territory, not a setpoint. Requires OTA for the new bounds (the live value you already set to 3 is unchanged).
+- **Level fail-safe is correction-effectiveness, not a 5° wall** ([ADR-015](docs/adr.md), amends ADR-013). Rest-level still detects and feeds the low tank. A pulse that has ~30 s of real air (OPEN contact, else 8 s grace) and is not shrinking — or live list past **`Tilt Critical` (default 3°, HydroHoist’s 3 in side-to-side)** — emergency-descends if the boat is above Ready: both valves open, blower off, ride to Ready, **FAULT + seal** if list has collapsed, **continue to Lowered** (vents open, `Lift Problem` ON) if residual list remains. In-move `level_fail_catchup` above Ready joins that path (no longer seals aloft). Stall still seals. **Flash-persisted `Tilt Critical` stays at 5° until nudged to 3 after OTA.** Requires OTA.
 - **Lift Max is gone; Lift has two shutoffs.** One Lift command: confirmed empty → stored empty-max ceiling; any boat or unknown → Cobalt/boat ceiling. Each ceiling is approached to `Lift Target %` (default 97) so a heavier day still arrives. Unknown starts at the boat ceiling and raises the target mid-move if the raise proves empty. `cal_max` stays as Empty Max (plausibility + empty shutoff), not a mode. Web/HA **Lift Max** button and `Lift Command` option removed; panel `LIFT_MAX`/`MAX` alias to Lift. Position no longer reports `Lifted Max`. Requires OTA. Live Lift cal written to the current Cobalt-high angles (starboard −5.45°, port −4.95°) and Lift Target set to 97. Supersedes the unreleased Cobalt-only Max roof guard.
 - **Raise stall timeout 30→15 s** (grace stays 20 s). Field raises never pause more than ~4 s between 0.2° progress; 15 s is still ~4× that. A dead raise now faults in ~35 s (blower off, valves closed). Flash-persisted — nudge the live slider after OTA / set via HA.
 - **Red Stop button is Stop-only:** it cancels raising/lowering, aborts at-rest leveling, seals the continuously venting Lowered mode, clears FAULT, seals emergency descent, and exits Bypass. It never selects Lift Max. Press Lower again to resume Lowered venting. Dock long-hold Bypass remains removed; enter Bypass via the labeled **Bypass Mode** switch (web/HA) or panel Diagnostics only.
@@ -45,7 +61,7 @@ Home Assistant control pass ([ADR-014](docs/adr.md)).
 
 ### Decided
 
-- **No HA cover entity** ([ADR-014](docs/adr.md)): covers invite bulk actions ("close all covers", good-night scenes, voice-assistant garage-door mapping) that could lower the boat unattended, and open/close/position-% semantics don't map to the four curated setpoints.
+- **No unbounded HA cover** ([ADR-014](docs/adr.md), later amended): a full-travel cover was rejected because bulk actions and position-% could lower the boat unattended. A Lift↔Ready-only cover shipped later; Lower stays on the select/button.
 
 ## [0.7.0] — 2026-07-24
 

@@ -12,7 +12,8 @@
 #    · level error = slave height % − master height % (each side has its OWN
 #      captures, so frame racking is calibrated out); while moving, the
 #      side that is AHEAD gets its valve throttled shut until the other catches up
-#    · hard stop: sides diverging past Tilt Critical (°) => FAULT+make-safe
+#    · hard stop / failed correction: list past Tilt Critical or a pulse that
+#      is not shrinking => emergency descent if the boat is high (ADR-015)
 #    · Maintain Level switch OFF => valves ganged, decisions logged as
 #      LEVEL(shadow) (observe-first, like height-maintain with actuation off)
 #
@@ -26,9 +27,10 @@
 #     5 = BYPASS         blower OFF, valves OPEN    (manual override: vent & hold hands-off; all LEDs off)
 #     6 = LOWERED_VENT   blower OFF, valves OPEN    (resting at Lowered: vent stays
 #                         open so the lift keeps settling; commands accepted)
-#     7 = EMERG_DESCEND  blower OFF, valves OPEN    (level divergence > Tilt Critical
-#                         with the boat high: give up altitude — vent BOTH sides down
-#                         to Ready, then seal into FAULT. Stop = seal now. ADR-013)
+#     7 = EMERG_DESCEND  blower OFF, valves OPEN    (correction failed or list
+#                         > Tilt Critical with the boat high: vent BOTH sides
+#                         to Ready; seal if list collapsed, else continue to
+#                         Lowered. Stop = seal now. ADR-015)
 #
 #  KC868-A16 I/O:
 #     I2C GPIO4/5 · inputs 0x22 (X01-08) 0x21 (X09-16)
@@ -61,12 +63,13 @@ substitutions:
   S_FAULT: "4"
   S_BYPASS: "5"
   S_LOWERED_VENT: "6"
-  S_EMERG: "7"      # emergency descent to Ready (level divergence, boat high)
+  S_EMERG: "7"      # emergency descent (ADR-015): Ready first, maybe Lowered
   # ---- go-to mode codes (global goto_mode) ----
   M_LIFT: "0"       # stored position — boat ceiling or empty ceiling (§5.1)
   M_READY: "1"      # almost down, not yet floating
   M_LOWER: "2"      # all the way down (boat floats free)
   M_MAX: "3"        # retired — Lift Max is no longer a mode (slot kept)
+  M_GUIDE: "4"      # floating, bunks still a slip centerline (sealed rest)
 
   # ---- Output channel numbers on PCF8574 outputs_1_8 (0x24), pins 0-7 ----
   blower_out_pin: "0"        # Y01 -> blower relay coil (RIB2401B / NT90)
@@ -110,7 +113,7 @@ esphome:
   build_path: .esphome/build/boat-lift
   project:
     name: ultralift.boat_lift
-    version: "0.9.1 (2026-09-05)"   # two Lift shutoffs, no Lift Max mode; build with venv ESPHome 2026.6.x
+    version: "0.11.1 (2026-09-10)"  # Guide go-to (web/HA); build with venv ESPHome 2026.6.x
 
 esp32:
   board: esp32dev
@@ -315,6 +318,10 @@ globals:
     type: float
     restore_value: no
     initial_value: "0.0"
+  - id: level_ok_since         # millis when lok last became true (0 = not trusted)
+    type: unsigned long        # hard stop waits 8 s of continuous dual-IMU trust
+    restore_value: no          # so a boot/startup frame cannot open both valves
+    initial_value: "0"
   - id: level_throttle         # 0 = none, 1 = master valve closed, 2 = slave valve closed
     type: int
     restore_value: no
@@ -349,10 +356,33 @@ globals:
     type: float
     restore_value: no
     initial_value: "0.0"
+  - id: rest_pulse_air_since     # when the feed/vent valve is actually open (0 = not yet)
+    type: unsigned long
+    restore_value: no
+    initial_value: "0"
+  - id: rest_pulse_err_at_air    # level_err_filt snapshot when air started
+    type: float
+    restore_value: no
+    initial_value: "0.0"
   - id: rest_last_pulse_ms       # min gap between rest-level pulses
     type: unsigned long
     restore_value: no
     initial_value: "0"
+  # ADR-015: emergency descent arrived at Lowered with residual list — vents
+  # stay open (LOWERED_VENT) but Lift Problem stays ON and mode buttons refuse
+  # until Stop acknowledges into FAULT + seal.
+  - id: emerg_lock
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: emerg_ready_since        # first tick in the Ready band during EMERG (0 = not there)
+    type: unsigned long
+    restore_value: no
+    initial_value: "0"
+  - id: emerg_ready_err          # level_err_filt snapshot at Ready arrival
+    type: float
+    restore_value: no
+    initial_value: "0.0"
 
   # ---- timers / progress trackers ----
   - id: blower_on_since
@@ -439,6 +469,16 @@ globals:
     type: bool
     restore_value: yes
     initial_value: "false"
+  # Guide (ADR-016): boat floating, bunks still a slip centerline. Capture-only
+  # until a go-to exists. Internal id is guide, not float (float = Ready).
+  - id: cal_angle_guide
+    type: float
+    restore_value: yes
+    initial_value: "0.0"
+  - id: cal_guide_done
+    type: bool
+    restore_value: yes
+    initial_value: "false"
 
   # ---- persisted SLAVE (IMU #2) calibration — its own captures at the same
   #      physical positions; the ~5° frame racking is calibrated out this way ----
@@ -474,6 +514,14 @@ globals:
     type: bool
     restore_value: yes
     initial_value: "false"
+  - id: cal2_angle_guide
+    type: float
+    restore_value: yes
+    initial_value: "0.0"
+  - id: cal2_guide_done
+    type: bool
+    restore_value: yes
+    initial_value: "false"
 
   # ---- derived height + position zones — computed ONCE by the 250 ms supervisor;
   #      every other consumer (status text, LEDs, observer, panel link, do_goto)
@@ -494,11 +542,19 @@ globals:
     type: float
     restore_value: no
     initial_value: "NAN"
+  - id: guide_target_pct         # Guide setpoint as % of span (NAN until Guide captured)
+    type: float
+    restore_value: no
+    initial_value: "NAN"
   - id: pos_at_lowered
     type: bool
     restore_value: no
     initial_value: "false"
   - id: pos_at_ready
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: pos_at_guide
     type: bool
     restore_value: no
     initial_value: "false"
@@ -797,6 +853,38 @@ number:
           id(cal2_float_done) = true;
           ESP_LOGI("cal", "SLAVE READY adjusted to %.2f deg", x);
   - platform: template
+    name: "Cal Angle — Guide"
+    id: cal_num_guide
+    web_server: {sorting_group_id: group_advanced, sorting_weight: 71.5}
+    min_value: -35
+    max_value: 65
+    step: 0.05
+    unit_of_measurement: "°"
+    entity_category: config
+    lambda: 'return id(cal_angle_guide);'
+    set_action:
+      - lambda: |-
+          id(cal_angle_guide) = x;
+          id(cal_guide_done) = true;
+          float gt = id(zone_tol_deg).state;
+          ESP_LOGI("cal", "GUIDE adjusted to %.2f deg (zone: %.2f .. %.2f)",
+                   x, x - gt, x + gt);
+  - platform: template
+    name: "Cal ${side_slave} Angle — Guide"
+    id: cal2_num_guide
+    web_server: {sorting_group_id: group_advanced, sorting_weight: 75.5}
+    min_value: -35
+    max_value: 65
+    step: 0.05
+    unit_of_measurement: "°"
+    entity_category: config
+    lambda: 'return id(cal2_angle_guide);'
+    set_action:
+      - lambda: |-
+          id(cal2_angle_guide) = x;
+          id(cal2_guide_done) = true;
+          ESP_LOGI("cal", "SLAVE GUIDE adjusted to %.2f deg", x);
+  - platform: template
     name: "Cal ${side_slave} Angle — Lift"
     id: cal2_num_top
     web_server: {sorting_group_id: group_advanced, sorting_weight: 76}
@@ -918,7 +1006,7 @@ number:
     web_server: {sorting_group_id: group_advanced, sorting_weight: 60}
     optimistic: true
     restore_value: true
-    initial_value: 3           # throttle when |slave% - master%| exceeds this
+    initial_value: 1.5         # ~0.9° on the ~58° span; in-move start / parked finish
     min_value: 1
     max_value: 15
     step: 0.5
@@ -955,7 +1043,7 @@ number:
     optimistic: true
     restore_value: true
     initial_value: 120         # master at target but slave can't close the gap
-    min_value: 10              # -> FAULT level_fail_catchup (stuck valve B / leak)
+    min_value: 10              # -> level_fail_catchup (descent if boat high; else FAULT)
     max_value: 600
     step: 5
     unit_of_measurement: "s"
@@ -1188,7 +1276,7 @@ number:
     web_server: {sorting_group_id: group_advanced, sorting_weight: 47}
     optimistic: true
     restore_value: true
-    initial_value: 3           # |level error| to start an at-rest pulse (looser than in-move)
+    initial_value: 2.5         # |level error| to start an at-rest pulse (dock 2026-09-10)
     min_value: 1
     max_value: 10
     step: 0.5
@@ -1200,26 +1288,27 @@ number:
     web_server: {sorting_group_id: group_advanced, sorting_weight: 48}
     optimistic: true
     restore_value: true
-    initial_value: 30          # error must persist this long before a rest pulse
+    initial_value: 15          # error must persist this long before a rest pulse
     min_value: 5
     max_value: 120
     step: 5
     unit_of_measurement: "s"
     entity_category: config
 
-  # ---- level-divergence HARD STOP threshold (§16.3): two-IMU error, expressed
-  #      in degrees of arm through the master span -> FAULT + make-safe.
-  #      rev I: the pitch-proxy annunciator is retired; this number now serves
-  #      the hard stop only. Name kept — the flash-persisted value is keyed to it. ----
+  # ---- Tilt Critical: never-exceed live list + Ready residual (ADR-015).
+  #      Two-IMU error in degrees of arm through the master span. Default 3°
+  #      ≈ HydroHoist 3 in side-to-side at Lift. Name kept so the flash-
+  #      persisted value survives. A live device at 5° must be nudged after OTA. ----
   - platform: template
     name: "Tilt Critical (deg)"
     id: tilt_critical_deg
     web_server: {sorting_group_id: group_advanced, sorting_weight: 51}
     optimistic: true
     restore_value: true
-    initial_value: 5           # DATA-CONFIRM: list proxy critical threshold
-    min_value: 1
-    max_value: 30
+    initial_value: 3           # OEM 3 in side-to-side ≈ 3° of arm at Lift.
+    # Flash-persisted: a live device still at 5° must be nudged after OTA.
+    min_value: 1               # 1° is a dock/HA test trip, not an operating setpoint
+    max_value: 5               # old wall; past this is dump/slip territory — not a knob
     step: 0.5
     unit_of_measurement: "°"
     entity_category: config
@@ -1247,6 +1336,19 @@ switch:
     turn_off_action:
       - lambda: 'id(test_mode) = false;'
       - script.execute: apply_outputs    # re-assert safe FSM outputs on exit
+
+  # One-shot: the level supervisor treats list as past Tilt Critical on the
+  # next armed tick (same path as a real hose-off). ALWAYS_OFF on boot so a
+  # power cycle cannot descend. Turns itself off when the descent starts.
+  # Bench Test must be OFF (FSM running). This WILL move the lift.
+  - platform: template
+    name: "Test: inject level fail"
+    id: test_inject_level_fail
+    icon: "mdi:alert-decagram"
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    entity_category: config
+    web_server: {sorting_group_id: group_bench, sorting_weight: 15}
 
   # ---- Bypass Mode (manual override) ----
   # ON  = open the valve, blower OFF, sit hands-off (lift vents/floats; FSM idle).
@@ -1372,7 +1474,8 @@ binary_sensor:
     web_server: {sorting_group_id: group_status, sorting_weight: 10}
     lambda: |-
       return id(lift_state) == ${S_FAULT} || id(lift_state) == ${S_BYPASS}
-             || id(lift_state) == ${S_EMERG} || !id(angle_trusted)
+             || id(lift_state) == ${S_EMERG} || id(emerg_lock)
+             || !id(angle_trusted)
              || !(id(cal_down_done) && id(cal_up_done));
 
   # ---- HA convenience: ON = a person asked the lift to move (dock/panel button,
@@ -1789,8 +1892,9 @@ text_sensor:
     web_server: {sorting_group_id: group_config, sorting_weight: 20}
     update_interval: 1s
     lambda: |-
-      char b[160];
-      if (!id(cal_down_done) && !id(cal_float_done) && !id(cal_up_done) && !id(cal_max_done))
+      char b[200];
+      if (!id(cal_down_done) && !id(cal_float_done) && !id(cal_up_done)
+          && !id(cal_max_done) && !id(cal_guide_done))
         return std::string("Not calibrated");
       int n = 0;
       if (id(cal_down_done)) {
@@ -1798,6 +1902,13 @@ text_sensor:
         n += snprintf(b, sizeof(b), "Lowered: >%.1f° (cal %.1f°)", lim, id(cal_angle_down));
       } else {
         n += snprintf(b, sizeof(b), "Lowered: —");
+      }
+      if (id(cal_guide_done)) {
+        float gt = id(zone_tol_deg).state;
+        n += snprintf(b + n, sizeof(b) - n, "  Guide: %.1f..%.1f°",
+                      id(cal_angle_guide) - gt, id(cal_angle_guide) + gt);
+      } else {
+        n += snprintf(b + n, sizeof(b) - n, "  Guide: —");
       }
       if (id(cal_float_done)) {
         float rt = id(zone_tol_deg).state;
@@ -1838,6 +1949,7 @@ text_sensor:
         case ${S_BYPASS}:   return std::string("Bypass");
         case ${S_EMERG}:    return std::string("Emergency Descent");
         default:
+          if (id(emerg_lock)) return std::string("Emergency Descent");
           if (id(rest_pulse) != 0) return std::string("Leveling");
           return std::string("Idle");   // HOLD + LOWERED_VENT
       }
@@ -1851,6 +1963,7 @@ text_sensor:
       // being passed through). Unknown = sensor untrusted or not calibrated.
       if (!id(angle_trusted) || !id(have_cal) || std::isnan(id(lift_pct)))
         return std::string("Unknown");
+      if (id(pos_at_guide))   return std::string("Guide");
       if (id(pos_at_lowered)) return std::string("Lowered");
       if (id(pos_at_ready))   return std::string("Ready");
       if (id(pos_at_top))     return std::string("Lifted");
@@ -1871,9 +1984,16 @@ text_sensor:
       bool have_pct = id(have_cal) && !std::isnan(pct);
       int s = id(lift_state);
       const char* mn = id(goto_mode) == ${M_LIFT} ? "Lift"
-                     : (id(goto_mode) == ${M_READY} ? "Ready" : "Lower");
-      // 1) emergency descent (ADR-013) — outranks everything but shares FAULT's tier
-      if (s == ${S_EMERG}) return std::string("EMERGENCY — descending to Ready (level failure)");
+                     : (id(goto_mode) == ${M_READY} ? "Ready"
+                     : (id(goto_mode) == ${M_GUIDE} ? "Guide" : "Lower"));
+      // 1) emergency descent (ADR-015) — outranks everything but shares FAULT's tier
+      if (s == ${S_EMERG}) {
+        if (id(goto_mode) == ${M_LOWER})
+          return std::string("EMERGENCY — descending to Lowered (level failure)");
+        return std::string("EMERGENCY — descending to Ready (level failure)");
+      }
+      if (id(emerg_lock))
+        return std::string("EMERGENCY — lowered, vents open (level failure)");
       // 1a) fault
       if (s == ${S_FAULT}) return std::string("FAULT — ") + id(fault_reason);
       // 1b) bypass — manual override, valve open, hands-off
@@ -1895,6 +2015,7 @@ text_sensor:
       if (!id(angle_valid))   return std::string("Angle sensor OFFLINE - manual control");
       if (!id(angle_trusted)) return std::string("Angle OUT OF RANGE - manual control");
       if (!have_pct) return std::string("Not calibrated");
+      if (id(pos_at_guide))    return std::string("Guide");
       if (id(pos_at_lowered))  return std::string("Lowered");
       if (id(pos_at_ready))    return std::string("Ready");
       if (id(pos_at_top))      return std::string("Lifted");
@@ -2018,6 +2139,10 @@ button:
     web_server: {sorting_group_id: group_control, sorting_weight: 2}
     on_press: {script.execute: request_goto_ready}
   - platform: template
+    name: "Guide"
+    web_server: {sorting_group_id: group_control, sorting_weight: 2.5}
+    on_press: {script.execute: request_goto_guide}
+  - platform: template
     name: "Stop"
     web_server: {sorting_group_id: group_control, sorting_weight: 3}
     on_press: {script.execute: request_stop}
@@ -2068,6 +2193,18 @@ button:
           ESP_LOGI("cal", "READY set to %.2f deg (zone: %.2f .. %.2f)",
                    id(cal_angle_float), id(cal_angle_float) - rt, id(cal_angle_float) + rt);
   - platform: template
+    name: "Calibrate: set GUIDE"
+    entity_category: config
+    web_server: {sorting_group_id: group_config, sorting_weight: 52.5}
+    on_press:
+      - lambda: |-
+          id(cal_angle_guide) = id(current_angle);
+          id(cal_guide_done) = true;
+          id(cal_num_guide).publish_state(id(cal_angle_guide));
+          float gt = id(zone_tol_deg).state;
+          ESP_LOGI("cal", "GUIDE set to %.2f deg (zone: %.2f .. %.2f)",
+                   id(cal_angle_guide), id(cal_angle_guide) - gt, id(cal_angle_guide) + gt);
+  - platform: template
     name: "Calibrate: set LOWERED"
     entity_category: config
     web_server: {sorting_group_id: group_config, sorting_weight: 53}
@@ -2111,6 +2248,16 @@ button:
           id(cal2_num_ready).publish_state(id(cal2_angle_float));
           ESP_LOGI("cal", "SLAVE READY set to %.2f deg", id(cal2_angle_float));
   - platform: template
+    name: "Calibrate ${side_slave}: set GUIDE"
+    entity_category: config
+    web_server: {sorting_group_id: group_config, sorting_weight: 56.5}
+    on_press:
+      - lambda: |-
+          id(cal2_angle_guide) = id(current_angle2);
+          id(cal2_guide_done) = true;
+          id(cal2_num_guide).publish_state(id(cal2_angle_guide));
+          ESP_LOGI("cal", "SLAVE GUIDE set to %.2f deg", id(cal2_angle_guide));
+  - platform: template
     name: "Calibrate ${side_slave}: set LOWERED"
     entity_category: config
     web_server: {sorting_group_id: group_config, sorting_weight: 57}
@@ -2140,7 +2287,7 @@ select:
     name: "Lift Command"
     id: lift_command_select
     icon: "mdi:swap-vertical-bold"
-    options: ["—", "Lift", "Ready", "Lower"]
+    options: ["—", "Lift", "Ready", "Guide", "Lower"]
     update_interval: 1s
     web_server: {sorting_group_id: group_advanced, sorting_weight: 80}
     lambda: |-
@@ -2149,6 +2296,7 @@ select:
         switch (id(goto_mode)) {
           case ${M_LIFT}:  return std::string("Lift");
           case ${M_READY}: return std::string("Ready");
+          case ${M_GUIDE}: return std::string("Guide");
           case ${M_LOWER}: return std::string("Lower");
         }
       }
@@ -2157,7 +2305,33 @@ select:
       - lambda: |-
           if      (x == "Lift")  id(request_goto_top)->execute();
           else if (x == "Ready") id(request_goto_ready)->execute();
+          else if (x == "Guide") id(request_goto_guide)->execute();
           else if (x == "Lower") id(request_goto_lowered)->execute();
+
+# ---------------------------------------------------------------------------
+#  HA cover — everyday envelope only: Open = Lift, Close = Ready, Stop = Stop.
+#  No position slider (has_position: false) so HA cannot send 50%.
+#  Full Lower stays on Lift Command / the Lower button (phone on the walk).
+#  No device_class: garage — voice assistants must not treat this as a door.
+#  State is published from the 250 ms tick (no restore-and-call — that would
+#  fire a move on boot).
+# ---------------------------------------------------------------------------
+cover:
+  - platform: template
+    name: "Lift Ready"
+    id: lift_ready_cover
+    icon: "mdi:arrow-up-down-bold"
+    restore_mode: NO_RESTORE
+    optimistic: false
+    assumed_state: false
+    has_position: false
+    web_server: {sorting_group_id: group_control, sorting_weight: 5}
+    open_action:
+      - script.execute: request_goto_top
+    close_action:
+      - script.execute: request_goto_ready
+    stop_action:
+      - script.execute: request_stop
 
 # ---------------------------------------------------------------------------
 #  Intents (request_*) — validate against state + interlocks, then transition.
@@ -2177,8 +2351,12 @@ script:
       mode: int
     then:
       - lambda: |-
-          // accepted from rest OR while moving (retarget). Not from FAULT/BYPASS.
+          // accepted from rest OR while moving (retarget). Not from FAULT/BYPASS/EMERG.
           int prev_s = id(lift_state);
+          if (id(emerg_lock)) {
+            ESP_LOGW("fsm", "goto: refused (emergency lock — Stop to acknowledge)");
+            return;
+          }
           if (prev_s != ${S_HOLD} && prev_s != ${S_LOWERED_VENT}
               && prev_s != ${S_RAISING} && prev_s != ${S_LOWERING}) return;
           if (!id(have_cal)) { ESP_LOGW("fsm","goto: not calibrated"); return; }
@@ -2195,6 +2373,7 @@ script:
 
           bool in_zone = (mode == ${M_LOWER} && id(pos_at_lowered))
                       || (mode == ${M_READY} && id(pos_at_ready))
+                      || (mode == ${M_GUIDE} && id(pos_at_guide))
                       || (mode == ${M_LIFT}  && !std::isnan(cur) && cur >= target - tol);
           int next_s;
           if (in_zone || !(cur < target - tol || cur > target + tol)) {
@@ -2243,6 +2422,7 @@ script:
     then:
       - lambda: |-
           int prev_s = id(lift_state);
+          if (id(emerg_lock) || prev_s == ${S_EMERG}) return;
           if (prev_s != ${S_HOLD} && prev_s != ${S_LOWERED_VENT}
               && prev_s != ${S_RAISING} && prev_s != ${S_LOWERING}) return;
           id(lowered_vent_stopped) = false;
@@ -2261,6 +2441,7 @@ script:
     then:
       - lambda: |-
           int prev_s = id(lift_state);
+          if (id(emerg_lock) || prev_s == ${S_EMERG}) return;
           if (prev_s != ${S_HOLD} && prev_s != ${S_LOWERED_VENT}
               && prev_s != ${S_RAISING} && prev_s != ${S_LOWERING}) return;
           id(lowered_vent_stopped) = false;
@@ -2306,6 +2487,15 @@ script:
           // mid-move just like Lift and Lower. Load classification only constrains
           // unattended Ready maintenance; it never blocks an operator command.
           id(do_goto)->execute(id(ready_target_pct), ${M_READY});
+  - id: request_goto_guide      # like Ready: trusted angle, captured setpoint, sealed rest
+    then:
+      - lambda: |-
+          if (id(test_mode)) { ESP_LOGI("fsm","bench test: GUIDE press ignored"); return; }
+          id(user_cmd_move) = true;
+          if (!id(angle_trusted)) { ESP_LOGW("fsm","Guide needs a trusted angle"); return; }
+          if (!id(cal_guide_done)) { ESP_LOGW("fsm","Guide not calibrated"); return; }
+          if (std::isnan(id(guide_target_pct))) return;
+          id(do_goto)->execute(id(guide_target_pct), ${M_GUIDE});
 
   - id: request_stop
     then:
@@ -2322,10 +2512,11 @@ script:
             return;
           }
           id(lowered_vent_stopped) = true;
-          if (id(lift_state) == ${S_EMERG}) {
+          if (id(lift_state) == ${S_EMERG} || id(emerg_lock)) {
             // operator override: seal NOW, latch the fault (second press clears -> HOLD)
+            id(emerg_lock) = false;
             id(enter_fault)->execute("level_divergence - operator stop");
-            ESP_LOGW("fsm", "request_stop during EMERGENCY DESCENT -> sealed, FAULT latched");
+            ESP_LOGW("fsm", "request_stop during EMERGENCY -> sealed, FAULT latched");
           } else if (id(lift_state) == ${S_FAULT}) {
             id(fault_reason) = "";
             id(rest_pulse) = 0;
@@ -2350,6 +2541,7 @@ script:
     then:
       - lambda: |-
           if (id(test_mode)) { ESP_LOGI("fsm","bench test: bypass ignored"); return; }
+          if (id(lift_state) == ${S_EMERG} || id(emerg_lock)) return;
           if (id(lift_state) == ${S_BYPASS}) return;       // already in bypass
           id(manual_move) = false;
           id(rest_pulse) = 0;
@@ -2382,11 +2574,44 @@ script:
           if (id(lift_state) != ${S_FAULT}) {
             id(fault_reason) = reason;
             id(rest_pulse) = 0;
+            id(emerg_lock) = false;
+            id(emerg_ready_since) = 0;
             id(lift_state) = ${S_FAULT};
             id(last_stop_reason) = std::string("FAULT: ") + reason;
             ESP_LOGE("fsm", "FAULT: %s", reason.c_str());
           }
       - script.execute: apply_outputs
+
+  # ADR-015: above Ready → EMERG_DESCEND; at/below Ready → FAULT + seal.
+  # Shared by the 3° hard stop, a rest-level pulse that is not winning, and
+  # in-move catch-up. Stall still calls enter_fault directly.
+  - id: start_emergency_descent
+    parameters:
+      reason: string
+    then:
+      - lambda: |-
+          if (id(test_mode)) return;
+          if (id(lift_state) == ${S_FAULT} || id(lift_state) == ${S_EMERG}) return;
+          if (id(emerg_lock)) return;
+          bool boat_high = !std::isnan(id(ready_target_pct)) && !std::isnan(id(lift_pct))
+                           && id(lift_pct) > id(ready_target_pct) + id(zone_tol_pct);
+          if (!boat_high) {
+            id(enter_fault)->execute(reason);
+            return;
+          }
+          id(rest_pulse) = 0;
+          id(level_throttle) = 0;
+          id(manual_move) = false;
+          id(user_cmd_move) = false;
+          id(emerg_lock) = false;
+          id(emerg_ready_since) = 0;
+          id(goto_mode) = ${M_READY};
+          id(lower_start_time) = millis();
+          id(lift_state) = ${S_EMERG};
+          id(last_stop_reason) = std::string("EMERGENCY descent: ") + reason;
+          ESP_LOGE("level", "EMERGENCY DESCENT: %s — venting both sides to Ready, blower off",
+                   reason.c_str());
+          id(apply_outputs)->execute();
 
   # ---- THE single place outputs are written. Outputs = f(state, rest_pulse). ----
   - id: apply_outputs
@@ -2527,16 +2752,16 @@ interval:
           int s = id(lift_state);
           bool bypass = (s == ${S_BYPASS});       // BYPASS: dark panel — every LED off
           bool moving = (s == ${S_RAISING} || s == ${S_LOWERING});
-          bool emerg  = (s == ${S_EMERG});        // ADR-013 emergency descent to Ready
+          bool emerg  = (s == ${S_EMERG}) || id(emerg_lock);
           bool critical = (s == ${S_FAULT}) || emerg || !id(angle_trusted);
           bool at_top = (s == ${S_HOLD}) && id(angle_trusted) && id(pos_at_top);
-          bool at_low = id(pos_at_lowered);
+          bool at_low = id(pos_at_lowered) && !id(pos_at_guide);
           bool at_rdy = id(pos_at_ready);
           // position LEDs: solid when resting at that mode, slow-flashing while heading
           // there (emergency descent slow-flashes Ready — that's where it's going)
           bool top_on = !bypass && (at_top || (moving && id(goto_mode) == ${M_LIFT} && flash_slow));
           bool rdy_on = !bypass && (at_rdy || ((moving || emerg) && id(goto_mode) == ${M_READY} && flash_slow));
-          bool low_on = !bypass && (at_low || (moving && id(goto_mode) == ${M_LOWER} && flash_slow));
+          bool low_on = !bypass && (at_low || ((moving || emerg) && id(goto_mode) == ${M_LOWER} && flash_slow));
           // RED Stop ring cadence:
           //   bypass            -> off (dark panel)
           //   latched FAULT     -> steady flash  (press the red Stop button to clear)
@@ -2597,6 +2822,8 @@ interval:
                       ? id(zone_tol_deg).state / fabs(span) * 100.0f : 0.0f;
           id(ready_target_pct) = (id(have_cal) && id(cal_float_done))
                       ? (id(cal_angle_float) - id(cal_angle_down)) / span * 100.0f : NAN;
+          id(guide_target_pct) = (id(have_cal) && id(cal_guide_done))
+                      ? (id(cal_angle_guide) - id(cal_angle_down)) / span * 100.0f : NAN;
           // Lift shutoff: confirmed empty uses Empty Max; any boat / unknown uses
           // the boat (Cobalt) ceiling. Lift Target % is the always-reach fraction.
           if (id(have_cal)) {
@@ -2634,6 +2861,8 @@ interval:
               && id(current_angle) > (id(cal_angle_down) - id(zone_tol_deg).state);
           id(pos_at_ready) = id(cal_float_done) && id(angle_valid)
               && fabs(id(current_angle) - id(cal_angle_float)) <= id(zone_tol_deg).state;
+          id(pos_at_guide) = id(cal_guide_done) && id(angle_valid)
+              && fabs(id(current_angle) - id(cal_angle_guide)) <= id(zone_tol_deg).state;
           id(pos_at_max) = id(cal_max_done) && id(angle_valid)
               && fabs(id(current_angle) - id(cal_angle_max)) <= id(zone_tol_deg).state;
           id(pos_at_top) = id(angle_valid) && !std::isnan(id(lift_pct))
@@ -2669,42 +2898,44 @@ interval:
                      && !std::isnan(id(lift_pct)) && !std::isnan(id(slave_pct));
           id(level_ok_now) = lok;
           if (lok) {
+            if (id(level_ok_since) == 0) {
+              id(level_ok_since) = now;
+              ESP_LOGI("level", "both IMUs trusted — hard stop arms in 8 s");
+            }
             float e = id(slave_pct) - id(lift_pct);
             float a2 = 0.25f / 3.0f;          // ~3 s EMA (waves largely cancel in the difference)
             id(level_err_filt) = a2 * e + (1.0f - a2) * id(level_err_filt);
+          } else if (id(level_ok_since) != 0) {
+            id(level_ok_since) = 0;
+            id(level_err_filt) = 0.0f;        // drop a startup/dropout spike; do not carry it
+            ESP_LOGW("level", "level trust lost — hard stop disarmed");
           }
 
-          // ---- §16.2 HARD STOP: sides diverging past Tilt Critical (°) is a
-          //      something-is-mechanically-wrong condition — air cannot fix it.
-          //      Armed whenever both sensors are trusted, independent of the
-          //      Auto-Maintain Level switch. (% error -> degrees via master span.)
-          //      ADR-013 response depends on WHERE the boat is:
-          //        · boat HIGH (above the Ready band): sealing in place would hold
-          //          the good side up while the failed side falls — the worst
-          //          response to a burst hose. Instead EMERGENCY DESCENT: vent
-          //          BOTH sides down to Ready, then seal into FAULT.
-          //        · at/below Ready (or Ready not calibrated / height unknown):
-          //          FAULT + make-safe as before — a list down low is harmless. ----
-          if (lok && id(have_cal) && !id(test_mode)) {
-            float err_deg = fabs(id(level_err_filt)) * fabs(span) / 100.0f;
-            if (err_deg > id(tilt_critical_deg).state
-                && id(lift_state) != ${S_FAULT} && id(lift_state) != ${S_EMERG}) {
-              bool boat_high = !std::isnan(id(ready_target_pct)) && !std::isnan(id(lift_pct))
-                               && id(lift_pct) > id(ready_target_pct) + id(zone_tol_pct);
+          // ---- §16.2 HARD STOP (ADR-015): list past Tilt Critical (°) is a
+          //      never-exceed. Armed after 8 s of *continuous* dual-IMU trust
+          //      (a cold-boot first frame can be plausible but wrong; the 3 s
+          //      EMA can then trip in ~500 ms and open both valves — the
+          //      opposite of Power-up → HOLD). Once armed, a later hose burst
+          //      still trips immediately. start_emergency_descent: boat HIGH
+          //      → ganged vent; at/below Ready → FAULT + seal. ----
+          float err_deg = lok && id(have_cal)
+                        ? fabs(id(level_err_filt)) * fabs(span) / 100.0f : NAN;
+          bool level_hard_armed = lok && id(level_ok_since) != 0
+                                  && (now - id(level_ok_since)) >= 8000UL;
+          bool inject = id(test_inject_level_fail).state;
+          if (level_hard_armed && id(have_cal) && !id(test_mode)
+              && (inject || (!std::isnan(err_deg) && err_deg > id(tilt_critical_deg).state))
+              && id(lift_state) != ${S_FAULT} && id(lift_state) != ${S_EMERG}
+              && !id(emerg_lock)) {
+            if (inject) {
+              id(test_inject_level_fail).publish_state(false);
+              ESP_LOGW("level", "TEST INJECT: forcing level-fail path at %.0f%% (live list %.1f deg)",
+                       id(lift_pct), err_deg);
+              id(start_emergency_descent)->execute("test_inject");
+            } else {
               ESP_LOGE("level", "LEVEL HARD STOP: sides diverged %.1f deg (> %.1f) at %.0f%%",
                        err_deg, id(tilt_critical_deg).state, id(lift_pct));
-              if (boat_high) {
-                id(rest_pulse) = 0;
-                id(level_throttle) = 0;
-                id(manual_move) = false;
-                id(goto_mode) = ${M_READY};
-                id(lower_start_time) = now;        // Lower Timeout backstops the descent
-                id(lift_state) = ${S_EMERG};
-                id(last_stop_reason) = "EMERGENCY descent: level divergence";
-                ESP_LOGE("level", "EMERGENCY DESCENT: venting both sides to Ready, blower off");
-              } else {
-                id(enter_fault)->execute("level_divergence");
-              }
+              id(start_emergency_descent)->execute("level_divergence");
             }
           }
 
@@ -2760,11 +2991,18 @@ interval:
             //      Height maintain has priority: if master is below the sag
             //      deadband, do not start (or abort) a rest pulse — the height
             //      top-up raise will level as a side effect via in-move throttle.
-            //      No sticky lockout: count visit events, keep correcting. ----
+            //      ADR-015: air budget is a *not-winning* detector only (feed
+            //      30 s / vent 10 s with no shrink → fail-safe). If the list
+            //      is shrinking, keep going until the same release as in-move
+            //      (deadband − hysteresis) or the vent height floor / 3°.
+            //      Dock 2026-09-10: a winning 10 s vent stopped at 2.7% in
+            //      the 2–3% hole and never retried. ----
             {
-              const unsigned long FEED_MS = 45000UL;
+              const unsigned long FEED_MS = 30000UL;      // air budget, not relay-on
               const unsigned long VENT_MS = 10000UL;
+              const unsigned long AIR_GRACE_MS = 8000UL;  // actuator open dead time
               const unsigned long REST_GAP_MS = 60000UL;  // min off-time between pulses
+              const float WIN_PCT = 0.5f;                 // |err| must shrink by this
               bool at_lift_only = (s0 == ${S_HOLD}) && id(pos_at_top);
               float lift_sp = std::isnan(id(lift_shutoff_pct))
                             ? id(top_target_pct).state : id(lift_shutoff_pct);
@@ -2776,35 +3014,68 @@ interval:
               // manage an active pulse
               if (id(rest_pulse) != 0) {
                 bool abort = !at_lift_only || !lok || !lvl_on || !height_ok;
-                unsigned long lim = (id(rest_pulse) <= 2) ? FEED_MS : VENT_MS;
-                bool timed_out = (now - id(rest_pulse_since)) >= lim;
+                bool feed = id(rest_pulse) <= 2;
+                bool v_open = (id(rest_pulse) == 1 || id(rest_pulse) == 4)
+                            ? id(valve_fb_open).state : id(valve_b_fb_open).state;
+                if (id(rest_pulse_air_since) == 0
+                    && (v_open || (now - id(rest_pulse_since)) >= AIR_GRACE_MS)) {
+                  id(rest_pulse_air_since) = now;
+                  id(rest_pulse_err_at_air) = id(level_err_filt);
+                }
+                bool air_on = id(rest_pulse_air_since) != 0;
+                unsigned long air_ms = air_on ? (now - id(rest_pulse_air_since)) : 0;
+                unsigned long lim = feed ? FEED_MS : VENT_MS;
+                bool timed_out = air_on && air_ms >= lim;
+                bool winning = air_on && lok
+                    && (fabs(id(level_err_filt)) + WIN_PCT < fabs(id(rest_pulse_err_at_air)));
+                bool growing = air_on && lok
+                    && (fabs(id(level_err_filt)) > fabs(id(rest_pulse_err_at_air)) + WIN_PCT);
                 // vent floor: never trade Lift height away
                 if (id(rest_pulse) >= 3 && !std::isnan(id(lift_pct))
                     && id(lift_pct) < lift_sp - id(zone_tol_pct)) {
                   abort = true;
                   ESP_LOGW("level", "REST-LEVEL: vent aborted (height floor)");
                 }
-                // done when error back inside release band
-                float rel = id(rest_level_trigger_pct).state
+                // Same finish line as a raise/lower throttle release.
+                float rel = id(level_deadband_pct).state
                             - id(level_hysteresis_pct).state;
                 if (rel < 0.0f) rel = 0.0f;
                 bool leveled = lok && fabs(id(level_err_filt)) <= rel;
-                // feed progress: fed side must move within ~15 s or abort
-                if (!abort && id(rest_pulse) <= 2 && (now - id(rest_pulse_since)) > 15000UL) {
-                  float fed = (id(rest_pulse) == 1) ? id(current_angle) : id(current_angle2);
-                  float dir = (id(rest_pulse) == 1)
-                            ? ((span >= 0.0f) ? 1.0f : -1.0f)
-                            : ((span2 >= 0.0f) ? 1.0f : -1.0f);
-                  if ((fed - id(rest_pulse_start_angle)) * dir < 0.15f) {
-                    abort = true;
-                    ESP_LOGW("level", "REST-LEVEL: feed no progress -> abort");
+                bool give_up = false;
+                if (!abort && !leveled && air_on) {
+                  if (!std::isnan(err_deg) && err_deg > id(tilt_critical_deg).state) {
+                    give_up = true;
+                    ESP_LOGE("level", "REST-LEVEL: abort angle %.1f deg -> fail-safe", err_deg);
+                  } else if (!feed && growing) {
+                    give_up = true;
+                    ESP_LOGE("level", "REST-LEVEL: vent grew error -> fail-safe");
+                  } else if (feed && air_ms > 15000UL && !winning) {
+                    float fed = (id(rest_pulse) == 1) ? id(current_angle) : id(current_angle2);
+                    float dir = (id(rest_pulse) == 1)
+                              ? ((span >= 0.0f) ? 1.0f : -1.0f)
+                              : ((span2 >= 0.0f) ? 1.0f : -1.0f);
+                    if ((fed - id(rest_pulse_start_angle)) * dir < 0.15f) {
+                      give_up = true;
+                      ESP_LOGE("level", "REST-LEVEL: feed no progress -> fail-safe");
+                    }
+                  } else if (timed_out && !winning) {
+                    give_up = true;
+                    ESP_LOGE("level", "REST-LEVEL: %s air not shrinking -> fail-safe",
+                             feed ? "30s" : "10s vent");
                   }
                 }
-                if (abort || timed_out || leveled) {
+                if (give_up) {
+                  id(rest_pulse) = 0;
+                  id(rest_pulse_air_since) = 0;
+                  id(rest_last_pulse_ms) = now;
+                  id(rest_level_below_since) = 0;
+                  id(start_emergency_descent)->execute("level_correct_fail");
+                } else if (abort || leveled) {
                   ESP_LOGI("level", "REST-LEVEL: pulse end (%s) err %+.1f%%",
-                           abort ? "abort" : (timed_out ? "timeout" : "leveled"),
+                           abort ? "abort" : "leveled",
                            id(level_err_filt));
                   id(rest_pulse) = 0;
+                  id(rest_pulse_air_since) = 0;
                   id(rest_last_pulse_ms) = now;
                   id(rest_level_below_since) = 0;
                 }
@@ -2823,6 +3094,7 @@ interval:
                                            : (slave_high ? 3 : 4);  // vent HIGH
                     id(rest_pulse) = want;
                     id(rest_pulse_since) = now;
+                    id(rest_pulse_air_since) = 0;
                     id(rest_pulse_start_angle) =
                         (want == 1 || want == 4) ? id(current_angle) : id(current_angle2);
                     id(rest_level_below_since) = 0;
@@ -2843,7 +3115,10 @@ interval:
                 }
               } else {
                 id(rest_level_below_since) = 0;
-                if (!at_lift_only && id(rest_pulse) != 0) id(rest_pulse) = 0;
+                if (!at_lift_only && id(rest_pulse) != 0) {
+                  id(rest_pulse) = 0;
+                  id(rest_pulse_air_since) = 0;
+                }
               }
             }
           }
@@ -2982,6 +3257,7 @@ interval:
               bool reached = false;
               if (id(goto_mode) == ${M_LOWER} && id(pos_at_lowered)) reached = true;
               else if (id(goto_mode) == ${M_READY} && id(pos_at_ready)) reached = true;
+              else if (id(goto_mode) == ${M_GUIDE} && id(pos_at_guide)) reached = true;
               else if (id(angle_valid) && !std::isnan(pct) && pct >= id(goto_target_pct)) reached = true;
               // Two-sided completion: master at target, but the slave must be
               // inside the level band too — the throttle (master valve closed)
@@ -2996,7 +3272,7 @@ interval:
                 }
                 if ((now - id(level_catchup_start)) >
                     (unsigned long)(id(level_catchup_timeout_s).state * 1000.0f)) {
-                  id(enter_fault)->execute("level_fail_catchup");
+                  id(start_emergency_descent)->execute("level_fail_catchup");
                 }
                 reached = false;   // keep the move alive; throttle feeds the lagging side
               }
@@ -3014,6 +3290,7 @@ interval:
             bool at_target = false;
             if (id(goto_mode) == ${M_LOWER} && id(pos_at_lowered)) at_target = true;
             else if (id(goto_mode) == ${M_READY} && id(pos_at_ready)) at_target = true;
+            else if (id(goto_mode) == ${M_GUIDE} && id(pos_at_guide)) at_target = true;
             else if (id(angle_valid) && !std::isnan(pct) && pct <= id(goto_target_pct)) at_target = true;
             unsigned long lt_ms = (unsigned long)(id(lower_timeout_minutes).state * 60000.0f);
             if (at_target) {
@@ -3043,7 +3320,7 @@ interval:
                   }
                   if ((now - id(level_catchup_start)) >
                       (unsigned long)(id(level_catchup_timeout_s).state * 1000.0f)) {
-                    id(enter_fault)->execute("level_fail_catchup");
+                    id(start_emergency_descent)->execute("level_fail_catchup");
                   }
                   lvl_hold = true;
                 }
@@ -3072,22 +3349,72 @@ interval:
             }
           }
 
-          // ---- EMERGENCY DESCENT (ADR-013): both valves open, blower off, riding
-          //      down to Ready. Ends sealed in FAULT: on reaching the Ready band
-          //      (or sinking below it — a fast descent can skip the band between
-          //      ticks), or on Lower Timeout. Trust loss does NOT stop it — venting
-          //      down is passively safe (power-loss behaviour with an ending), and
-          //      the timeout still seals. Stop = seal now (handled in request_stop).
-          //      Mode buttons are refused (do_goto only accepts states 0/2/3/6). ----
+          // ---- EMERGENCY DESCENT (ADR-015): both valves open, blower off.
+          //      Stage 1: ride to Ready. If list collapsed and is not growing,
+          //      FAULT + seal. If residual list, still growing, or level trust
+          //      lost → stage 2: continue to Lowered, then LOWERED_VENT +
+          //      emerg_lock (vents stay open, Problem ON). Trust loss does NOT
+          //      stop the descent. Timeout seals. Stop = seal now. ----
           else if (s == ${S_EMERG}) {
-            bool below_ready = id(angle_valid) && !std::isnan(pct)
-                               && !std::isnan(id(ready_target_pct))
-                               && pct <= id(ready_target_pct);
             unsigned long lt_ms = (unsigned long)(id(lower_timeout_minutes).state * 60000.0f);
-            if (id(pos_at_ready) || below_ready) {
-              id(enter_fault)->execute("level_divergence - descended, sealed at Ready");
-            } else if ((now - id(lower_start_time)) > lt_ms) {
-              id(enter_fault)->execute("level_divergence - descent timeout, sealed");
+            // now is sampled at the start of this 250 ms tick; start_emergency_descent
+            // stamps lower_start_time with a later millis(). Unsigned subtract would
+            // wrap and look like a 49-day timeout — same-tick inject then sealed
+            // without ever leaving Lift (dock 2026-09-10).
+            unsigned long started = id(lower_start_time);
+            bool timed_out = (now >= started) && ((now - started) > lt_ms);
+            if (id(goto_mode) == ${M_LOWER}) {
+              if (id(pos_at_lowered)) {
+                id(emerg_lock) = true;
+                id(emerg_ready_since) = 0;
+                id(lift_state) = ${S_LOWERED_VENT};
+                id(last_stop_reason) = "EMERGENCY — lowered, vents open";
+                if (!id(boat_present)) ESP_LOGI("presence", "EMERG LOWERED_VENT -> presence reset to presumed BOAT ON");
+                id(boat_present) = true;
+                id(boat_heavy) = true;
+                id(boat_load_known) = false;
+                ESP_LOGE("level", "EMERGENCY: arrived Lowered with residual list, vents left open");
+              } else if (timed_out) {
+                id(enter_fault)->execute("level_divergence - descent timeout, sealed");
+              }
+            } else {
+              bool below_ready = id(angle_valid) && !std::isnan(pct)
+                                 && !std::isnan(id(ready_target_pct))
+                                 && pct <= id(ready_target_pct);
+              bool at_ready = id(pos_at_ready) || below_ready;
+              if (at_ready) {
+                const float WIN_PCT = 0.5f;
+                bool residual = !lok || std::isnan(err_deg)
+                                || err_deg > id(tilt_critical_deg).state;
+                if (residual) {
+                  id(goto_mode) = ${M_LOWER};
+                  id(lower_start_time) = now;
+                  id(emerg_ready_since) = 0;
+                  ESP_LOGE("level", "EMERGENCY: residual list at Ready (%.1f deg) — continuing to Lowered",
+                           err_deg);
+                } else {
+                  if (id(emerg_ready_since) == 0) {
+                    id(emerg_ready_since) = now;
+                    id(emerg_ready_err) = id(level_err_filt);
+                  }
+                  if ((now - id(emerg_ready_since)) >= 2000UL) {
+                    bool growing = fabs(id(level_err_filt))
+                                   > fabs(id(emerg_ready_err)) + WIN_PCT;
+                    if (growing) {
+                      id(goto_mode) = ${M_LOWER};
+                      id(lower_start_time) = now;
+                      id(emerg_ready_since) = 0;
+                      ESP_LOGE("level", "EMERGENCY: list still growing at Ready — continuing to Lowered");
+                    } else {
+                      id(enter_fault)->execute("level_divergence - descended, sealed at Ready");
+                    }
+                  }
+                }
+              } else {
+                id(emerg_ready_since) = 0;
+                if (timed_out)
+                  id(enter_fault)->execute("level_divergence - descent timeout, sealed");
+              }
             }
           }
 
@@ -3098,7 +3425,7 @@ interval:
           //      indefinitely. Stop latches it sealed until the next mode request.
           //      Boat can come/go at the bottom, so presence resets to presumed ON. ----
           else if (s == ${S_HOLD} && id(angle_trusted) && id(pos_at_lowered)
-                   && !id(lowered_vent_stopped)) {
+                   && !id(pos_at_guide) && !id(lowered_vent_stopped)) {
             id(lift_state) = ${S_LOWERED_VENT};
             id(boat_present) = true;
             id(boat_heavy) = true;
@@ -3141,6 +3468,37 @@ interval:
             }
             id(prev_lift_state) = cs;
           }
+
+          // ---- HA Lift/Ready cover: open = above Ready, closed = at/below Ready
+          //      (incl. Lowered). Opening/closing only for user Lift/Ready moves
+          //      and emergency descent (destination is Ready, or Lowered if
+          //      residual list remains). A Lower from the
+          //      select/button is not this entity — leave operation idle.
+          {
+            float pos = 0.0f;   // COVER_CLOSED
+            if (id(angle_trusted) && id(have_cal) && !std::isnan(id(lift_pct))) {
+              if (!std::isnan(id(ready_target_pct))
+                  && id(lift_pct) > id(ready_target_pct) + id(zone_tol_pct))
+                pos = 1.0f;     // COVER_OPEN
+              else if (id(pos_at_top))
+                pos = 1.0f;
+            }
+            cover::CoverOperation op = cover::COVER_OPERATION_IDLE;
+            int cs0 = id(lift_state);
+            if (cs0 == ${S_EMERG}) {
+              op = cover::COVER_OPERATION_CLOSING;
+            } else if (id(user_cmd_move)
+                       && (cs0 == ${S_RAISING} || cs0 == ${S_LOWERING})) {
+              if (id(goto_mode) == ${M_LIFT})       op = cover::COVER_OPERATION_OPENING;
+              else if (id(goto_mode) == ${M_READY}) op = cover::COVER_OPERATION_CLOSING;
+            }
+            if (id(lift_ready_cover).position != pos
+                || id(lift_ready_cover).current_operation != op) {
+              id(lift_ready_cover).position = pos;
+              id(lift_ready_cover).current_operation = op;
+              id(lift_ready_cover).publish_state();
+            }
+          }
       # re-assert outputs from (possibly updated) state every tick
       - script.execute: apply_outputs
 
@@ -3174,7 +3532,11 @@ interval:
           }
 
           // ---- sag rate (%/h) from the filtered height, sampled every 60 s ----
-          if (good && id(obs_height_filt) > -900.0f) {
+          // Resting HOLD only. A commanded raise/lower is not sag — carrying
+          // that slope into the first parked tick false-trips Air Loss (Ready
+          // arrival 2026-09-06: 149 s descent → "sag rate high", cleared 3 min).
+          bool sag_rest = (id(lift_state) == ${S_HOLD});
+          if (good && sag_rest && id(obs_height_filt) > -900.0f) {
             if (id(obs_rate_last_t) == 0) {
               id(obs_rate_last_t) = now; id(obs_rate_last_h) = id(obs_height_filt);
             } else if (now - id(obs_rate_last_t) >= 60000UL) {
@@ -3182,6 +3544,9 @@ interval:
               if (dt_h > 0.0f) id(obs_sag_rate) = (id(obs_height_filt) - id(obs_rate_last_h)) / dt_h;
               id(obs_rate_last_t) = now; id(obs_rate_last_h) = id(obs_height_filt);
             }
+          } else if (!sag_rest) {
+            id(obs_rate_last_t) = 0;
+            id(obs_sag_rate) = 0.0f;
           }
 
           // ---- AIR LOSS ALERT (§15.5 — visibility only; NEVER actuates) ----
@@ -3190,7 +3555,8 @@ interval:
           //      in 30 s with both valves commanded closed (60 s settle grace after
           //      sealing; event latches the alert ~30 min). Seal failure, manually
           //      opened valve, or the §14.2 compression spiral.
-          //   B) parked sag rate beyond Air Alert Sag Rate (downward).
+          //   B) parked sag rate beyond Air Alert Sag Rate (downward) — same 60 s
+          //      post-seal grace so a finished go-to is not an alert.
           //   C) top-ups + level fixes this visit reach Air Alert Visit Events.
           // Keepers keep correcting regardless (ADR-004) — this is the "and you
           // should know about it" layer. HA alerts on the Air Loss Alert binary.
@@ -3200,25 +3566,27 @@ interval:
             if (!sealed) { id(seal_ref_filt) = -999.0f; id(seal_since) = 0; }
             else {
               if (id(seal_since) == 0) { id(seal_since) = now; id(seal_ref_filt) = -999.0f; }
-              bool seal_settled = (now - id(seal_since)) > 60000UL;
-              if (seal_settled && good && id(obs_height_filt) > -900.0f) {
-                if (id(seal_ref_filt) < -900.0f) {
-                  id(seal_ref_filt) = id(obs_height_filt); id(seal_ref_ms) = now;
-                } else if (now - id(seal_ref_ms) >= 30000UL) {
-                  float drop = id(seal_ref_filt) - id(obs_height_filt);
-                  if (drop > id(air_drop_alert_pct).state) {
-                    id(air_alert_latch_ms) = now;
-                    ESP_LOGE("airloss", "SINKING WHILE SEALED: %.1f%% in 30 s (limit %.1f%%) at %.1f%%",
-                             drop, id(air_drop_alert_pct).state, id(obs_height_filt));
-                  }
-                  id(seal_ref_filt) = id(obs_height_filt); id(seal_ref_ms) = now;
+            }
+            bool seal_settled = sealed && id(seal_since) != 0
+                                && (now - id(seal_since)) > 60000UL;
+            if (seal_settled && good && id(obs_height_filt) > -900.0f) {
+              if (id(seal_ref_filt) < -900.0f) {
+                id(seal_ref_filt) = id(obs_height_filt); id(seal_ref_ms) = now;
+              } else if (now - id(seal_ref_ms) >= 30000UL) {
+                float drop = id(seal_ref_filt) - id(obs_height_filt);
+                if (drop > id(air_drop_alert_pct).state) {
+                  id(air_alert_latch_ms) = now;
+                  ESP_LOGE("airloss", "SINKING WHILE SEALED: %.1f%% in 30 s (limit %.1f%%) at %.1f%%",
+                           drop, id(air_drop_alert_pct).state, id(obs_height_filt));
                 }
+                id(seal_ref_filt) = id(obs_height_filt); id(seal_ref_ms) = now;
               }
             }
             bool parked = (id(lift_state) == ${S_HOLD}) && id(visit_pos) != 0;
             bool a = id(air_alert_latch_ms) != 0
                      && (now - id(air_alert_latch_ms)) < 1800000UL;
-            bool b = parked && (id(obs_sag_rate) < -id(air_sag_alert_rate).state);
+            bool b = parked && seal_settled
+                     && (id(obs_sag_rate) < -id(air_sag_alert_rate).state);
             bool c = parked && (id(visit_height_count) + id(visit_level_count))
                                >= (int) id(air_visit_alert_count).state;
             bool on = a || b || c;
@@ -3368,13 +3736,14 @@ interval:
           int s = id(lift_state);
           const char* st = "HOLDING";
           if (s == ${S_FAULT})              st = "FAULT";
-          else if (s == ${S_EMERG})         st = "EMERG_DESCEND";
+          else if (s == ${S_EMERG} || id(emerg_lock)) st = "EMERG_DESCEND";
           else if (s == ${S_BYPASS})        st = "BYPASS";
           else if (s == ${S_RAISING})       st = "RAISING";
           else if (s == ${S_LOWERING})      st = "LOWERING";
           else if (s == ${S_LOWERED_VENT})  st = "LOWERED";   // resting, vent open
           else if (have && id(angle_trusted) && !std::isnan(pct)) {   // HOLD: resting position
-            if (id(pos_at_lowered))       st = "LOWERED";
+            if (id(pos_at_guide))         st = "GUIDE";
+            else if (id(pos_at_lowered))  st = "LOWERED";
             else if (id(pos_at_ready))    st = "READY";
             else if (id(pos_at_top))      st = "LIFTED";
             else if (!std::isnan(id(ready_target_pct)))
@@ -3411,6 +3780,7 @@ interval:
                   if      (req == "LIFT" || req == "TOP")              id(request_goto_top)->execute();
                   else if (req == "LIFT_MAX" || req == "MAX")          id(request_goto_top)->execute();
                   else if (req == "READY")      id(request_goto_ready)->execute();
+                  else if (req == "GUIDE")      id(request_goto_guide)->execute();
                   else if (req == "LOWER" || req == "LOWERED")         id(request_goto_lowered)->execute();
                   else if (req == "STOP")       id(request_stop)->execute();
                   else if (req == "RESET")      id(request_stop)->execute();   // rev G: Stop = universal clear
