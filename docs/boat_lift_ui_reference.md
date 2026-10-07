@@ -2,7 +2,7 @@
 
 What every entity on the device web page (and in Home Assistant) means, group by group, with example readings. This is the operator-facing companion to the engineering design in [`boat_lift_design.md`](boat_lift_design.md) (§ references point there).
 
-The page is ordered top to bottom: **Control → Status → Configuration → Advanced Tuning → Diagnostics → Bench**. The rule for what lives where: *Control is what you press, Status is what you glance at, Configuration is what you set at commissioning, Advanced Tuning is set-and-forget thresholds, Diagnostics is for chasing a problem, Bench is hands-on wiring work only.*
+October 6 dashboard: the main page shows **position commands + Stop → lift status → automatic maintenance**. **Diagnostics** is collapsed. **Advanced** is collapsed, with Calibration, Tuning, and Service & bench nested inside it. Existing calibration normally needs no further adjustment. See [the embedded dashboard](web_dashboard.md) for layout, connection behavior and local testing. The numbered groups below remain the entity reference; Configuration maps to Advanced → Calibration/Tuning, and Bench maps to Advanced → Service & bench. The rule for what lives where: *Control is what you press, Status is what you glance at, Configuration is what you set at commissioning, Advanced Tuning is set-and-forget thresholds, Diagnostics is for chasing a problem, Bench is hands-on wiring work only.*
 
 ---
 
@@ -16,12 +16,14 @@ The page is ordered top to bottom: **Control → Status → Configuration → Ad
 | `EMERGENCY — descending to Lowered (level failure)` | Ready still had residual list (or list still growing): continuing the ganged vent to the bottom. |
 | `EMERGENCY — lowered, vents open (level failure)` | Emergency descent arrived at Lowered; vents stay open, `Lift Problem` ON, mode buttons refused until **Stop** acknowledges (FAULT + seal). |
 | `FAULT — stall_no_progress` (etc.) | Latched safe stop + reason. Press **Stop** to clear. |
-| `BYPASS — valve open, blower off (manual override)` | Hands-off manual mode (§6.6). Dark button panel. |
-| `Raising → Lift` / `Lowering → Ready` | Moving, with the destination named. |
-| `MANUAL raising…` / `MANUAL lowering…` | Moving without position feedback (angle not trusted) — bounded by timers and Stop only. |
+| `BYPASS — valve open, blower off (manual override)` | Hands-off manual mode (§6.6). Position rings dark, red flashing. Press **Stop** once. |
+| `Raising → Lift` / `Lowering → Ready` | Moving, with the destination named. `(port angle)` means starboard is out and port is running the move. `(port IMU offline)` means starboard is running and port is out. |
+| `MANUAL raising…` / `MANUAL lowering…` | Moving with neither IMU trusted — bounded by timers and Stop only. |
 | `Lowered — vent open` | Resting at the bottom, vents deliberately left open (they stay open at the bottom, always). |
 | `Manual valve` | A valve's real position disagrees with what's commanded — someone operated it by hand (or it's stuck). |
-| `Angle sensor OFFLINE - manual control` / `Angle OUT OF RANGE - manual control` | Height feedback lost; only manual jogs and Stop work (§6.5). |
+| `Angle sensors OFFLINE - manual control` / `Angle OUT OF RANGE - manual control` / `Angle not trusted - manual control` | Neither IMU can run height. Lift and Lower jog; Ready and Guide do nothing until a sensor returns (§6.5). |
+| `Lifted — port angle` (and the same suffix on other positions) | Starboard is untrusted. Go-to is using the port captures. Leveling is off. The red ring uses the IMU cadence until starboard returns. |
+| `… — port IMU offline` | Port is untrusted. Go-to stays on starboard. Leveling is off. |
 | `Not calibrated` | No target moves until Lift + Lowered are captured. |
 | `Lifted` / `Ready` / `Guide` / `Lowered` / `Between ready/lifted` … | Resting position. `Guide` = floating, bunks still centering the slip (ADR-016); only after both Guide captures. |
 
@@ -31,9 +33,9 @@ The page is ordered top to bottom: **Control → Status → Configuration → Ad
 
 **Auto-Maintain Level** *(default ON)* — keeps the two sides even: throttles the side that's ahead during every move, and corrects a developing list while parked at Lift. OFF = valves ganged, decisions still logged as `LEVEL(shadow)`.
 
-**Bypass Mode** — opens both valves, blower off, controller idle (web/HA or panel Diagnostics; the dock red button no longer enters Bypass). The lift vents and floats; all button LEDs go dark. Turn OFF (or short-press Stop) to return to normal.
+**Bypass Mode** — opens both valves, blower off, controller idle (web/HA or panel Diagnostics; the dock red button no longer enters Bypass). The lift vents and floats. The three position rings go dark and the red ring flashes; press Stop once (or turn the switch off) to return to normal. Every ring dark means the controller has no power.
 
-**Lift Ready** *(cover, blind)* — Home Assistant raise/lower/stop for the everyday envelope. Raise sends Lift, lower sends Ready, Stop is Stop. Its position is Lift Height; above 95% it shows fully raised. It does not go to Lower (use the Lower button or `Lift Command` → Lower), and a partial position command is ignored.
+**Lift Ready** *(cover, blind)* — Home Assistant raise/lower/stop for the everyday envelope. Raise sends Lift, lower sends Ready, Stop is Stop. Its position is Lift Height; above 95% it shows fully raised and stays there until height falls below 93%, avoiding chatter from small drift. This display hysteresis does not change actual height, motion or maintenance thresholds. It does not go to Lower (use the Lower button or `Lift Command` → Lower), and a partial position command is ignored.
 
 ---
 
@@ -41,7 +43,7 @@ The page is ordered top to bottom: **Control → Status → Configuration → Ad
 
 - **Valve Positions** — the valves' *real* end-stop positions from their feedback contacts, e.g. `Starboard CLOSED · Port CLOSED`. `MOVING` = mid-travel; `FAULT` = both contacts on (contact fault). This is the single source of truth for valve state — trust it over any inference.
 - **Level Status** — how level the lift is / what leveling is doing: `Level OK — Port 0.4% low`, `Leveling — holding Starboard back` (in-move throttle), `Leveling — feeding Port` (at-rest pulse), `Auto-level OFF — …`, or a ganged-fallback reason (`Port IMU offline — ganged`).
-- **Lift Problem** *(binary)* — the one flag to alert on: fault, bypass, angle not trusted, or uncalibrated.
+- **Lift Problem** *(binary)* — the one flag to alert on: fault, bypass, emergency, either IMU untrusted, or starboard not calibrated. A single dead IMU still allows go-to on the other side.
 - **Lift In Operation** *(binary)* — ON while a move *somebody asked for* is running (any button, panel, web, or HA), OFF when it finishes. Keeper top-ups and the emergency descent don't light it — watch Lift Activity for those.
 - **Air Loss Alert** *(binary)* — ON when air is leaving abnormally: sinking while sealed, parked sag rate too high, or too many keeper interventions in one visit (§15.5). The keepers keep correcting either way — this is the "you should know about this" flag. Reason in Diagnostics → Air Loss Detail.
 - **Lift Height** — position as % of the calibrated span (Lowered = 0 %, Lift / boat-max cal = 100 %). Can read below 0 (settled past the Lowered cal) or above 100 (empty lift riding toward Empty Max).
@@ -100,7 +102,7 @@ All live-editable and stored on the device — an OTA does *not* overwrite value
 
 ## 5 · Diagnostics
 
-Read-only. **Arm Angle Starboard/Port** (raw degrees), **Height Port** (slave side's own %), **Level Error** (Port minus Starboard, %), **IMU OK** flags, **Lift Height (filtered)** (wave-stripped), **Lift Wave P-P** (60 s wave amplitude), **Lift Sag Rate** (%/h drift), **Visit Height Top-ups / Visit Level Events** (per-visit keeper counters, for HA graphs), **Air Loss Detail** (why the alert is on), **Last Stop Reason** (why the last move ended — first place to look when "the valve closed by itself"), **Last Move Duration**, **Uptime / WiFi Signal / Firmware Build**.
+Read-only. **Arm Angle Starboard/Port** (raw roll, degrees), **Arm Pitch Starboard/Port** (raw pitch, degrees — mount observation only, not used for control), **Height Port** (slave side's own %), **Level Error** (Port minus Starboard, %), **IMU OK** flags, **Lift Height (filtered)** (wave-stripped), **Lift Wave P-P** (60 s wave amplitude), **Lift Sag Rate** (%/h drift), **Visit Height Top-ups / Visit Level Events** (per-visit keeper counters, for HA graphs), **Air Loss Detail** (why the alert is on), **Last Stop Reason** (why the last move ended — first place to look when "the valve closed by itself"), **Last Move Duration**, **Uptime / WiFi Signal / Firmware Build**.
 
 ---
 
@@ -109,3 +111,5 @@ Read-only. **Arm Angle Starboard/Port** (raw degrees), **Height Port** (slave si
 Hands-on only. **Bench Test (FSM off)** suspends the state machine so the relay/valve switches below it can be toggled by hand for wiring verification; button presses are ignored (but logged). The red dock button remains a universal kill even on the bench. **Turn Bench Test OFF for normal service.**
 
 **Test: inject level fail** — one-shot. The level supervisor takes the same hard-stop path as a real list past Tilt Critical (then ADR-015 descent). Boots OFF; clears itself when the descent starts. **This moves the lift.** Bench Test must be OFF. A valve toggle here is *not* that test: with the FSM running, `apply_outputs` overwrites bench valve switches every tick.
+
+**Target bunk height** and **Go** — occasional, at the bottom of Service & bench. The number is bunk inches from the waterline, the same zero as **Bunk Height** (negative is below water). Go converts that height through the arm sine and runs one existing go-to. Leave Bench Test off. It does not change Guide, and auto-maintain does not hold that height. While it moves, status reads `Raising → Height` or `Lowering → Height`. A height the calibrated stroke cannot reach is refused.

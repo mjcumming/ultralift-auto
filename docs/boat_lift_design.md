@@ -51,7 +51,7 @@ Each WT901 reports two tilt axes:
 
 - **X-axis (Roll) = the height/position axis.** `current_angle` tracks Roll; all height %, setpoints, calibration, and go-to logic derive from X on the **master** IMU.
   **Sign convention (field-confirmed):** fully **lowered = positive** angle; raising swings the angle **negative**. Height % handles the negative span transparently. The one-sided Lowered zone ("at the lowered angle *or settled beyond it*") depends on this sign — revisit if a sensor is remounted.
-- **Y-axis (Pitch) = decoded but unused.** Pitch should not change as the lift swings; drift would imply the sensor was knocked or loosened. The pitch-based tilt proxy (`Lift Tilt`, `Lift Tilt Critical`, LEVEL ref capture) was **retired 2026-07-24** — the two-IMU **Level Error** is the list signal, and the level-divergence hard stop (§16.2) is the mechanical backstop.
+- **Y-axis (Pitch) = published, not used for control.** `Arm Pitch Starboard` / `Arm Pitch Port` are the raw Y angles. Pitch should not change as the lift swings; a later mount check will compare them to the band these sensors record. The pitch-based *list* proxy (`Lift Tilt`, `Lift Tilt Critical`, LEVEL ref capture) stays **retired** (2026-07-24) — the two-IMU **Level Error** is the list signal, and the level-divergence hard stop (§16.2) is the mechanical backstop. Pitch does not clear `angle_trusted` yet (§13).
 
 ---
 
@@ -122,6 +122,8 @@ Four **go-to setpoints** the lift can be sent to (ADR-016 Guide is web/HA, no do
 | **Ready** | Orange | Almost down — on the bunks, sealed, walkable | `cal_ready` (captured angle) |
 | **Guide** | Web / HA (no dock LED) | Boat **floating**, bunks still a slip centerline | `cal_guide` — sealed rest, like Ready |
 | **Lowered** | Green | All the way down (keep venting) | `cal_lowered` (~0 %) |
+
+Under **Advanced → Service & bench**, **Target Height** (bunk inches, same waterline zero as Bunk Height) and **Go to Height** run one existing go-to. Inches convert through the arm sine, because a degree near horizontal buys more height than a degree at the bottom. It is not a parked mode and not an everyday control: auto-maintain still holds only Lift and Ready, and a target that lands in the Lowered band still follows the vent rule.
 
 Plus red **Stop** (§6.3): cancels motion and commands safe outputs in every operating state. Height % is derived linearly between `cal_lift` (100 % — max with the heavy boat) and `cal_lowered` (0 %); Ready and Guide are their own angles; `cal_max` is the empty-lift ceiling, not a mode. **Naming:** buttons/UI say *Lift / Ready / Lower*; firmware internal calibration ids remain `up` / `float` / `down` / `max` / `guide` (`float` = Ready, never Guide).
 
@@ -198,21 +200,22 @@ Position checks use **one captured setpoint per mode + one configurable band**: 
 - **RAISING:** stop when the target zone is reached → HOLD. (Backstops: stall detector and absolute blower cap.)
 - **LOWERING:** stop when the target zone is reached → HOLD — **except a Lowered target**, which rests in **LOWERED_VENT**. The `Lower Timeout` timer backstops a descent that never confirms its zone.
 - **Stop / red button:** any moving or resting state → HOLD with blower off and valves closed. It also clears a latched FAULT, seals emergency descent, and exits Bypass. At Lowered, Stop latches the vent closed; pressing Lower again clears that latch and resumes continuous venting. At Guide (once captured), Stop stays sealed — the Lowered-zone re-entry rule does not fire. Mode buttons do **not** cancel — they retarget (§6.2).
-- **Supervisor:** → FAULT (hard) or **auto-stop on loss of angle trust** (§6.5).
+- **Supervisor:** → FAULT (hard) or **auto-stop when both angle sources are lost** (§6.5).
 
 ### 6.4 Preconditions
 
-A position-targeted move requires: **calibrated**, a **trusted master angle** (§9.4), and **not faulted**.
+A position-targeted move requires: **a trusted height source** (§9.4), and **not faulted**.
 
-### 6.5 Degraded / manual mode (angle not trusted)
+### 6.5 One IMU down, and manual mode when both are down
 
-When the master angle is **offline** or **out of range**, the controller drops to **manual-recovery mode** rather than a latched fault:
+Starboard is the primary height source. Port runs height only when starboard is untrusted and port is trusted and calibrated (ADR-017). Either way, a single dead IMU **keeps go-to working** on the survivor: valves ganged, leveling off, `Lift Problem` on, red on the IMU cadence (§8). A move in progress retargets into the surviving sensor’s percent. An in-flight inch target stops, because that percent belonged to the sensor that started it.
+
+Manual recovery is only when **neither** IMU can provide height:
 
 - A position-targeted move in progress is **STOPPED** to HOLD.
-- **Red LED flashes** (critical); **Lift → manual RAISE jog**, **Lowered → manual LOWER jog**, **Ready refused**, **Stop always live**.
+- **Lift → manual RAISE jog**, **Lowered → manual LOWER jog**, **Ready and Guide refused**, **Stop always live**.
 - Manual jogs run **without position feedback**, bounded only by the **absolute blower cap** (up), **lower-timeout** (down), and **Stop**.
-- Returning to a trusted angle restores normal go-to automatically.
-- While untrusted, leveling is disabled and both valves are ganged.
+- A returning IMU restores go-to on its own. Pressing red does not invent a height.
 
 ### 6.6 Bypass mode (manual override)
 
@@ -221,7 +224,7 @@ Hands-off override that **opens both valves and ensures the blower is off**, the
 - **Outputs:** valves **OPEN**, blower **OFF**. The lift is **vented** — it will not hold on the pneumatics.
 - **Entry:** toggle **Bypass Mode** ON (web/HA), or panel Diagnostics `BYPASS_ON`. The dock red button does **not** enter Bypass; it remains Stop-only.
 - **Exit:** short-press Stop/red, or toggle the switch OFF → **HOLD**.
-- **LEDs:** all OFF in bypass — a dark panel means bypass.
+- **LEDs:** the three position rings go off and red flashes. A dark panel with a flashing red button is bypass; every ring dark is power loss.
 - **Status:** Lift Status shows bypass; **Lift Problem = ON** while bypassed.
 
 ---
@@ -254,18 +257,22 @@ Future option (not done): use end-stops as stuck-valve fault triggers.
 
 ## 8. Button LED Scheme
 
-| LED | SOLID when | FLASHING when | OFF otherwise |
-|---|---|---|---|
-| Lift (white) | resting **at Lift** | moving with **target = Lift** | |
-| Ready (orange) | resting **at Ready** | moving with **target = Ready** | |
-| Lowered (green) | resting **at Lowered** (not Guide) | moving with **target = Lowered** | |
-| Stop (red) | **moving (in operation)** | **critical** — fault OR angle not trusted | resting & healthy |
+The boat is the height display. The rings show which commands are available, which one is running, and the failures you cannot see from the dock (ADR-017).
 
-- Position LED **solid** = resting in that mode; **flashing** = heading to that mode.
-- **Red solid** = "in operation — press to stop." **Red flashing** = "critical."
-- In degraded/manual mode white (Lift) and green (Lowered) are the live manual controls.
-- **Bypass:** every LED OFF.
-- Cadences: position LEDs flash **slow** (~0.8 Hz) while moving; **fast flash** (~2.5 Hz) for faults/critical on red. Angle-sensor-**offline**: ~3 s fast-flash burst, then ~10 s dark, repeating.
+| Ring | On | Flashing | Off |
+|---|---|---|---|
+| Lift (white), Ready, Lower | Whenever the controller is in normal service | The destination of a person-commanded move, or of an emergency descent, until it finishes. A manual jog flashes Lift or Lower. | Bypass (all three) |
+| Stop (red) | — | See cadences below | Healthy, including while a move is running |
+
+Red cadences, highest priority first:
+
+| Cadence | Meaning | What you do |
+|---|---|---|
+| Even flash (~2.5 Hz) | Latched fault, emergency descent (including settled at the bottom with vents open), or bypass | Press red. A fault or bypass clears in one press. An emergency seals on the first press and clears on the second. Then a mode can be tried. |
+| 3 s even flash, 10 s dark | One or both IMUs untrusted | With one IMU alive, modes already work on that sensor and this cadence stays until it recovers. With both dead, Lift and Lower are manual jogs. |
+| Slow double-blink | Wi-Fi is down and the rows above are clear | Nothing at the dock. The lift is fully local. |
+
+A keeper top-up does not flash a button. Guide and an inch target have no dock button, so none of the three flash. In manual mode the white and green rings are the jog controls; Ready stays lit and a press does nothing.
 
 ---
 
@@ -286,23 +293,23 @@ Future option (not done): use end-stops as stuck-valve fault triggers.
   1. `EMERGENCY — descending to Ready (level failure)` / `… to Lowered` / `EMERGENCY — lowered, vents open (level failure)` (ADR-015)
   2. `FAULT — <reason>`
   3. `BYPASS — valve open, blower off (manual override)`
-  4. Moving → `MANUAL raising…` (untrusted) or `Raising -> Ready` (go-to; **no live % embedded**)
-  5. `Lowered — vent open` (LOWERED_VENT)
+  4. Moving → `MANUAL raising…` (neither IMU trusted) or `Raising -> Ready` (go-to; **no live % embedded**). A port fallback appends `(port angle)`; a dead port appends `(port IMU offline)`.
+  5. `Lowered — vent open` (LOWERED_VENT), with the same IMU suffix when one side is out
   6. `Manual valve` (feedback disagrees with closed command, §7.1)
-  7. `Angle sensor OFFLINE — manual control` / `Angle OUT OF RANGE — manual control`
+  7. `Angle sensors OFFLINE - manual control` / `Angle OUT OF RANGE - manual control` / `Angle not trusted - manual control` (neither side can run height)
   8. `Not calibrated`
-  9. Resting → `Lowered`, `Ready`, `Lifted`, `Between …`, or `Holding`
+  9. Resting → `Lowered`, `Ready`, `Lifted`, `Between …`, or `Holding`, plus `— port angle` or `— port IMU offline` when that is the degraded case
 
 Short tokens exist for **exact-match Home Assistant automations**. Embedding a live percentage in status floods the HA recorder.
 
-- **Lift Problem** (binary, `problem`) — ON for fault / bypass / emergency descent / emergency-Lowered lock / **angle not trusted** / uncalibrated.
+- **Lift Problem** (binary, `problem`) — ON for fault / bypass / emergency descent / emergency-Lowered lock / **either IMU untrusted** / starboard uncalibrated. One dead IMU still allows go-to on the other (ADR-017).
 - **Lift In Operation** (binary, `running`) — ON only while a **person-initiated** move runs (any button, panel, web, or HA command), OFF when it settles. Machine-initiated motion — keeper top-ups, ADR-013 emergency descent — deliberately stays OFF; that motion reads in `Lift Activity`. Backed by a `user_cmd_move` flag set in every `request_goto_*` intent and cleared when the keeper starts a top-up (ADR-014).
 
 ### 9.2b HA command entity
 
 **`Lift Command`** (select: `— / Lift / Ready / Guide / Lower`) — the declarative control for HA automations and scenes: setting an option fires the same `request_*` intent as the matching button, so every interlock applies. Shows the destination while a user-commanded move runs, rests at `—` (a no-op option) so re-selecting always fires. Guide and Lower stay on this select (and their web buttons) for deliberate remote use.
 
-**`Lift Ready`** (cover, `blind`) — everyday HA raise/lower/stop: raise = Lift, lower = Ready, stop = Stop. Position is Lift Height %; above 95% reports fully raised. A partial set-position is ignored. See ADR-014.
+**`Lift Ready`** (cover, `blind`) — everyday HA raise/lower/stop: raise = Lift, lower = Ready, stop = Stop. Position is Lift Height %; above 95% latches fully raised until height falls below 93%. This display hysteresis absorbs small drift; raw height, motion and maintenance remain unchanged. The latch is not persisted, and untrusted height holds the previous display. A partial set-position is ignored. See ADR-014.
 
 ### 9.3 UI tiers (web_server sorting groups)
 
@@ -310,16 +317,18 @@ Short tokens exist for **exact-match Home Assistant automations**. Embedding a l
 
 ### 9.4 Angle trust ladder
 
-Only **trusted** master angle allows automatic go-to moves:
+Each IMU is trusted on its own. Automatic go-to needs one trusted, calibrated side (§6.5):
 
 | Rung | Test | Behaviour |
 |---|---|---|
-| **OFFLINE** | no fresh frames within `Angle Freshness` (~3 s) | manual recovery; sensor OK = off |
-| **OUT OF RANGE** | data fresh, but live angle outside calibrated span ± `Angle Plausibility Margin` (default 10°) | manual recovery; auto-move stopped |
+| **OFFLINE** | no fresh frames within `Angle Freshness` (~3 s) | that IMU drops out |
+| **OUT OF RANGE** | data fresh, but live angle outside calibrated span ± `Angle Plausibility Margin` (default 10°) | that IMU drops out |
 | **SENSOR MOVED** *(Guard B — retired 2026-07-24 with the pitch proxy)* | — | a moved/loosened sensor surfaces as persistent two-IMU Level Error / divergence |
-| **TRUSTED** | fresh + plausible | normal go-to |
+| **TRUSTED** | fresh + plausible | eligible as a height source |
 
-Implemented as `angle_valid` (fresh + inside ±95°) → `angle_trusted` (valid + plausible). Loss of trust mid-move **auto-stops** to HOLD. The slave IMU runs the same ladder independently (`angle2_valid` / `angle2_trusted`); leveling degrades to ganged valves when the slave loses trust.
+Height uses starboard when it is trusted and calibrated, otherwise port. Go-to stops only when neither side is eligible (§6.5). The slave ladder still gates leveling on its own.
+
+Implemented as `angle_valid` (fresh + inside ±95°) → `angle_trusted` (valid + plausible) for starboard, and the same ladder for port (`angle2_valid` / `angle2_trusted`). `height_ok` is starboard when that side is trusted and calibrated, otherwise port. Loss of **both** mid-move auto-stops to HOLD. Leveling degrades to ganged valves when either side loses trust.
 
 Size the `angle_valid` gate to the *mounted* sensor. With the confirmed mounting (arm swing well inside ±90°, lowered = positive), the gate is **±95°**. Remount → re-check this gate and the one-sided Lowered zone (§6.2).
 
@@ -342,7 +351,7 @@ Size the `angle_valid` gate to the *mounted* sensor. With the confirmed mounting
 - HOLD/FAULT: valves commanded CLOSED, blower OFF. (LOWERED_VENT/BYPASS/EMERG_DESCEND: valves OPEN, blower OFF.)
 - **Absolute blower runtime cap** (`Blower Max Runtime`, all modes incl. manual test): the blower can never run longer than this. *Must exceed real full-raise time before live use (OEM auto-off ~15 min).*
 - RAISING requires angle progress after a grace window, or FAULT (stall). Stall progress is **sign-aware** and **feed-aware** during leveling throttle.
-- **Automatic moves require a trusted master angle** (§9.4); loss of trust mid-move **auto-stops** to HOLD.
+- **Automatic moves require a trusted height source** (§9.4, ADR-017); loss of both IMUs mid-move **auto-stops** to HOLD. One surviving IMU keeps the move, with valves ganged.
 - **Level fail-safe** (§16.2, ADR-015): list past `Tilt Critical` (~3°) or a correction that is not winning → emergency descent if the boat is high, else FAULT + make-safe.
 - **Power-up → safe** (valves closed, HOLD). **Power-loss → safe drift** (vents down to float). **Network loss → no change in safe behaviour.**
 - **Bench Test Mode must be OFF for normal service** (suspends FSM output control and ignores button intents).
@@ -371,6 +380,11 @@ Size the `angle_valid` gate to the *mounted* sensor. With the confirmed mounting
 
 Still open:
 
+- **Pitch mount check** (observation started 2026-10-06). `Arm Pitch Starboard` and `Arm Pitch Port` are in Home Assistant with `state_class: measurement`, so hourly min/mean/max survive the recorder purge. They do not affect trust, leveling, or go-to. Finish only after both sides have parked time and a few full strokes:
+  1. Read the statistics. Note the quiet band at rest and how far pitch moves across a stroke. A hanging or cocked mount is a large step; dock waves are small and common to both sensors.
+  2. Pick a sustained departure from each side's installed pitch.
+  3. On that departure, clear that side's existing trusted bit (`angle_trusted` / `angle2_trusted`). ADR-017 already gangs the valves and continues height on the other IMU. Do not add a leveling path that runs on one sensor.
+  4. Leave acceleration (`0x51`) and gyro (`0x52`) unparsed unless the pitch band cannot see a rattle. The angle output is the filtered gravity vector; raw accel is only the motion that filter removes.
 - Decide manual jog: **latched-with-Stop** (current) vs **hold-to-run / deadman**.
 - **Maintain-at-Ready policy** (float-away guard): whether sustained Ready sag should escalate to notify/FAULT.
 - Decide whether valve feedback should ever gate the FSM (stuck-valve fault) or stay display-only.
@@ -478,7 +492,7 @@ Each tank has its own vent/fill valve and inclinometer. The controller keeps the
 
 ### 16.1 Roles — reference (master) / follower (slave)
 
-- **Master = IMU #1** (GPIO32) is the **reference frame**. Sole authority for lift *height*: position zones, go-to targets, angle trust, timeouts.
+- **Master = IMU #1** (GPIO32) is the **reference frame** and the primary height source. Port supplies height only while starboard is untrusted (ADR-017). Zones, go-to targets, and stall progress follow whichever sensor is the height source.
 - **Slave = IMU #2** (GPIO14) answers one question: *is my side where the master's side is?* The slave is corrected **to match the master**, never the reverse.
 - **Physical side labels:** master = **STARBOARD**, slave = **PORT**. UI entity names use side terms via substitutions; master/slave remain internal role names. **Valve A (Y2) = starboard** and **valve B (Y3) = port** — leveling requires valve A = master's side (swap pin substitutions if plumbing differs).
 - Because the frame racks, "level" is compared in **calibrated-% space**: each sensor gets its own Lowered/Ready/Lift captures; `level error = slave_height_% − master_height_%` (positive = slave side HIGH).
@@ -540,8 +554,9 @@ While parked at **Lift**, a list is corrected by the at-rest keeper. Ready is **
 | Condition | Behaviour |
 |---|---|
 | Auto-Maintain Level OFF | valves ganged; decisions still logged as `LEVEL(shadow)` |
-| Slave stale / implausible | leveling + completion gate disabled, valves ganged |
-| Master trust lost mid-move | auto move stops |
+| Slave stale / implausible | starboard keeps height; leveling + completion gate disabled, valves ganged |
+| Master trust lost, port still trusted | move continues on port percent; valves ganged |
+| Both IMUs untrusted mid-move | auto move stops |
 | Sides diverge past hard stop, or correction not winning | emergency descent if boat high; else FAULT + make-safe |
 | Slave can't catch up in time | `level_fail_catchup` — descent if boat high; else FAULT + seal |
 

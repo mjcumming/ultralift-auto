@@ -191,10 +191,10 @@ confirms when the next `STA` reflects the change. If the lift refuses, `STA`
 simply never flips — the honest outcome, with no extra round-trip.
 
 ### 7.3 Degraded / manual mode (`trust=0`)
-A touchscreen can't be a trustworthy dead-man, so the panel does **not** offer
+`trust=1` means some IMU can still run height (starboard, or port if starboard is out — ADR-017). `trust=0` means neither can. A touchscreen can't be a trustworthy dead-man, so the panel does **not** offer
 manual jogging. On `trust=0` it **greys out** the request buttons and shows
 "MANUAL CONTROL — use dock buttons." Recovery happens at the physical dock
-buttons (design doc §6.5). STOP stays available.
+buttons (design doc §6.5). STOP stays available. One dead IMU keeps `trust=1` and sets `prob=1`; the buttons stay live and `msg=` names the surviving side.
 
 ### 7.4 Fault (`st=FAULT` / `prob=1`)
 Panel surfaces the error and offers **RESET** behind a confirm dialog → `CMD
@@ -227,7 +227,7 @@ STA v=1 st=LOWERING h=61 prob=0 trust=1 water=17.8 msg=Lowering -> Lower... 61%
 STA v=1 st=LOWERED  h=1  prob=0 trust=1 water=17.8 msg=Lowered
 
 # angle sensor drops out mid-rest -> panel greys go-to, points at the dock
-STA v=1 st=LOWERED h=1 prob=1 trust=0 water=17.8 msg=Angle sensor OFFLINE - manual control
+STA v=1 st=LOWERED h=1 prob=1 trust=0 water=17.8 msg=Angle sensors OFFLINE - manual control
 ```
 
 ---

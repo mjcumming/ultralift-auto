@@ -16,6 +16,10 @@ Built for a HydroHoist **UltraLift UL2 8800** with **per-tank valves and inclino
 - **Dock UX** — four illuminated buttons with state-aware LED cadences, a decluttered on-device web UI (all tunables live-editable and flash-persisted — no recompiles to retune), and short-token status sensors (`Lift Activity`, `Lift Position`) built for exact-match Home Assistant automations.
 - **Optional touch panel** — an RS485-linked ESP32-S3 display that is a pure request/display surface; every command it sends goes through the same validated intents as a physical button.
 
+## Web dashboard
+
+The embedded page puts Lift / Ready / Guide / Lower, a persistent Stop control, and live status first. Calibration stays under **Advanced → Calibration**, closed by default; tuning and service controls are tucked away beside it. Diagnostics is a separate collapsed section. The existing calibration and controller logic are retained. See [dashboard design and local preview](docs/web_dashboard.md).
+
 ## Hardware
 
 Full bill of materials, wiring, and I/O map: **[docs/boat_lift_design.md](docs/boat_lift_design.md)** (§3). The short version: a KinCony **KC868-A16** ESP32 board, two WitMotion **HWT901B-TTL** inclinometers, two 1″ stainless auto-return motorized ball valves, a 30 A relay for the OEM 115 VAC blower, four 19 mm illuminated buttons, a DS18B20, and ordinary stainless pipe fittings — everything off the shelf.

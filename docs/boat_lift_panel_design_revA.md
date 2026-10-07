@@ -105,8 +105,9 @@ bottom **LIFT tab**; action verbs (RAISE/LOWER) also read more clearly as
 - Button **colors match the dock-button LEDs** (design doc §8); labels are verbs while
   the lift's status stays in position-nouns for cross-interface consistency.
 - Status line uses design-doc language when resting / moving.
-- **(Planned)** mirror the dock LED scheme (design doc §8): active mode highlighted,
-  target pulses while moving, STOP glows red in motion, red-pulse = critical.
+- **(Planned)** mirror the dock LED scheme (design doc §8): the three position
+  controls stay lit, the active destination pulses, red flashes only for a
+  latch, a dead IMU, or Wi-Fi down.
 
 ---
 

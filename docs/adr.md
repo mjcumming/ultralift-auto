@@ -12,7 +12,7 @@ Status values: **Accepted**.
 
 **Rationale:** Height needs a single authority; comparing two absolute angles on a racked frame is noisy. Calibrating each sensor at the same physical setpoints and comparing in %-space removes racking. Side words match dock language; master/slave stay as internal roles.
 
-**Consequence:** Leveling never moves the master to the slave. If plumbing is reversed, swap pin substitutions — do not invert the control rule in code.
+**Consequence:** Leveling never moves the master to the slave. If plumbing is reversed, swap pin substitutions — do not invert the control rule in code. Height authority when starboard is untrusted is amended by ADR-017.
 
 ---
 
@@ -131,7 +131,7 @@ In-move throttle follows Maintain Level on every go-to. Both switches **default 
 
 **Rationale:** The proxy predates the second IMU. The two-IMU Level Error measures list directly in calibrated %-space, and a moved or loosened sensor surfaces as persistent level error or divergence. The pitch proxy was unproven and deliberately excluded from Lift Problem — a status entity nobody may act on is clutter, not safety.
 
-**Consequence:** "Sensor moved" Guard B is retired with it; the trust ladder relies on freshness + plausibility + the level hard stop.
+**Consequence:** "Sensor moved" Guard B is retired with it; the trust ladder relies on freshness + plausibility + the level hard stop. As of 2026-10-06 both raw pitches are published again as diagnostic sensors so the installed band can be measured. That does not restore the list proxy, and pitch still does not affect trust or leveling.
 
 ---
 
@@ -149,7 +149,7 @@ In-move throttle follows Maintain Level on every go-to. Both switches **default 
 
 **Decision:** Home Assistant drives the lift through the same four stateless buttons as the web UI, plus a **`Lift Command` select** (`— / Lift / Ready / Lower`) whose set-action fires the matching `request_*` intent, plus a **`Lift Ready` cover** whose open/close/stop map to Lift / Ready / Stop only. A **`Lift In Operation`** binary (`running`) is ON only while a **person-initiated** move runs: a `user_cmd_move` flag is set by every `request_goto_*` intent (dock buttons, panel, web, HA — all human paths) and cleared when the auto-maintain keeper starts a top-up; emergency descent is excluded outright. The select mirrors the destination of a user-commanded move and rests at `—` (selecting `—` is a no-op), so re-selecting the same destination always fires.
 
-The cover is a **blind** (`device_class: blind`, no tilt) so voice assistants use raise and lower, not garage-door open/close. Its position is **Lift Height %** (0 = Lowered calibration, 100 = Lift calibration); above 95% it reports fully open so a normal Lift arrival does not sit at 97. Raise/open goes to Lift, lower/close goes to Ready, stop is Stop. A partial `set_cover_position` is ignored, so a slider cannot send the boat to an arbitrary height. It does not restore-and-call on boot. **Full Lower stays on `Lift Command` and the Lower button** — intentional remote use (phone on the walk to the dock), not an everyday dashboard action.
+The cover is a **blind** (`device_class: blind`, no tilt) so voice assistants use raise and lower, not garage-door open/close. Its position is **Lift Height %** (0 = Lowered calibration, 100 = Lift calibration); above 95% it latches fully open and remains there until height falls below 93% (October 6, 2026 refinement). This display-only hysteresis absorbs drift around 95%; raw height and motion/maintenance thresholds are unchanged. Unknown or non-finite height retains the previous display, and the volatile latch is requalified from live feedback after boot. Raise/open goes to Lift, lower/close goes to Ready, stop is Stop. A partial `set_cover_position` is ignored, so a slider cannot send the boat to an arbitrary height. It does not restore-and-call on boot. **Full Lower stays on `Lift Command` and the Lower button** — intentional remote use (phone on the walk to the dock), not an everyday dashboard action.
 
 **Rationale:** "The lift is in operation" means *someone asked it to do something* — keeper top-ups and the ADR-013 descent are housekeeping and emergency response, and lighting a "running" flag for them would train people to ignore it (motion is still visible in `Lift Activity`). An unbounded cover was rejected: covers get swept into bulk actions ("close all covers", good-night scenes, voice assistants exposing a garage door), and open/close/position-% semantics collapse Ready, LOWERED_VENT, and the load-selected Lift shutoffs into an ambiguous slider. A Lift↔Ready-only cover keeps the dashboard/voice envelope on the bunks (Ready is still boat-supported and sealed). Lower remains available as an explicit select/button so a walk-up launch is still one phone tap, not one "close all covers" away.
 
@@ -195,6 +195,27 @@ Descent is staged: ride to Ready with both valves open, blower off. If list has 
 - **The useful docking height** — boat floating, bunks still a centerline fence (~1–5% / ~51–53° that morning).
 - **Lowered** — keep venting (ADR-009). Entering the Lowered zone from HOLD re-opens both valves. That is why the “pretty good” float ran away toward the 53.8° bottom.
 
-Stealing Ready would give up the walkable seal. Stealing Lowered would break continuous vent at the true bottom. The new zone will overlap Lowered’s one-sided band (`cal_lowered − zone_tol`), so Guide **must win**: report Guide before Lowered; Stop at Guide stays sealed (`HOLD` + `pos_at_guide` must not re-enter `LOWERED_VENT`); green Lowered LED is `pos_at_lowered && !pos_at_guide`. No fifth LED.
+Stealing Ready would give up the walkable seal. Stealing Lowered would break continuous vent at the true bottom. The new zone will overlap Lowered’s one-sided band (`cal_lowered − zone_tol`), so Guide **must win**: report Guide before Lowered; Stop at Guide stays sealed (`HOLD` + `pos_at_guide` must not re-enter `LOWERED_VENT`). No fifth LED. Dock rings no longer show which zone the lift is in (ADR-017).
 
-**Consequence:** Empty `cal_guide_done` / `cal2_guide_done` until the operator Stop-seals at the intended height and presses **Calibrate: set GUIDE** (both sides). Do not invent an angle from a moving dump. HA `number.set_value` on template cals often does not publish — use the capture buttons while sitting still. Panel `st=GUIDE` when HOLD and `pos_at_guide`. Go-to refuses until captured. Cover stays Lift↔Ready only. Do not add a firmware “after N minutes at Lowered, raise to Guide” — that guess is often wrong (boat still there, want to stay down, extra draft); HA can fire Guide when you actually decide.
+**Consequence:** Empty `cal_guide_done` / `cal2_guide_done` until the operator Stop-seals at the intended height and presses **Calibrate: set GUIDE** (both sides). Do not invent an angle from a moving dump. HA `number.set_value` on template cals often does not publish — use the capture buttons while sitting still. Panel `st=GUIDE` when HOLD and `pos_at_guide`. Go-to refuses until captured. Cover stays Lift↔Ready only. Do not add a firmware “after N minutes at Lowered, raise to Guide” — that guess is often wrong (boat still there, want to stay down, extra draft); HA can fire Guide when you actually decide. The dock LED no longer encodes “at Guide” (ADR-017); Guide still wins over Lowered in the reported position.
+
+---
+
+## ADR-017 — Either IMU can run height; dock LEDs show commands and faults
+
+**Decision:** Starboard remains the primary height source. If starboard is untrusted and port is trusted and calibrated, go-to, zones, stall progress, and height maintenance use **port’s** captures. If only port is untrusted, starboard keeps height. Leveling and the level hard stop still require **both**. One dead IMU gangs the valves and leaves `Lift Problem` on. Both dead drops to manual jog (Lift raises, Lower lowers, Ready and Guide refuse) until a sensor returns.
+
+Dock rings:
+
+| Ring | Healthy idle | Move | Fault / emergency / bypass | One or both IMUs untrusted | Wi-Fi down only |
+|---|---|---|---|---|---|
+| White, Ready, Lower | On | The commanded destination slow-flashes; the other two stay on. Emergency flashes its destination. | On, except **bypass turns all three off** | On (manual jog flashes Lift or Lower) | On |
+| Red | Off | Off | Even flash. Press red. | 3 s of even flash, then 10 s dark | Slow double-blink |
+
+A person-commanded move flashes its button. A keeper top-up does not. Guide and an inch target have no dock button, so none of the three flash. Red priority is latch, then IMU, then Wi-Fi.
+
+Pressing red still clears a latched fault (one press), an emergency (first press seals and latches, second clears), and bypass (one press). That returns to holding so a mode can be tried. It does not clear a live IMU or Wi-Fi indication; with one IMU alive the modes already work.
+
+**Rationale:** The boat is the height display at the dock. The rings need to show which command is running and which failures you cannot see: a latched stop, a dead sensor, and no Wi-Fi. Both tanks already have Lift / Ready / Guide / Lowered / Empty Max captures from the same physical positions, so port percent is a real height, not a guess. Stopping the lift because the primary IMU died, while the secondary is still reading, gives up a move the frame can still finish. Leveling on one IMU would invent a list.
+
+**Consequence:** Amends ADR-001’s “master is the sole height authority.” ADR-016’s “green Lowered LED off at Guide” is retired; Guide still wins in `Lift Position` and status text. An inch go-to that is in flight when the height source switches stops, because that percent belongs to the sensor that started it. Named modes retarget into the new sensor’s percent. Requires OTA.
