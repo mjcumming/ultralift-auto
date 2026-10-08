@@ -28,7 +28,10 @@
 #     5 = BYPASS         blower OFF, valves OPEN    (manual override: vent & hold hands-off;
 #                         position LEDs off, red flashes)
 #     6 = LOWERED_VENT   blower OFF, valves OPEN    (resting at Lowered: vent stays
-#                         open so the lift keeps settling; commands accepted)
+#                         open so the lift keeps settling; commands accepted.
+#                         Automatic re-entry waits for ADR-018 IMU settle and
+#                         both sides in the Lowered zone — a power-up frame
+#                         must not open the valves.)
 #     7 = EMERG_DESCEND  blower OFF, valves OPEN    (correction failed or list
 #                         > Tilt Critical with the boat high: vent BOTH sides
 #                         to Ready; seal if list collapsed, else continue to
@@ -116,9 +119,10 @@ esphome:
   build_path: .esphome/build/boat-lift
   includes:
     - cover_position.h
+    - boot_settle.h
   project:
     name: ultralift.boat_lift
-    version: "0.11.3 (2026-10-06)"  # publish both arm pitches for mount observation; build with venv ESPHome 2026.6.x
+    version: "0.11.4 (2026-10-08)"  # power-up must not vent; IMU settle gate (ADR-018)
 
 esp32:
   board: esp32dev
@@ -349,9 +353,25 @@ globals:
     type: float
     restore_value: no
     initial_value: "0.0"
-  - id: level_ok_since         # millis when lok last became true (0 = not trusted)
-    type: unsigned long        # hard stop waits 8 s of continuous dual-IMU trust
-    restore_value: no          # so a boot/startup frame cannot open both valves
+  - id: level_ok_since         # millis when dual-IMU trust last became true (0 = not trusted)
+    type: unsigned long        # ADR-018 settle clock; not an 8 s hard-stop arm
+    restore_value: no          # a restored uptime would arm the gate immediately
+    initial_value: "0"
+  - id: level_calm_since       # millis when |list| last fell under Tilt Critical (0 = not calm)
+    type: unsigned long
+    restore_value: no
+    initial_value: "0"
+  - id: level_settle_vent      # boot_settle: lowered-vent re-entry and rest-level may run
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: level_settle_hard      # boot_settle: level hard stop / automatic descent may run
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: lowered_absent_since   # millis both IMUs first read "not lowered" while venting (0 = a side is down)
+    type: unsigned long
+    restore_value: no
     initial_value: "0"
   - id: level_throttle         # 0 = none, 1 = master valve closed, 2 = slave valve closed
     type: int
@@ -2760,6 +2780,12 @@ script:
           if (id(test_mode)) return;
           if (id(lift_state) == ${S_FAULT} || id(lift_state) == ${S_EMERG}) return;
           if (id(emerg_lock)) return;
+          // ADR-018: a power-up list is not a hose-off. test_inject is the
+          // explicit bench bypass (the switch itself is ALWAYS_OFF on boot).
+          if (reason != "test_inject" && !id(level_settle_hard)) {
+            ESP_LOGW("level", "automatic descent suppressed during IMU settle (%s)", reason.c_str());
+            return;
+          }
           bool boat_high = !std::isnan(id(ready_target_pct)) && !std::isnan(id(lift_pct))
                            && id(lift_pct) > id(ready_target_pct) + id(zone_tol_pct);
           if (!boat_high) {
@@ -3129,33 +3155,51 @@ interval:
           bool lok = id(angle_trusted) && id(angle2_trusted) && id(have_cal2)
                      && !std::isnan(id(lift_pct)) && !std::isnan(id(slave_pct));
           id(level_ok_now) = lok;
+          bool had_level_trust = id(level_ok_since) != 0;
           if (lok) {
-            if (id(level_ok_since) == 0) {
-              id(level_ok_since) = now;
-              ESP_LOGI("level", "both IMUs trusted — hard stop arms in 8 s");
-            }
             float e = id(slave_pct) - id(lift_pct);
             float a2 = 0.25f / 3.0f;          // ~3 s EMA (waves largely cancel in the difference)
             id(level_err_filt) = a2 * e + (1.0f - a2) * id(level_err_filt);
-          } else if (id(level_ok_since) != 0) {
-            id(level_ok_since) = 0;
+          } else if (had_level_trust) {
             id(level_err_filt) = 0.0f;        // drop a startup/dropout spike; do not carry it
-            ESP_LOGW("level", "level trust lost — hard stop disarmed");
+            ESP_LOGW("level", "level trust lost — IMU settle reset, valves stay closed");
           }
 
-          // ---- §16.2 HARD STOP (ADR-015): list past Tilt Critical (°) is a
-          //      never-exceed. Armed after 8 s of *continuous* dual-IMU trust
-          //      (a cold-boot first frame can be plausible but wrong; the 3 s
-          //      EMA can then trip in ~500 ms and open both valves — the
-          //      opposite of Power-up → HOLD). Once armed, a later hose burst
-          //      still trips immediately. start_emergency_descent: boat HIGH
-          //      → ganged vent; at/below Ready → FAULT + seal. ----
+          // ---- ADR-018 boot settle. 2026-10-08 power restore opened both
+          //      vents at Lift: an early frame looked like Lowered, and the
+          //      list was still 3.8° at 11 s so the old 8 s hard-stop grace
+          //      had already expired. Automatic vent waits for 20 s of list
+          //      under Tilt Critical. A list that never calms arms the hard
+          //      stop at 60 s. After that, a hose burst still trips on the
+          //      next tick. ----
           float err_deg = lok && id(have_cal)
                         ? fabs(id(level_err_filt)) * fabs(span) / 100.0f : NAN;
-          bool level_hard_armed = lok && id(level_ok_since) != 0
-                                  && (now - id(level_ok_since)) >= 8000UL;
+          bool list_under = lok && !std::isnan(err_deg)
+                            && err_deg <= id(tilt_critical_deg).state;
+          ultralift::SettleClocks settle_clocks;
+          settle_clocks.trust_since = static_cast<std::uint32_t>(id(level_ok_since));
+          settle_clocks.calm_since = static_cast<std::uint32_t>(id(level_calm_since));
+          settle_clocks.hard_latched = id(level_settle_hard);
+          ultralift::SettleGate settle = ultralift::boot_settle(
+              lok, list_under, static_cast<std::uint32_t>(now), settle_clocks);
+          bool was_vent = id(level_settle_vent);
+          bool was_hard = id(level_settle_hard);
+          id(level_ok_since) = settle_clocks.trust_since;
+          id(level_calm_since) = settle_clocks.calm_since;
+          id(level_settle_vent) = settle.auto_vent_allowed;
+          id(level_settle_hard) = settle.hard_stop_armed;
+          if (lok && !had_level_trust)
+            ESP_LOGI("level", "both IMUs trusted — automatic vent waits for 20 s of calm list");
+          if (settle.auto_vent_allowed && !was_vent)
+            ESP_LOGI("level", "IMU list calm for 20 s — lowered vent and rest-level armed");
+          else if (settle.hard_stop_armed && !was_hard)
+            ESP_LOGW("level", "IMU settle force-armed at 60 s — list never calmed, hard stop live");
+
+          // §16.2 HARD STOP (ADR-015), gated by the settle above.
+          // start_emergency_descent: boat HIGH → ganged vent; at/below Ready
+          // → FAULT + seal. Inject skips the wait; the switch is off on boot.
           bool inject = id(test_inject_level_fail).state;
-          if (level_hard_armed && id(have_cal) && !id(test_mode)
+          if (lok && (settle.hard_stop_armed || inject) && id(have_cal) && !id(test_mode)
               && (inject || (!std::isnan(err_deg) && err_deg > id(tilt_critical_deg).state))
               && id(lift_state) != ${S_FAULT} && id(lift_state) != ${S_EMERG}
               && !id(emerg_lock)) {
@@ -3311,7 +3355,7 @@ interval:
                   id(rest_last_pulse_ms) = now;
                   id(rest_level_below_since) = 0;
                 }
-              } else if (at_lift_only && lok && lvl_on && height_ok) {
+              } else if (at_lift_only && lok && lvl_on && height_ok && id(level_settle_vent)) {
                 bool past = fabs(id(level_err_filt)) > id(rest_level_trigger_pct).state;
                 if (past) {
                   if (id(rest_level_below_since) == 0) id(rest_level_below_since) = now;
@@ -3659,20 +3703,50 @@ interval:
           }
 
           // ---- resting at the bottom: vent stays open unless Stop sealed it.
-          //      Any HOLD that finds itself settled in the Lowered zone —
-          //      post-reboot or a timed-out lower that settles
-          //      in later — re-enters LOWERED_VENT so the tanks keep venting
-          //      indefinitely. Stop latches it sealed until the next mode request.
-          //      Boat can come/go at the bottom, so presence resets to presumed ON. ----
-          else if (s == ${S_HOLD} && id(height_ok) && id(pos_at_lowered)
-                   && !id(pos_at_guide) && !id(lowered_vent_stopped)) {
-            id(lift_state) = ${S_LOWERED_VENT};
-            id(boat_present) = true;
-            id(boat_heavy) = true;
-            id(boat_load_known) = false;
-            id(last_stop_reason) = "at lowered - vent reopened";
-            ESP_LOGI("fsm", "HOLD in Lowered zone -> LOWERED_VENT (vent stays open)");
+          //      ADR-018: a power-up frame must not open the valves. Re-entry
+          //      needs 20 s of calm list AND both sides in Lowered, neither in
+          //      Guide. If both valid IMUs then read "not lowered" for 2 s, and
+          //      this is not an emergency lock, the vents close. After the gate is
+          //      open, Stop at the true bottom is still a no-op. A timed-out
+          //      lower that later settles in re-enters the same way. ----
+          else if (s == ${S_LOWERED_VENT} && !id(emerg_lock)) {
+            float tol_deg = id(zone_tol_deg).state;
+            bool stbd_lowered = id(cal_down_done) && id(angle_valid)
+                && id(current_angle) > (id(cal_angle_down) - tol_deg);
+            bool port_lowered = id(cal2_down_done) && id(angle2_valid)
+                && id(current_angle2) > (id(cal2_angle_down) - tol_deg);
+            std::uint32_t absent = static_cast<std::uint32_t>(id(lowered_absent_since));
+            if (ultralift::lowered_reading_gone(id(angle_valid), stbd_lowered,
+                                                id(angle2_valid), port_lowered,
+                                                static_cast<std::uint32_t>(now), absent)) {
+              id(lowered_absent_since) = 0;
+              id(lift_state) = ${S_HOLD};
+              id(last_stop_reason) = "not lowered — valves closed";
+              ESP_LOGW("fsm", "LOWERED_VENT but neither IMU is lowered -> HOLD");
+            } else {
+              id(lowered_absent_since) = absent;
+            }
           }
+          else if (s == ${S_HOLD} && id(level_settle_vent) && !id(lowered_vent_stopped)) {
+            float tol_deg = id(zone_tol_deg).state;
+            bool stbd_lowered = id(cal_down_done) && id(angle_valid)
+                && id(current_angle) > (id(cal_angle_down) - tol_deg);
+            bool port_lowered = id(cal2_down_done) && id(angle2_valid)
+                && id(current_angle2) > (id(cal2_angle_down) - tol_deg);
+            bool stbd_guide = id(cal_guide_done) && id(angle_valid)
+                && fabsf(id(current_angle) - id(cal_angle_guide)) <= tol_deg;
+            bool port_guide = id(cal2_guide_done) && id(angle2_valid)
+                && fabsf(id(current_angle2) - id(cal2_angle_guide)) <= tol_deg;
+            if (stbd_lowered && port_lowered && !stbd_guide && !port_guide) {
+              id(lift_state) = ${S_LOWERED_VENT};
+              id(boat_present) = true;
+              id(boat_heavy) = true;
+              id(boat_load_known) = false;
+              id(last_stop_reason) = "at lowered - vent reopened";
+              ESP_LOGI("fsm", "HOLD in Lowered zone -> LOWERED_VENT (vent stays open)");
+            }
+          }
+          if (id(lift_state) != ${S_LOWERED_VENT}) id(lowered_absent_since) = 0;
 
           // ---- move timing (calibration runs + diagnostics) ----
           {

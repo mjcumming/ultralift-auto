@@ -168,7 +168,7 @@ Pressing a mode button sends the lift to that setpoint; the controller **chooses
 | **HOLD** | OFF | CLOSED | Resting (at a mode, or between). |
 | **RAISING** | ON | OPEN / throttled | Pumping air in; rising toward target. Blower + valves energize **together**. |
 | **LOWERING** | OFF | OPEN / throttled | Venting; descending toward target. |
-| **LOWERED_VENT** | OFF | **OPEN** | Resting at Lowered with vents left open — the lift keeps settling indefinitely. New commands accepted. **The vent stays open at the true bottom** (HOLD in the Lowered zone re-enters LOWERED_VENT unless `pos_at_guide` or Stop latched the vent; a latched FAULT still seals). |
+| **LOWERED_VENT** | OFF | **OPEN** | Resting at Lowered with vents left open — the lift keeps settling indefinitely. New commands accepted. **The vent stays open at the true bottom** once ADR-018’s settle gate is open and both sides read Lowered (neither in Guide). A power-up frame does not re-enter. If both valid IMUs then read “not lowered” for 2 s, and this is not an emergency lock, the vents close. Stop latches the vent shut; a latched FAULT still seals. |
 | **FAULT** | OFF | CLOSED | Latched safe state + reason. |
 | **BYPASS** | OFF | **OPEN** | Manual override (§6.6): valves open, blower off, FSM idle. |
 | **EMERG_DESCEND** | OFF | **OPEN** (ganged) | Emergency descent (§16.2, ADR-015): correction failed or list ≥ `Tilt Critical` with the boat high — vent both sides down to Ready; seal there if list has collapsed, else continue to Lowered. Stop = seal now; mode buttons refused. |
@@ -500,7 +500,7 @@ Each tank has its own vent/fill valve and inclinometer. The controller keeps the
 ### 16.2 Intervention thresholds
 
 - **Intervene** when sides differ by more than the **Level Deadband** (configurable; intent ≈ ≤1° of arm).
-- **Give up** when the correction is not winning (§16.5) or live list reaches **`Tilt Critical`** (default **3°** of arm ≈ HydroHoist’s 3 in side-to-side at Lift). Air cannot fix that. Shared entry `start_emergency_descent` (ADR-015):
+- **Give up** when the correction is not winning (§16.5) or live list reaches **`Tilt Critical`** (default **3°** of arm ≈ HydroHoist’s 3 in side-to-side at Lift). Air cannot fix that. Shared entry `start_emergency_descent` (ADR-015). **Not during IMU power-up** (ADR-018): automatic descent waits for 20 s of list under `Tilt Critical`, or 60 s of dual-IMU trust if the list never calms. The 2026-10-08 restore was still at 3.8° when an 8 s grace expired.
   - **Boat high** (above the Ready band): **emergency descent** — both valves open ganged, blower off. Ride to Ready. If list has collapsed under `Tilt Critical` and is not still growing (~2 s look) → **FAULT + seal**. If residual list remains, is still growing, or level trust is lost → **keep venting to Lowered**, then **LOWERED_VENT + `emerg_lock`** (vents stay open, `Lift Problem` ON, mode buttons refused). `Lower Timeout` seals as backstop. **Stop seals immediately** (operator override). Trust loss does not stop the descent.
   - **At/below Ready** (or Ready not calibrated / height unknown): **FAULT + make-safe** (both valves closed).
 

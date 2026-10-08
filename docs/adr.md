@@ -97,7 +97,7 @@ In-move throttle follows Maintain Level on every go-to. Both switches **default 
 
 ## ADR-009 — LOWERED_VENT resting state
 
-**Decision:** Reaching Lowered leaves both valves **open** indefinitely so the lift keeps settling — **the vent stays open at the bottom, always**: a standing supervisor rule re-enters LOWERED_VENT from any HOLD settled in the Lowered zone (post-boot, post-Stop, post-timeout), so Stop at the bottom is a no-op. A latched FAULT still seals.
+**Decision:** Reaching Lowered leaves both valves **open** indefinitely so the lift keeps settling — **the vent stays open at the bottom, always**: a standing supervisor rule re-enters LOWERED_VENT from HOLD once the boot settle gate is open and both sides read Lowered (not Guide). Stop at that true bottom is a no-op. A power-up angle is not that reading — see [ADR-018](#adr-018). A latched FAULT still seals.
 
 **Rationale:** “All the way down” is a physical end, not a precise angle band; leaving the vent open matches how the OEM system is used when floating the boat.
 
@@ -219,3 +219,22 @@ Pressing red still clears a latched fault (one press), an emergency (first press
 **Rationale:** The boat is the height display at the dock. The rings need to show which command is running and which failures you cannot see: a latched stop, a dead sensor, and no Wi-Fi. Both tanks already have Lift / Ready / Guide / Lowered / Empty Max captures from the same physical positions, so port percent is a real height, not a guess. Stopping the lift because the primary IMU died, while the secondary is still reading, gives up a move the frame can still finish. Leveling on one IMU would invent a list.
 
 **Consequence:** Amends ADR-001’s “master is the sole height authority.” ADR-016’s “green Lowered LED off at Guide” is retired; Guide still wins in `Lift Position` and status text. An inch go-to that is in flight when the height source switches stops, because that percent belongs to the sensor that started it. Named modes retarget into the new sensor’s percent. Requires OTA.
+
+---
+
+## ADR-018 — Power-up does not open the valves
+
+**Amends [ADR-009](#adr-009) and [ADR-015](#adr-015).**
+
+**Decision:** After boot, do not open a valve for any automatic reason until the IMUs have settled.
+
+- **Automatic vent** (LOWERED_VENT re-entry from HOLD, and at-rest level pulses) waits until both IMUs have been trusted **and** filtered list has stayed at or under `Tilt Critical` for **20 s**. Re-entry also requires **both** sides in the Lowered zone and **neither** in Guide. One IMU, or one frame, is not enough.
+- **Level hard stop** and the other automatic descents (`level_correct_fail`, `level_fail_catchup`) arm on that same 20 s calm window. If the list never calms, they arm after **60 s** of continuous dual-IMU trust, and a list still past `Tilt Critical` then descends. Once armed, the hard stop stays armed across a list spike — putting the wait back would drop a hose-off that starts just after settle. Trust loss clears the clocks and the latch. After that, a later divergence still trips on the next tick.
+- A `LOWERED_VENT` that is not an emergency lock, and whose lowered reading then disappears on **both valid** IMUs for **2 s**, returns to HOLD and seals. A sensor dropout does not count. One side still lowered does not count. A commanded Lower that actually arrives stays venting.
+- Dock, panel, web, and HA commands are not delayed. `Test: inject level fail` is not delayed. Stall still seals immediately.
+
+**Rationale:** 2026-10-08, power restore at Lift. Uptime was a few seconds when the controller reported `at lowered - vent reopened` with height at 105% and the arms near the top. Five seconds later it latched `EMERGENCY descent: level_divergence` at ~98%. The valves reached fully open about 9 s after the first command; Stop caught it at ~93%. The October 3 grace only covered the hard stop, and only for 8 s. This slew was still 3.8° at 11 s, and the bottom-vent rule had no grace. ADR-017 makes that worse: a port startup reading toward the lowered end of the scale can be the height source while starboard is still untrusted. An unattended repeat would have ridden to Ready.
+
+Sitting sealed for up to 60 s after a power restore, while a real hose-off would already be twisting, is accepted. Opening both tanks from a lie is not. Once the gate is open, ADR-009 and ADR-015 are unchanged.
+
+**Consequence:** A lift that is truly at the bottom reopens its vents about 20 s after the list is calm, not on the first sample. A real twist that is present at power-up and does not collapse is acted on at 60 s, not at 8 s. Requires OTA. Until that flash, another power loss at Lift will open the vents again.

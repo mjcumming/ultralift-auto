@@ -19,6 +19,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Power-up must not descend.** On 2026-10-08 a power restore at Lift opened both vents (`at lowered - vent reopened`) and then emergency-descended (`level_divergence`) while height was still ~98–105%. The 8 s hard-stop grace was already over — the IMU slew was still 3.8° at 11 s — and the lowered-vent re-entry had no grace at all, so one early frame could latch the valves open. Automatic vent (lowered re-entry and rest-level) now waits until both IMUs have held list under Tilt Critical for 20 s. The hard stop waits for that same calm window, or 60 s of dual-IMU trust if the list never calms, and then a real divergence still trips on the next tick. Re-entry also requires both sides in Lowered and neither in Guide. A startup `LOWERED_VENT` whose lowered reading disappears is sealed back to HOLD. Person commands are unchanged. [ADR-018](docs/adr.md). Requires OTA.
+
 - **Stable fully raised cover display.** `Lift Ready` latches 100% above 95% height and releases only below 93%, so small drift around 95% does not chatter. Raw height, motion, calibration and automatic maintenance are unchanged. Invalid feedback holds the previous display; the latch is rebuilt from live height after boot.
 
 - **Emergency descent no longer times out on the same tick it starts.** `start_emergency_descent` stamps `lower_start_time` with `millis()` after the supervisor already sampled `now`; unsigned wrap looked like a 15 min timeout and sealed at Lift with `descent timeout` (inject test 2026-09-10, boat never moved). Timeout now requires `now >= start`. Requires OTA.
