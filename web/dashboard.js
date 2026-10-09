@@ -3,7 +3,7 @@
   'use strict';
   const states = new Map(), names = new Map(), rows = new Map();
   const pending = new Set();
-  let connected = false, lastEvent = 0, scheduled = false, generation = 0, stopBusy = false;
+  let connected = false, lastEvent = 0, scheduled = false, scheduledAt = 0, generation = 0, stopBusy = false, events = null;
   const $ = selector => document.querySelector(selector);
   const named = (domain, name) => states.get(names.get(`${domain}/${name}`));
   const finite = value => value === null || value === undefined || value === '' ? null : Number.isFinite(Number(value)) ? Number(value) : null;
@@ -53,8 +53,12 @@
     $('#message').textContent = value; $('#message').hidden = !value; $('#message').className = error ? 'error' : '';
   }
   function scheduleRender() {
-    if (scheduled) return;
-    scheduled = true; requestAnimationFrame(() => { scheduled = false; render(); });
+    const now = Date.now();
+    if (scheduled && now - scheduledAt < 2000) return;
+    scheduled = true; scheduledAt = now;
+    const paint = () => { scheduled = false; render(); };
+    if (document.hidden) setTimeout(paint, 200);
+    else requestAnimationFrame(paint);
   }
   function addRow(data) {
     if (!data.name || rows.has(data.id)) return;
@@ -118,10 +122,18 @@
     if (!emergency && !fault && !bypass && flag('binary_sensor','Lift Problem')) notices.push(status);
     if (flag('binary_sensor','Air Loss Alert')) notices.push(`Air loss alert · ${text('Air Loss Detail')}`);
     $('#notice').hidden = !live || !notices.length; $('#notice').textContent = notices.join(' ');
+    const commandName = named('select','Lift Command')?.state;
+    const commanded = ['Lift','Ready','Guide','Lower'].includes(commandName) ? commandName : null;
+    let going = commanded;
+    if (bench) going = null;
+    else if (!going && emergency) going = /[Ll]owered/.test(status) ? 'Lower' : /Ready/.test(status) ? 'Ready' : null;
+    else if (!going && manual) going = /raising/i.test(status) ? 'Lift' : /lowering/i.test(status) ? 'Lower' : null;
+    const place = {Lift:'Lifted',Ready:'Ready',Guide:'Guide',Lower:'Lowered'};
     for (const button of document.querySelectorAll('[data-command]')) {
       const name = button.dataset.command;
       button.disabled = !live || !named('button',name) || (name === 'Stop' ? stopBusy : busy || bench || fault || emergency || bypass || status === '—' || (manual && (name === 'Ready' || name === 'Guide')));
-      button.classList.toggle('selected', live && name !== 'Stop' && ({Lift:'Lifted',Ready:'Ready',Guide:'Guide',Lower:'Lowered'}[name] === pos));
+      button.classList.toggle('selected', live && !going && place[name] === pos);
+      button.classList.toggle('destination', live && going === name);
     }
     const height = live ? number('sensor','Lift Height') : null;
     $('#height').textContent = format(height, '%');
@@ -246,14 +258,29 @@
     await command(button, 'press');
   });
   document.querySelectorAll('[data-toggle]').forEach(button => button.addEventListener('click', () => toggle(button.dataset.toggle)));
-  const events = new EventSource('/events');
-  events.onopen = () => { states.clear(); names.clear(); connected = true; lastEvent = Date.now(); scheduleRender(); };
-  events.onerror = () => { connected = false; scheduleRender(); };
-  events.addEventListener('state', event => {
-    lastEvent = Date.now();
-    try { accept(JSON.parse(event.data)); } catch { message('An update could not be read. Waiting for fresh status.', true); }
+  function openEvents() {
+    const previous = events;
+    previous?.close();
+    const source = new EventSource('/events');
+    events = source;
+    source.onopen = () => {
+      if (events !== source) return;
+      states.clear(); names.clear(); connected = true; lastEvent = Date.now(); scheduleRender();
+    };
+    source.onerror = () => { if (events !== source) return; connected = false; scheduleRender(); };
+    source.addEventListener('state', event => {
+      if (events !== source) return;
+      lastEvent = Date.now();
+      try { accept(JSON.parse(event.data)); } catch { message('An update could not be read. Waiting for fresh status.', true); }
+    });
+    source.addEventListener('ping', () => { if (events !== source) return; lastEvent = Date.now(); scheduleRender(); });
+  }
+  openEvents();
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') return;
+    if (!online()) openEvents();
+    else scheduleRender();
   });
-  events.addEventListener('ping', () => { lastEvent = Date.now(); scheduleRender(); });
   setInterval(scheduleRender, 1000);
   render();
 })();

@@ -28,7 +28,7 @@ def substitute(value):
     return value
 
 
-for domain in ('button', 'switch', 'number', 'binary_sensor', 'sensor', 'text_sensor'):
+for domain in ('button', 'switch', 'number', 'binary_sensor', 'sensor', 'text_sensor', 'select'):
     for index, entry in enumerate(config.get(domain, [])):
         if 'name' not in entry or entry.get('internal') == 'true':
             continue
@@ -79,6 +79,7 @@ def scene(name):
         'binary_sensor': {'Lift Problem': False, 'Air Loss Alert': False, 'IMU Starboard OK': True, 'IMU Port OK': True},
         'switch': {'Auto-Maintain Height': True, 'Auto-Maintain Level': True, 'Bench Test (FSM off)': False,
                    'Bypass Mode': False, 'Blower Relay (Y1) — bench only': False},
+        'select': {'Lift Command': 'Lift' if name == 'moving' else '—'},
     }
     if name == 'moving':
         values['text_sensor'].update({'Lift Status':'Raising -> Lift','Lift Activity':'Raising','Lift Position':'Between',
@@ -196,9 +197,11 @@ class Handler(BaseHTTPRequestHandler):
             if domain == 'button' and name in ('Lift','Ready','Guide','Lower','Go to Height'):
                 update('text_sensor','Lift Status',f"Raising -> {'Height' if name == 'Go to Height' else name}")
                 update('text_sensor','Lift Activity','Raising')
+                update('select','Lift Command','—' if name == 'Go to Height' else name)
             if domain == 'button' and name == 'Stop':
                 update('text_sensor','Lift Status','Holding')
                 update('text_sensor','Lift Activity','Idle')
+                update('select','Lift Command','—')
                 update('text_sensor','Last Stop Reason','Stop pressed')
                 for key in ['Blower Relay (Y1) — bench only','Valve Starboard (Y2) — bench only','Valve Port (Y3) — bench only']:
                     update('switch',key,False)
