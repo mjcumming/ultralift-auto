@@ -82,4 +82,13 @@ inline bool lowered_reading_gone(bool stbd_valid, bool stbd_lowered,
   }
   return settle_elapsed(now, absent_since, kLoweredAbsentMs);
 }
+
+// A commanded Lower that has reached the zone keeps the vent open through
+// the arrival ring. 2026-10-09 14:30 CDT: the lower touched 54.2°, rebounded
+// to 48.1° for 2 s, the seal closed both valves, and re-entry opened them
+// again at 51.9°. The 2 s seal remains for a vent latched without that
+// arrival — a power-up frame whose angles then come back high.
+inline bool seal_unconfirmed_vent(bool arrived, bool reading_gone) {
+  return !arrived && reading_gone;
+}
 }  // namespace ultralift

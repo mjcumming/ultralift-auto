@@ -126,7 +126,7 @@ esphome:
     - finish_level.h
   project:
     name: ultralift.boat_lift
-    version: "0.11.6 (2026-10-09)"  # raise finish trims list inside the deadband (ADR-020)
+    version: "0.11.7 (2026-10-09)"  # a confirmed Lower keeps venting through the arrival ring
 
 esp32:
   board: esp32dev
@@ -377,6 +377,10 @@ globals:
     type: unsigned long
     restore_value: no
     initial_value: "0"
+  - id: lowered_vent_arrived   # commanded Lower has reached the zone; the 2 s
+    type: bool                 # startup seal must not close that vent (ADR-018)
+    restore_value: no
+    initial_value: "false"
   - id: level_throttle         # 0 = none, 1 = master valve closed, 2 = slave valve closed
     type: int
     restore_value: no
@@ -2567,6 +2571,9 @@ script:
             }
           }
           id(lift_state) = next_s;
+          // Already at Lowered is an arrival, not a startup latch. A lower
+          // that still has to travel clears it until the zone is reached.
+          id(lowered_vent_arrived) = (next_s == ${S_LOWERED_VENT});
 
           const char* dir = (next_s == ${S_RAISING}) ? "raising"
                           : (next_s == ${S_LOWERING}) ? "lowering" : "already there";
@@ -3636,6 +3643,7 @@ interval:
                 // tanks keep venting and the lift settles as far down as it physically
                 // goes, indefinitely. Both sides reach bottom, so no level gate here.
                 id(lift_state) = ${S_LOWERED_VENT};
+                id(lowered_vent_arrived) = true;   // ring may leave the zone; keep venting
                 id(level_catchup_start) = 0;
                 id(last_stop_reason) = "lowered - vent left open";
                 // floating: the boat can drive on/off here -> presence unknown = presumed ON
@@ -3759,9 +3767,12 @@ interval:
           //      ADR-018: a power-up frame must not open the valves. Re-entry
           //      needs 20 s of calm list AND both sides in Lowered, neither in
           //      Guide. If both valid IMUs then read "not lowered" for 2 s, and
-          //      this is not an emergency lock, the vents close. After the gate is
-          //      open, Stop at the true bottom is still a no-op. A timed-out
-          //      lower that later settles in re-enters the same way. ----
+          //      this vent was not a commanded arrival, the vents close. A
+          //      Lower that has reached the zone keeps venting through the
+          //      arrival ring (2026-10-09 14:30). After the gate is open, Stop
+          //      at the true bottom is still a no-op. A timed-out lower that
+          //      later settles in re-enters the same way, and that re-entry is
+          //      not an arrival — the 2 s seal still applies. ----
           else if (s == ${S_LOWERED_VENT} && !id(emerg_lock)) {
             float tol_deg = id(zone_tol_deg).state;
             bool stbd_lowered = id(cal_down_done) && id(angle_valid)
@@ -3769,10 +3780,12 @@ interval:
             bool port_lowered = id(cal2_down_done) && id(angle2_valid)
                 && id(current_angle2) > (id(cal2_angle_down) - tol_deg);
             std::uint32_t absent = static_cast<std::uint32_t>(id(lowered_absent_since));
-            if (ultralift::lowered_reading_gone(id(angle_valid), stbd_lowered,
-                                                id(angle2_valid), port_lowered,
-                                                static_cast<std::uint32_t>(now), absent)) {
+            bool gone = ultralift::lowered_reading_gone(id(angle_valid), stbd_lowered,
+                                                        id(angle2_valid), port_lowered,
+                                                        static_cast<std::uint32_t>(now), absent);
+            if (ultralift::seal_unconfirmed_vent(id(lowered_vent_arrived), gone)) {
               id(lowered_absent_since) = 0;
+              id(lowered_vent_arrived) = false;
               id(lift_state) = ${S_HOLD};
               id(last_stop_reason) = "not lowered — valves closed";
               ESP_LOGW("fsm", "LOWERED_VENT but neither IMU is lowered -> HOLD");
@@ -3792,6 +3805,7 @@ interval:
                 && fabsf(id(current_angle2) - id(cal2_angle_guide)) <= tol_deg;
             if (stbd_lowered && port_lowered && !stbd_guide && !port_guide) {
               id(lift_state) = ${S_LOWERED_VENT};
+              id(lowered_vent_arrived) = false;   // not a commanded arrival
               id(boat_present) = true;
               id(boat_heavy) = true;
               id(boat_load_known) = false;
@@ -3799,7 +3813,10 @@ interval:
               ESP_LOGI("fsm", "HOLD in Lowered zone -> LOWERED_VENT (vent stays open)");
             }
           }
-          if (id(lift_state) != ${S_LOWERED_VENT}) id(lowered_absent_since) = 0;
+          if (id(lift_state) != ${S_LOWERED_VENT}) {
+            id(lowered_absent_since) = 0;
+            id(lowered_vent_arrived) = false;
+          }
 
           // ---- move timing (calibration runs + diagnostics) ----
           {

@@ -108,5 +108,13 @@ int main() {
   assert(!ultralift::lowered_reading_gone(true, false, true, true, 5000, absent));
   assert(absent == 0);
 
+  // 2026-10-09 14:30: a real Lower arrived, then the arm rang out of the
+  // zone for 2 s. That reading-gone is real, and it must not seal. A
+  // startup latch that was never confirmed still seals.
+  assert(!ultralift::seal_unconfirmed_vent(true, true));
+  assert(!ultralift::seal_unconfirmed_vent(true, false));
+  assert(!ultralift::seal_unconfirmed_vent(false, false));
+  assert(ultralift::seal_unconfirmed_vent(false, true));
+
   puts("Boot settle: 11 s slew, calm restart, 60 s force, dropout and wrap passed.");
 }
