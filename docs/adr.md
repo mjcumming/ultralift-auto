@@ -22,7 +22,7 @@ Status values: **Accepted**.
 
 **Rationale:** One blower can only feed one path at a time. A parallel “level FSM” would fight go-to and maintain. Biasing which valve is open reuses every existing safety backstop.
 
-**Consequence:** Stall detection must be feed-aware. Move completion for Ready/Lift waits for both master-at-target and level-within-deadband.
+**Consequence:** Stall detection must be feed-aware. Move completion for Ready waits for master-at-target and level-within-deadband. A raise's finish inside that deadband is [ADR-020](#adr-020).
 
 ---
 
@@ -159,6 +159,8 @@ The cover is a **blind** (`device_class: blind`, no tilt) so voice assistants us
 
 ## ADR-015 — Correction-effectiveness fail-safe; staged emergency descent
 
+**Amended by [ADR-019](#adr-019).** The parked rest-level pulse no longer feeds, and a pulse that does not level no longer descends. The 3° hard stop, in-move catch-up, and the staged Ready→Lowered descent stand.
+
 **Decision:** Treat a slow leak as *correct then notify*, and a leak the correction cannot win as *give up altitude* (ADR-013 maneuver). Detect and feed-low stay as they are. Fail the correction if either:
 
 - live list ≥ **`Tilt Critical`** (default **3°** of arm — HydroHoist UL2 “stop if more than 3 inches side-to-side”; on this 51 in arm that is ~3° at Lift), or
@@ -210,9 +212,9 @@ Dock rings:
 | Ring | Healthy idle | Move | Fault / emergency / bypass | One or both IMUs untrusted | Wi-Fi down only |
 |---|---|---|---|---|---|
 | White, Ready, Lower | On | The commanded destination slow-flashes; the other two stay on. Emergency flashes its destination. | On, except **bypass turns all three off** | On (manual jog flashes Lift or Lower) | On |
-| Red | Off | Off | Even flash. Press red. | 3 s of even flash, then 10 s dark | Slow double-blink |
+| Red | Off | Solid, so Stop is the obvious press. A latched fault or emergency still flashes instead. | Even flash. Press red. | 3 s of even flash, then 10 s dark, unless a move is running — then solid | Slow double-blink, unless a move is running — then solid |
 
-A person-commanded move flashes its button. A keeper top-up does not. Guide and an inch target have no dock button, so none of the three flash. Red priority is latch, then IMU, then Wi-Fi.
+A person-commanded move flashes its button. A keeper top-up does not. Guide and an inch target have no dock button, so none of the three flash. Red stays solid through any raise or lower, including a keeper top-up, so the stop button is visible while the lift is moving. Red priority is latch, then that solid light, then IMU, then Wi-Fi.
 
 Pressing red still clears a latched fault (one press), an emergency (first press seals and latches, second clears), and bypass (one press). That returns to holding so a mode can be tried. It does not clear a live IMU or Wi-Fi indication; with one IMU alive the modes already work.
 
@@ -229,12 +231,40 @@ Pressing red still clears a latched fault (one press), an emergency (first press
 **Decision:** After boot, do not open a valve for any automatic reason until the IMUs have settled.
 
 - **Automatic vent** (LOWERED_VENT re-entry from HOLD, and at-rest level pulses) waits until both IMUs have been trusted **and** filtered list has stayed at or under `Tilt Critical` for **20 s**. Re-entry also requires **both** sides in the Lowered zone and **neither** in Guide. One IMU, or one frame, is not enough.
-- **Level hard stop** and the other automatic descents (`level_correct_fail`, `level_fail_catchup`) arm on that same 20 s calm window. If the list never calms, they arm after **60 s** of continuous dual-IMU trust, and a list still past `Tilt Critical` then descends. Once armed, the hard stop stays armed across a list spike — putting the wait back would drop a hose-off that starts just after settle. Trust loss clears the clocks and the latch. After that, a later divergence still trips on the next tick.
+- **Level hard stop** and in-move `level_fail_catchup` arm on that same 20 s calm window. A parked rest-level pulse does not descend on its own ([ADR-019](#adr-019)). If the list never calms, they arm after **60 s** of continuous dual-IMU trust, and a list still past `Tilt Critical` then descends. Once armed, the hard stop stays armed across a list spike — putting the wait back would drop a hose-off that starts just after settle. Trust loss clears the clocks and the latch. After that, a later divergence still trips on the next tick.
 - A `LOWERED_VENT` that is not an emergency lock, and whose lowered reading then disappears on **both valid** IMUs for **2 s**, returns to HOLD and seals. A sensor dropout does not count. One side still lowered does not count. A commanded Lower that actually arrives stays venting.
 - Dock, panel, web, and HA commands are not delayed. `Test: inject level fail` is not delayed. Stall still seals immediately.
 
 **Rationale:** 2026-10-08, power restore at Lift. Uptime was a few seconds when the controller reported `at lowered - vent reopened` with height at 105% and the arms near the top. Five seconds later it latched `EMERGENCY descent: level_divergence` at ~98%. The valves reached fully open about 9 s after the first command; Stop caught it at ~93%. The October 3 grace only covered the hard stop, and only for 8 s. This slew was still 3.8° at 11 s, and the bottom-vent rule had no grace. ADR-017 makes that worse: a port startup reading toward the lowered end of the scale can be the height source while starboard is still untrusted. An unattended repeat would have ridden to Ready.
 
-Sitting sealed for up to 60 s after a power restore, while a real hose-off would already be twisting, is accepted. Opening both tanks from a lie is not. Once the gate is open, ADR-009 and ADR-015 are unchanged.
+Sitting sealed for up to 60 s after a power restore, while a real hose-off would already be twisting, is accepted. Opening both tanks from a lie is not. Once the gate is open, ADR-009 is unchanged. ADR-015's descent maneuver is unchanged; who may start it is [ADR-019](#adr-019).
 
 **Consequence:** A lift that is truly at the bottom reopens its vents about 20 s after the list is calm, not on the first sample. A real twist that is present at power-up and does not collapse is acted on at 60 s, not at 8 s. Requires OTA. Until that flash, another power loss at Lift will open the vents again.
+
+---
+
+## ADR-019 — Parked leveling vents, then sits
+
+**Amends [ADR-015](#adr-015).**
+
+**Decision:** A rest-level pulse at Lift only **vents the high side**. It does not run the blower. The pulse length is **3×** the time both valves take to descend by the current list, measured at the top of the stroke on 2026-10-08 as **0.18 %/s** (96.5% → 90.8% in 32 s after both OPEN contacts). One valve is a little slower; the multiple covers that. The clock starts when that valve's OPEN contact is true. If the contact is still false **25 s** after the command, the valve closes. The pulse also closes when the list reaches the in-move release (`Level Deadband` − hysteresis) or the open-time budget ends.
+
+Then the valves stay closed. If the list is still past `Rest Level Trigger`, do not pulse again until it has come back under that trigger on its own. Do not emergency-descend because the pulse failed. **`Tilt Critical`** remains the only parked reason to descend. In-move `level_fail_catchup` is unchanged.
+
+**Rationale:** 2026-10-08 22:32, parked at Lift, port 2.5% high. The keeper vented port. The 8 s grace plus 10 s vent budget expired as the valve reached OPEN, the list had not moved, and `level_correct_fail` dropped the boat to Ready. The list was never getting worse. A flat list means both tanks are holding. The failure that has to give up altitude is one side falling, and that is the 3° hard stop.
+
+Feeding the low side is the wrong next step. If the high-side valve is open and the list does not come back, air is not the fix — a leak on the low side would be fed by the blower. The safety contract already limits the blower to RAISING.
+
+**Consequence:** A 2.5% list is about a 42 s open pulse. A pulse that levels closes early. A pulse that does not level holds, valves closed, until the list itself returns under the trigger; the 3° stop can still descend during or after the pulse. `Lift Problem` (`device_class: problem`) is ON for that hold, and for every other error and warning (fault, bypass, emergency, IMU, calibration, air-loss). Requires OTA. Until that flash, another not-shrinking vent will dump the lift again.
+
+---
+
+## ADR-020 — A raise finishes inside the release band
+
+**Amends [ADR-002](#adr-002).**
+
+**Decision:** The climb still throttles at `Level Deadband`. In the last 5% of a raise, a throttle change does not wait out `Level Min Hold`. Once master is at the target, the raise seals only when |level error| is inside the in-move release (`Level Deadband` − hysteresis). A list between that release and the deadband keeps the move alive and feeds the low side. The trim gets 20 s. If the list has not closed by 0.1% for 5 s after that, or the catch-up timeout elapses while it is still only creeping, the raise seals and sits. A list past the deadband is unchanged: catch-up, then emergency descent. Lowering is unchanged.
+
+**Rationale:** 2026-10-08 22:37 CDT, the re-raise onto the boat ceiling. At about 95% the list was +0.3%, inside the 0.5% release. Starboard was the side still being fed while the port valve opened, and at the 97% target the list was −1.46%. That is inside the 1.5% deadband, so the raise sealed. The list then sat at about −1.6% all night. The sensors were already showing a tenth of a percent. The valve, not the inclinometer, is what cannot stop closer than the release band.
+
+**Consequence:** A normal raise no longer accepts a 1.5% list at the ceiling. A trim that cannot get inside 0.5% seals inside the old deadband and does not descend. A gap that is still past 1.5% when the catch-up timer ends still descends. Requires OTA.

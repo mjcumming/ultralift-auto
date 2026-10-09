@@ -13,8 +13,9 @@
 #    · level error = slave height % − master height % (each side has its OWN
 #      captures, so frame racking is calibrated out); while moving, the
 #      side that is AHEAD gets its valve throttled shut until the other catches up
-#    · hard stop / failed correction: list past Tilt Critical or a pulse that
-#      is not shrinking => emergency descent if the boat is high (ADR-015)
+#    · hard stop: list past Tilt Critical => emergency descent if the boat is
+#      high (ADR-015). A parked level pulse only vents the high side, then
+#      closes; a list that does not come back does not descend (ADR-019).
 #    · Maintain Level switch OFF => valves ganged, decisions logged as
 #      LEVEL(shadow) (observe-first, like height-maintain with actuation off)
 #
@@ -32,10 +33,11 @@
 #                         Automatic re-entry waits for ADR-018 IMU settle and
 #                         both sides in the Lowered zone — a power-up frame
 #                         must not open the valves.)
-#     7 = EMERG_DESCEND  blower OFF, valves OPEN    (correction failed or list
-#                         > Tilt Critical with the boat high: vent BOTH sides
-#                         to Ready; seal if list collapsed, else continue to
-#                         Lowered. Stop = seal now. ADR-015)
+#     7 = EMERG_DESCEND  blower OFF, valves OPEN    (list > Tilt Critical with
+#                         the boat high: vent BOTH sides to Ready; seal if list
+#                         collapsed, else continue to Lowered. Stop = seal now.
+#                         ADR-015. A parked vent that does not level stays
+#                         HOLD — ADR-019.)
 #
 #  KC868-A16 I/O:
 #     I2C GPIO4/5 · inputs 0x22 (X01-08) 0x21 (X09-16)
@@ -120,9 +122,11 @@ esphome:
   includes:
     - cover_position.h
     - boot_settle.h
+    - rest_level.h
+    - finish_level.h
   project:
     name: ultralift.boat_lift
-    version: "0.11.4 (2026-10-08)"  # power-up must not vent; IMU settle gate (ADR-018)
+    version: "0.11.6 (2026-10-09)"  # raise finish trims list inside the deadband (ADR-020)
 
 esp32:
   board: esp32dev
@@ -389,8 +393,22 @@ globals:
     type: unsigned long
     restore_value: no
     initial_value: "0"
+  # Raise finish trim (ADR-020). since == 0 means not trimming. best is the
+  # lowest |level error| seen this trim; best_ms is when it last improved.
+  - id: finish_trim_since
+    type: unsigned long
+    restore_value: no
+    initial_value: "0"
+  - id: finish_trim_best_ms
+    type: unsigned long
+    restore_value: no
+    initial_value: "0"
+  - id: finish_trim_best
+    type: float
+    restore_value: no
+    initial_value: "0.0"
   # ---- §21.6 at-rest level keeper (Lift only; gated by Maintain Level) ----
-  # rest_pulse: 0=off, 1=feed master, 2=feed slave, 3=vent slave, 4=vent master
+  # rest_pulse: 0=off, 3=vent slave (high), 4=vent master (high). No feed.
   - id: rest_pulse
     type: int
     restore_value: no
@@ -403,15 +421,15 @@ globals:
     type: unsigned long
     restore_value: no
     initial_value: "0"
-  - id: rest_pulse_start_angle   # progress check on the side being fed/vented
-    type: float
+  - id: rest_level_holdoff       # last vent did not level; sit until the list returns
+    type: bool
     restore_value: no
-    initial_value: "0.0"
-  - id: rest_pulse_air_since     # when the feed/vent valve is actually open (0 = not yet)
+    initial_value: "false"
+  - id: rest_pulse_air_since     # when the vent valve's OPEN contact is true (0 = not yet)
     type: unsigned long
     restore_value: no
     initial_value: "0"
-  - id: rest_pulse_err_at_air    # level_err_filt snapshot when air started
+  - id: rest_pulse_err_at_air    # level_err_filt snapshot when the valve opened
     type: float
     restore_value: no
     initial_value: "0.0"
@@ -992,7 +1010,9 @@ number:
     web_server: {sorting_group_id: group_config, sorting_weight: 41}
     optimistic: true
     restore_value: true
-    initial_value: 2
+    initial_value: 2           # 2026-10-09 review. Flash-persisted: a live
+                               # device still at 3.5° must be set back to 2.
+                               # OTA does not move it. See ready_guide_review.
     min_value: 0.5
     max_value: 10
     step: 0.5
@@ -1535,7 +1555,11 @@ output:
 #  'inverted: true' => contact-closed reads as true.
 # ---------------------------------------------------------------------------
 binary_sensor:
-  # ---- MAIN: single problem flag for alerting (fault / angle offline / uncalibrated) ----
+  # ---- MAIN: the Home Assistant problem bit (device_class: problem).
+  #      One flag for every error and warning: fault, bypass, emergency,
+  #      either IMU untrusted, starboard not calibrated, air-loss, and a
+  #      parked vent that did not level (ADR-019). Air Loss Alert stays as
+  #      the reason; this is the entity to alert on. ----
   - platform: template
     name: "Lift Problem"
     id: lift_problem
@@ -1546,7 +1570,9 @@ binary_sensor:
              || id(lift_state) == ${S_EMERG} || id(emerg_lock)
              || !id(angle_trusted)
              || (id(have_cal2) && !id(angle2_trusted))
-             || !(id(cal_down_done) && id(cal_up_done));
+             || !(id(cal_down_done) && id(cal_up_done))
+             || id(air_alert)
+             || id(rest_level_holdoff);
 
   # ---- HA convenience: ON = a person asked the lift to move (dock/panel button,
   #      web, or HA) and that move is still running; OFF when it settles.
@@ -2192,8 +2218,6 @@ text_sensor:
       if (!id(angle2_trusted)) return std::string("${side_slave} outside calibrated range — ganged");
       if (!id(level_ok_now))   return std::string("Not trusted — ganged");
       int rp = id(rest_pulse);
-      if (rp == 1) return std::string("Leveling — feeding ${side_master}");
-      if (rp == 2) return std::string("Leveling — feeding ${side_slave}");
       if (rp == 3) return std::string("Leveling — venting ${side_slave}");
       if (rp == 4) return std::string("Leveling — venting ${side_master}");
       if (id(level_throttle) == 1) return std::string("Leveling — holding ${side_master} back");
@@ -2770,8 +2794,8 @@ script:
       - script.execute: apply_outputs
 
   # ADR-015: above Ready → EMERG_DESCEND; at/below Ready → FAULT + seal.
-  # Shared by the 3° hard stop, a rest-level pulse that is not winning, and
-  # in-move catch-up. Stall still calls enter_fault directly.
+  # Shared by the 3° hard stop and in-move catch-up. A parked vent that does
+  # not level closes and sits (ADR-019). Stall still calls enter_fault directly.
   - id: start_emergency_descent
     parameters:
       reason: string
@@ -2819,7 +2843,8 @@ script:
           else if (s == ${S_LOWERING} || s == ${S_BYPASS} || s == ${S_LOWERED_VENT}
                    || s == ${S_EMERG}) { v_base = true; }   // EMERG: both valves ganged open, blower off
           // HOLD / FAULT: make_safe -> blower off, valves closed — unless an
-          // at-rest level pulse is active (HOLD + rest_pulse 1..4).
+          // at-rest level pulse is venting the high side (HOLD + rest_pulse 3/4).
+          // The blower stays off. Parked leveling does not feed (ADR-019).
 
           // Leveling bias: both valves follow the state, then the throttled
           // side (decided by the 250 ms supervisor) is closed while moving.
@@ -2832,14 +2857,10 @@ script:
           }
 
           // §21.6 at-rest level pulse while parked at Lift (still HOLD in the FSM).
-          // 1=feed master, 2=feed slave, 3=vent slave, 4=vent master
+          // 3=vent slave, 4=vent master. Blower stays off.
           int rp = id(rest_pulse);
-          if (s == ${S_HOLD} && rp != 0) {
-            if (rp == 1)      { blower = true;  va = true;  vb = false; }
-            else if (rp == 2) { blower = true;  va = false; vb = true;  }
-            else if (rp == 3) { blower = false; va = false; vb = true;  }
-            else if (rp == 4) { blower = false; va = true;  vb = false; }
-          }
+          if (s == ${S_HOLD} && rp == 3) { va = false; vb = true; }
+          else if (s == ${S_HOLD} && rp == 4) { va = true; vb = false; }
 
           // Auto-return valves: energized = open, off = spring/auto return closed.
           // Blower and valves are commanded independently (no sequencing); when
@@ -2936,11 +2957,13 @@ interval:
   # ---- Button ring LEDs.
   # White / Ready / Lower stay lit so the choices are visible. The destination
   # of a person-commanded move (or an emergency descent) slow-flashes until it
-  # ends. Red is dark when the lift is healthy.
+  # ends. Red stays lit while raising or lowering so Stop is the obvious press.
+  #   solid                    raising or lowering — press red to stop
   #   even flash (~2.5 Hz)     fault, emergency, bypass — press red to clear
   #   3 s flash / 10 s dark    an IMU is untrusted (go-to still works on the other)
   #   slow double-blink        Wi-Fi down, and nothing above is wrong
   # Bypass turns the three position rings off so a venting lift is not a normal night.
+  # Red priority: latch flash, then solid while moving, then IMU, then Wi-Fi.
   - interval: 100ms
     then:
       - lambda: |-
@@ -2963,6 +2986,7 @@ interval:
           bool low_on = !bypass && !(show_dest && mode == ${M_LOWER} && !flash_slow);
           bool stop_on;
           if (latch)                 stop_on = flash;
+          else if (moving)           stop_on = true;
           else if (sensor_bad)       stop_on = sensor_gap;
           else if (!id(wifi_sta).is_connected()) stop_on = wifi_pulse;
           else                       stop_on = false;
@@ -3223,6 +3247,9 @@ interval:
             int s0 = id(lift_state);
             bool moving23 = (s0 == ${S_RAISING} || s0 == ${S_LOWERING});
             int want = 0;
+            // Last 5% of a raise: a side-to-side swap is not held for
+            // Level Min Hold. A release is already immediate. ADR-020.
+            bool raise_finish = false;
             if (moving23 && lok && !id(manual_move)) {
               float db = id(level_deadband_pct).state;
               float rel = db - id(level_hysteresis_pct).state;
@@ -3233,11 +3260,26 @@ interval:
               float trip = (cur == 0) ? db : rel;
               if (e > trip)       want = (s0 == ${S_RAISING}) ? 2 : 1;  // slave HIGH: raise->close slave, lower->close master
               else if (e < -trip) want = (s0 == ${S_RAISING}) ? 1 : 2;  // slave LOW:  raise->close master, lower->close slave
+              if (s0 == ${S_RAISING} && id(height_ok)) {
+                float pct_now = id(lift_pct);
+                float tgt = id(goto_target_pct);
+                raise_finish = ultralift::raise_finish_zone(pct_now, tgt);
+                // At the target, a list inside the deadband but outside the
+                // release band still feeds the low side. Otherwise the raise
+                // seals in that hole (2026-10-08, sealed at -1.46%).
+                float ae = fabsf(e);
+                if (raise_finish && ultralift::raise_at_target(pct_now, tgt)
+                    && ae > rel && ae <= db) {
+                  int feed = ultralift::finish_feed_throttle(e, rel);
+                  if (feed != 0) want = feed;
+                }
+              }
             }
             if (id(auto_level_switch).state) {
               if (want != id(level_throttle)) {
                 unsigned long hold_ms = (unsigned long)(id(level_min_hold_s).state * 1000.0f);
-                if (id(level_throttle) == 0 || want == 0 || (now - id(level_since)) >= hold_ms) {
+                if (id(level_throttle) == 0 || want == 0 || raise_finish
+                    || (now - id(level_since)) >= hold_ms) {
                   ESP_LOGW("level", "LEVEL: throttle %s (err %.1f%%)",
                            want == 1 ? "MASTER valve (feed/vent slave)" :
                            want == 2 ? "SLAVE valve (feed/vent master)" : "released",
@@ -3264,21 +3306,15 @@ interval:
             }
 
             // ---- §21.6 at-rest level keeper (Lift only; Maintain Level ON).
-            //      Height maintain has priority: if master is below the sag
-            //      deadband, do not start (or abort) a rest pulse — the height
-            //      top-up raise will level as a side effect via in-move throttle.
-            //      ADR-015: air budget is a *not-winning* detector only (feed
-            //      30 s / vent 10 s with no shrink → fail-safe). If the list
-            //      is shrinking, keep going until the same release as in-move
-            //      (deadband − hysteresis) or the vent height floor / 3°.
-            //      Dock 2026-09-10: a winning 10 s vent stopped at 2.7% in
-            //      the 2–3% hole and never retried. ----
+            //      Vent the high side only (ADR-019). The open-valve pulse is
+            //      3× the measured both-valve descent for this list, and the
+            //      clock starts at the OPEN contact — actuator travel does not
+            //      count. Then the valve closes. No correction → sit. The
+            //      blower stays off. Tilt Critical, above, is the descent.
+            //      Height maintain still wins when master is below the sag
+            //      deadband; that top-up is a raise, not a level feed. ----
             {
-              const unsigned long FEED_MS = 30000UL;      // air budget, not relay-on
-              const unsigned long VENT_MS = 10000UL;
-              const unsigned long AIR_GRACE_MS = 8000UL;  // actuator open dead time
-              const unsigned long REST_GAP_MS = 60000UL;  // min off-time between pulses
-              const float WIN_PCT = 0.5f;                 // |err| must shrink by this
+              const unsigned long REST_GAP_MS = 60000UL;
               bool at_lift_only = (s0 == ${S_HOLD}) && id(pos_at_top);
               float lift_sp = std::isnan(id(lift_shutoff_pct))
                             ? id(top_target_pct).state : id(lift_shutoff_pct);
@@ -3286,76 +3322,55 @@ interval:
                                && id(lift_pct) >= lift_sp
                                               - id(maintain_sag_deadband).state;
               bool lvl_on = id(auto_level_switch).state && !id(test_mode);
+              float rel = id(level_deadband_pct).state
+                          - id(level_hysteresis_pct).state;
+              if (rel < 0.0f) rel = 0.0f;
+              if (lok && id(rest_level_holdoff)
+                  && fabs(id(level_err_filt)) <= id(rest_level_trigger_pct).state) {
+                id(rest_level_holdoff) = false;
+                ESP_LOGI("level", "REST-LEVEL: list back under trigger");
+              }
 
-              // manage an active pulse
               if (id(rest_pulse) != 0) {
-                bool abort = !at_lift_only || !lok || !lvl_on || !height_ok;
-                bool feed = id(rest_pulse) <= 2;
-                bool v_open = (id(rest_pulse) == 1 || id(rest_pulse) == 4)
+                bool leave = !at_lift_only || !lok || !lvl_on || !height_ok;
+                bool floor = !std::isnan(id(lift_pct))
+                             && id(lift_pct) < lift_sp - id(zone_tol_pct);
+                bool v_open = (id(rest_pulse) == 4)
                             ? id(valve_fb_open).state : id(valve_b_fb_open).state;
-                if (id(rest_pulse_air_since) == 0
-                    && (v_open || (now - id(rest_pulse_since)) >= AIR_GRACE_MS)) {
+                if (id(rest_pulse_air_since) == 0 && v_open) {
                   id(rest_pulse_air_since) = now;
                   id(rest_pulse_err_at_air) = id(level_err_filt);
                 }
-                bool air_on = id(rest_pulse_air_since) != 0;
-                unsigned long air_ms = air_on ? (now - id(rest_pulse_air_since)) : 0;
-                unsigned long lim = feed ? FEED_MS : VENT_MS;
-                bool timed_out = air_on && air_ms >= lim;
-                bool winning = air_on && lok
-                    && (fabs(id(level_err_filt)) + WIN_PCT < fabs(id(rest_pulse_err_at_air)));
-                bool growing = air_on && lok
-                    && (fabs(id(level_err_filt)) > fabs(id(rest_pulse_err_at_air)) + WIN_PCT);
-                // vent floor: never trade Lift height away
-                if (id(rest_pulse) >= 3 && !std::isnan(id(lift_pct))
-                    && id(lift_pct) < lift_sp - id(zone_tol_pct)) {
-                  abort = true;
-                  ESP_LOGW("level", "REST-LEVEL: vent aborted (height floor)");
-                }
-                // Same finish line as a raise/lower throttle release.
-                float rel = id(level_deadband_pct).state
-                            - id(level_hysteresis_pct).state;
-                if (rel < 0.0f) rel = 0.0f;
                 bool leveled = lok && fabs(id(level_err_filt)) <= rel;
-                bool give_up = false;
-                if (!abort && !leveled && air_on) {
-                  if (!std::isnan(err_deg) && err_deg > id(tilt_critical_deg).state) {
-                    give_up = true;
-                    ESP_LOGE("level", "REST-LEVEL: abort angle %.1f deg -> fail-safe", err_deg);
-                  } else if (!feed && growing) {
-                    give_up = true;
-                    ESP_LOGE("level", "REST-LEVEL: vent grew error -> fail-safe");
-                  } else if (feed && air_ms > 15000UL && !winning) {
-                    float fed = (id(rest_pulse) == 1) ? id(current_angle) : id(current_angle2);
-                    float dir = (id(rest_pulse) == 1)
-                              ? ((span >= 0.0f) ? 1.0f : -1.0f)
-                              : ((span2 >= 0.0f) ? 1.0f : -1.0f);
-                    if ((fed - id(rest_pulse_start_angle)) * dir < 0.15f) {
-                      give_up = true;
-                      ESP_LOGE("level", "REST-LEVEL: feed no progress -> fail-safe");
-                    }
-                  } else if (timed_out && !winning) {
-                    give_up = true;
-                    ESP_LOGE("level", "REST-LEVEL: %s air not shrinking -> fail-safe",
-                             feed ? "30s" : "10s vent");
-                  }
-                }
-                if (give_up) {
-                  id(rest_pulse) = 0;
-                  id(rest_pulse_air_since) = 0;
-                  id(rest_last_pulse_ms) = now;
-                  id(rest_level_below_since) = 0;
-                  id(start_emergency_descent)->execute("level_correct_fail");
-                } else if (abort || leveled) {
-                  ESP_LOGI("level", "REST-LEVEL: pulse end (%s) err %+.1f%%",
-                           abort ? "abort" : "leveled",
-                           id(level_err_filt));
+                ultralift::RestPulseIn pin;
+                pin.valve_open = id(rest_pulse_air_since) != 0;
+                pin.leveled = leveled;
+                pin.since_command_ms = now - id(rest_pulse_since);
+                pin.since_open_ms = pin.valve_open ? (now - id(rest_pulse_air_since)) : 0;
+                pin.abs_err_at_open = fabsf(id(rest_pulse_err_at_air));
+                ultralift::RestPulseStep step = ultralift::rest_pulse_step(pin);
+                bool end = leave || floor
+                           || step == ultralift::RestPulseStep::Close;
+                if (end) {
+                  // Leaving Lift, losing trust, or yielding to a height top-up
+                  // is not a failed correction. A vent that ran out — or never
+                  // opened, or hit the height floor — sits until the list
+                  // itself comes back under the trigger.
+                  bool hold = !leave && !leveled;
+                  if (hold) id(rest_level_holdoff) = true;
+                  const char* why = leave ? "abort"
+                      : floor ? "height floor"
+                      : leveled ? "leveled"
+                      : pin.valve_open ? "pulse done" : "valve did not open";
+                  ESP_LOGW("level", "REST-LEVEL: %s err %+.1f%% — valves closed%s",
+                           why, id(level_err_filt), hold ? ", holding" : "");
                   id(rest_pulse) = 0;
                   id(rest_pulse_air_since) = 0;
                   id(rest_last_pulse_ms) = now;
                   id(rest_level_below_since) = 0;
                 }
-              } else if (at_lift_only && lok && lvl_on && height_ok && id(level_settle_vent)) {
+              } else if (at_lift_only && lok && lvl_on && height_ok
+                         && id(level_settle_vent) && !id(rest_level_holdoff)) {
                 bool past = fabs(id(level_err_filt)) > id(rest_level_trigger_pct).state;
                 if (past) {
                   if (id(rest_level_below_since) == 0) id(rest_level_below_since) = now;
@@ -3365,14 +3380,10 @@ interval:
                              || (now - id(rest_last_pulse_ms)) >= REST_GAP_MS;
                   if ((now - id(rest_level_below_since)) >= persist_ms && gap_ok) {
                     bool slave_high = id(level_err_filt) > 0.0f;
-                    bool at_or_below = id(lift_pct) <= lift_sp;
-                    int want = at_or_below ? (slave_high ? 1 : 2)   // feed LOW
-                                           : (slave_high ? 3 : 4);  // vent HIGH
+                    int want = slave_high ? 3 : 4;   // vent the high side
                     id(rest_pulse) = want;
                     id(rest_pulse_since) = now;
                     id(rest_pulse_air_since) = 0;
-                    id(rest_pulse_start_angle) =
-                        (want == 1 || want == 4) ? id(current_angle) : id(current_angle2);
                     id(rest_level_below_since) = 0;
                     // ensure visit is Lift before counting (supervisor may run before maintain tick)
                     if (id(visit_pos) != 1) {
@@ -3381,20 +3392,15 @@ interval:
                       id(visit_level_count) = 0;
                     }
                     id(visit_level_count)++;
-                    const char* what = want == 1 ? "FEED master" : want == 2 ? "FEED slave"
-                                     : want == 3 ? "VENT slave" : "VENT master";
-                    ESP_LOGW("level", "REST-LEVEL: %s (err %+.1f%%, h %.1f%%) visit level #%d",
-                             what, id(level_err_filt), id(lift_pct), id(visit_level_count));
+                    ESP_LOGW("level", "REST-LEVEL: VENT %s (err %+.1f%%, h %.1f%%) visit level #%d",
+                             slave_high ? "slave" : "master",
+                             id(level_err_filt), id(lift_pct), id(visit_level_count));
                   }
                 } else {
                   id(rest_level_below_since) = 0;
                 }
               } else {
                 id(rest_level_below_since) = 0;
-                if (!at_lift_only && id(rest_pulse) != 0) {
-                  id(rest_pulse) = 0;
-                  id(rest_pulse_air_since) = 0;
-                }
               }
             }
           }
@@ -3443,6 +3449,13 @@ interval:
 
           int s = id(lift_state);
           float pct = id(lift_pct);
+          // A trim clock only means something while this raise is still the
+          // one that started it. Stop, fault, and descent drop it.
+          if (s != ${S_RAISING}) {
+            id(finish_trim_since) = 0;
+            id(finish_trim_best_ms) = 0;
+            id(finish_trim_best) = 0.0f;
+          }
 
           // ---- RAISING (blower + valve energized together since rev H) ----
           if (s == ${S_RAISING}) {
@@ -3543,28 +3556,68 @@ interval:
               else if (id(goto_mode) == ${M_READY} && id(pos_at_ready)) reached = true;
               else if (id(goto_mode) == ${M_GUIDE} && id(pos_at_guide)) reached = true;
               else if (id(height_ok) && !std::isnan(pct) && pct >= id(goto_target_pct)) reached = true;
-              // Two-sided completion: master at target, but the slave must be
-              // inside the level band too — the throttle (master valve closed)
-              // feeds the slave while the master holds. Times out to FAULT.
-              if (reached && id(auto_level_switch).state && id(level_ok_now)
-                  && !id(manual_move)
-                  && fabs(id(level_err_filt)) > id(level_deadband_pct).state) {
-                if (id(level_catchup_start) == 0) {
-                  id(level_catchup_start) = now;
-                  ESP_LOGI("fsm", "raise: master at target, waiting on slave (err %.1f%%)",
-                           id(level_err_filt));
+              // Two-sided completion. Past the deadband: existing catch-up,
+              // then emergency descent. Inside the deadband but outside the
+              // release band: keep feeding the low side (ADR-020) and seal
+              // if that trim stalls. Inside the release band: seal.
+              bool finish_stalled = false;
+              bool level_gate = reached && id(auto_level_switch).state && id(level_ok_now)
+                                && !id(manual_move);
+              if (!level_gate) {
+                id(finish_trim_since) = 0;
+                id(finish_trim_best_ms) = 0;
+                id(finish_trim_best) = 0.0f;
+              } else {
+                float db = id(level_deadband_pct).state;
+                float rel = db - id(level_hysteresis_pct).state;
+                if (rel < 0.0f) rel = 0.0f;
+                ultralift::FinishTrimClock trim;
+                trim.since = id(finish_trim_since);
+                trim.best_ms = id(finish_trim_best_ms);
+                trim.best = id(finish_trim_best);
+                bool trim_was_idle = trim.since == 0;
+                unsigned long cap_ms =
+                    (unsigned long)(id(level_catchup_timeout_s).state * 1000.0f);
+                ultralift::FinishArrival fin = ultralift::finish_arrival(
+                    fabsf(id(level_err_filt)), db, rel, now, cap_ms, trim);
+                id(finish_trim_since) = trim.since;
+                id(finish_trim_best_ms) = trim.best_ms;
+                id(finish_trim_best) = trim.best;
+                if (fin == ultralift::FinishArrival::Wide) {
+                  if (id(level_catchup_start) == 0) {
+                    id(level_catchup_start) = now;
+                    ESP_LOGI("fsm", "raise: master at target, waiting on slave (err %.1f%%)",
+                             id(level_err_filt));
+                  }
+                  if ((now - id(level_catchup_start)) > cap_ms) {
+                    id(start_emergency_descent)->execute("level_fail_catchup");
+                  }
+                  reached = false;   // keep the move alive; throttle feeds the lagging side
+                } else if (fin == ultralift::FinishArrival::Hold) {
+                  id(level_catchup_start) = 0;
+                  if (trim_was_idle && id(finish_trim_since) != 0)
+                    ESP_LOGI("fsm", "raise finish: trimming list (err %.1f%%)",
+                             id(level_err_filt));
+                  reached = false;   // feed the low side until the release band
+                } else {
+                  id(level_catchup_start) = 0;
+                  finish_stalled = (fin == ultralift::FinishArrival::SealAnyway);
                 }
-                if ((now - id(level_catchup_start)) >
-                    (unsigned long)(id(level_catchup_timeout_s).state * 1000.0f)) {
-                  id(start_emergency_descent)->execute("level_fail_catchup");
-                }
-                reached = false;   // keep the move alive; throttle feeds the lagging side
               }
               if (reached && id(lift_state) == ${S_RAISING}) {
                 id(lift_state) = ${S_HOLD};
                 id(level_catchup_start) = 0;
-                id(last_stop_reason) = "raise target reached";
-                ESP_LOGI("fsm", "raise target reached -> HOLD");
+                id(finish_trim_since) = 0;
+                id(finish_trim_best_ms) = 0;
+                id(finish_trim_best) = 0.0f;
+                if (finish_stalled) {
+                  id(last_stop_reason) = "raise target reached - list trim stalled";
+                  ESP_LOGW("fsm", "raise finish trim stalled at err %.1f%% -> HOLD",
+                           id(level_err_filt));
+                } else {
+                  id(last_stop_reason) = "raise target reached";
+                  ESP_LOGI("fsm", "raise target reached -> HOLD");
+                }
               }
             }
           }

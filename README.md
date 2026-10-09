@@ -10,7 +10,7 @@ Built for a HydroHoist **UltraLift UL2 8800** with **per-tank valves and inclino
 
 - **Go-to-position FSM** — Lift / Ready / Guide / Lowered. Guide is web/HA (boat floating, bunks still a slip centerline; no dock button). Press a destination; the controller picks raise vs lower, drives blower + vent valves, and stops on the calibrated zone. Lift uses two shutoffs: boat ceiling with any boat (or unknown), empty ceiling when confirmed empty. Mode buttons retarget mid-move (last press wins); red Stop always cancels motion and commands safe outputs.
 - **Auto-Maintain Height / Auto-Maintain Level** (default ON) — height top-ups at Lift (to the load-selected shutoff), plus load-confirmed Ready recovery only inside a bounded 3–5 % sag envelope. Below the Ready floor, automatic inflation is inhibited. In-move throttle runs on every go-to; at-rest leveling remains Lift-only. Per-visit counters live on `Maintain Observe`.
-- **Two-valve / two-IMU leveling** — each tank has its own vent/fill valve and inclinometer. A list is corrected at Lift; if the correction is not winning or live list passes ~3° with the boat high, both valves open and the lift emergency-descends (Ready first, Lowered if residual list remains).
+- **Two-valve / two-IMU leveling** — each tank has its own vent/fill valve and inclinometer. At Lift a list vents the high side, then the valve closes. If that does not level the boat, it sits. Live list past ~3° with the boat high emergency-descends (Ready first, Lowered if residual list remains).
 - **Boat-presence detection** — no sensor needed: raise speed classifies empty vs light boat vs Cobalt/heavy. That class picks the Lift shutoff (empty vs any boat); unknown stays on the boat ceiling and may raise the target mid-move if the raise proves empty.
 - **Safety supervisor** — angle trust ladder (freshness + plausibility, per sensor), stall detection, absolute blower runtime cap in every mode, valve position feedback with a manual-operation detector, failed level-correction / 3° list emergency descent, degraded manual mode when sensing is lost, latched faults with reasons, power-loss-safe defaults.
 - **Dock UX** — four illuminated buttons with state-aware LED cadences, a decluttered on-device web UI (all tunables live-editable and flash-persisted — no recompiles to retune), and short-token status sensors (`Lift Activity`, `Lift Position`) built for exact-match Home Assistant automations.
@@ -35,6 +35,7 @@ Full bill of materials, wiring, and I/O map: **[docs/boat_lift_design.md](docs/b
 | `docs/boat_lift_ui_reference.md` | **Web UI & calibration reference** — what every entity means, and how to calibrate |
 | `docs/adr.md` | Design decisions and rationale |
 | `docs/dock_test_2026-09-10.md` | Dock log: ADR-015 fail-safe tests and the Guide-mode decision |
+| `docs/ready_guide_review_2026-10-09.md` | Recorder review of Ready/Guide stops, and the goal to return Zone Tolerance to 2° |
 | `docs/boat_lift_link_protocol.md` | Lift ↔ panel RS485 protocol |
 | `docs/boat_lift_panel_design_revA.md` | Panel UI design |
 | `field-data/` | Captured move profiles (raise/lower CSVs, loaded + empty) used to tune the classifier and alarms |

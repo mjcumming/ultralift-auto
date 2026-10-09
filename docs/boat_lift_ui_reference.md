@@ -72,7 +72,7 @@ Why the Port captures too: the frame racks slightly, so the port sensor gets its
 
 - **Calibration Summary** — every zone edge the captures produce, on one line: `Lowered: >48.0° (cal 50.0°)  Guide: 48.5..55.5°  Ready: 42.2..46.2°  Lift: -5.4°  Empty: -23.9°`. Guide shows `—` until captured. If a zone looks wrong, this is where you see it.
 - **Lift Target (%)** — how close Lift approaches the load-selected ceiling (default 97). Stop short of the captured max so a heavier day still arrives; 100 % will miss when the boat is heavier than the capture.
-- **Zone Tolerance (°)** — the single "close enough" band used for every position zone: at-Ready means within ±this of the Ready angle, and so on. Wider = zones easier to hit but sloppier; default 2°.
+- **Zone Tolerance (°)** — the single "close enough" band used for every position zone: at-Ready means within ±this of the Ready angle, and so on. Wider = zones easier to hit but sloppier. Firmware initial **2°**, and this boat was set back to 2° on 2026-10-09 (it had been persisted at 3.5°). A supervised Guide lower at 2° is still open — see [`ready_guide_review_2026-10-09.md`](ready_guide_review_2026-10-09.md).
 - **Restart** — reboots the controller (state is safe: it always boots to HOLD; at the bottom the vent rule reopens the vents itself).
 
 Nudging without re-running the lift: each capture is also an editable number under **Advanced Tuning** (`Cal Angle — …`). Use those to trim a setpoint a fraction of a degree or restore a clobbered value; use the capture buttons when the lift is actually parked at the position.
